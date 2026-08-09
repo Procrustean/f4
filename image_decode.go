@@ -11,31 +11,28 @@ import (
 	"strings"
 	"sync"
 
+	_ "image/gif"
+	_ "image/jpeg"
+
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 	"github.com/woozymasta/png"
-	_ "image/gif"
-	_ "image/jpeg"
 )
 
-// ImageDecoder describes one way of turning file bytes into pixels. Several
-// decoders may claim the same extension; the one with the highest priority is
-// tried first and the rest act as fallbacks. This is the seam through which
-// platform decoders and subplugins will be added later.
+// ImageDecoder turns file bytes into pixels; several may claim one extension.
 type ImageDecoder struct {
 	Name       string
 	Priority   int
 	Extensions []string
 	Decode     func(data []byte) (*vtui.ImageSurface, error)
 
-	// DecodeCtx, when set, is used instead of Decode. A decoder that leaves
-	// the process has to be told when nobody is waiting for its answer any
-	// more; one that only reads bytes never needs this and keeps the
-	// simpler signature.
+	// DecodeCtx: process-leaving decoders can be cancelled mid-decode.
 	DecodeCtx func(ctx context.Context, data []byte) (*vtui.ImageSurface, error)
+
+	// Label names the external tool in the interface.
+	Label func(data []byte) string
 }
 
-// decode calls whichever of the two functions the decoder provided.
 func (d ImageDecoder) decode(ctx context.Context, data []byte) (*vtui.ImageSurface, error) {
 	if d.DecodeCtx != nil {
 		return d.DecodeCtx(ctx, data)
@@ -43,30 +40,24 @@ func (d ImageDecoder) decode(ctx context.Context, data []byte) (*vtui.ImageSurfa
 	return d.Decode(data)
 }
 
-// The registry is read from the decoding workers, so it is guarded: a plugin
-// registering a decoder while a picture is being decoded is otherwise a race.
+// Guarded: a plugin may register while a picture is decoding.
 var (
 	imageDecodersMu sync.RWMutex
 	imageDecoders   []ImageDecoder
 )
 
-// allImageDecoders returns a snapshot of the registry.
 func allImageDecoders() []ImageDecoder {
 	imageDecodersMu.RLock()
 	out := append([]ImageDecoder(nil), imageDecoders...)
 	imageDecodersMu.RUnlock()
 
-	// The priorities from the settings are applied here rather than stored
-	// in the registry, so that clearing the setting brings the built-in
-	// order back without a second copy of the built-in numbers.
+	// Applied here, not stored: clearing the setting restores built-in order.
 	for i := range out {
 		out[i].Priority = imageDecoderPriorityOf(out[i].Name, out[i].Priority)
 	}
 	return out
 }
 
-// RegisterImageDecoder adds a decoder, replacing an earlier one of the same
-// name so that a plugin can override a built-in.
 func RegisterImageDecoder(d ImageDecoder) {
 	if d.Name == "" || (d.Decode == nil && d.DecodeCtx == nil) {
 		return
@@ -82,9 +73,6 @@ func RegisterImageDecoder(d ImageDecoder) {
 	imageDecoders = append(imageDecoders, d)
 }
 
-// UnregisterImageDecoder takes a decoder out of the registry. It exists for
-// the external converter, which registers itself only when there is a
-// converter on the PATH and so has to be able to change its mind.
 func UnregisterImageDecoder(name string) {
 	imageDecodersMu.Lock()
 	defer imageDecodersMu.Unlock()
@@ -96,14 +84,11 @@ func UnregisterImageDecoder(name string) {
 	}
 }
 
-// The priority overrides read from the [Images] section.
 var (
 	imageDecoderPrioMu sync.RWMutex
 	imageDecoderPrio   map[string]int
 )
 
-// SetImageDecoderPriorities replaces the overrides. A nil or empty map means
-// every decoder keeps the priority it registered with.
 func SetImageDecoderPriorities(prio map[string]int) {
 	imageDecoderPrioMu.Lock()
 	defer imageDecoderPrioMu.Unlock()
@@ -117,7 +102,6 @@ func SetImageDecoderPriorities(prio map[string]int) {
 	}
 }
 
-// imageDecoderPriorityOf returns the priority a decoder should be sorted by.
 func imageDecoderPriorityOf(name string, registered int) int {
 	imageDecoderPrioMu.RLock()
 	defer imageDecoderPrioMu.RUnlock()
@@ -127,11 +111,7 @@ func imageDecoderPriorityOf(name string, registered int) int {
 	return registered
 }
 
-// ParseImageDecoderPriorities reads the DecoderPriority setting: pairs of a
-// decoder name and a number, separated by commas, semicolons or vertical
-// bars. A pair that does not parse is dropped rather than turned into an
-// error, because a typo in the settings file should not stop pictures from
-// opening.
+// DecoderPriority pairs; a bad pair is dropped so a config typo cannot block images.
 func ParseImageDecoderPriorities(spec string) map[string]int {
 	out := make(map[string]int)
 	for _, part := range strings.FieldsFunc(spec, func(r rune) bool {
@@ -166,7 +146,6 @@ func imageExtension(path string) string {
 	return strings.ToLower(base[dot+1:])
 }
 
-// ImageDecodersFor returns the decoders claiming this file, best first.
 func ImageDecodersFor(path string) []ImageDecoder {
 	ext := imageExtension(path)
 	if ext == "" {
@@ -187,25 +166,16 @@ func ImageDecodersFor(path string) []ImageDecoder {
 	return out
 }
 
-// IsImageFile reports whether anything at all can decode this file.
 func IsImageFile(path string) bool {
 	return len(ImageDecodersFor(path)) > 0
 }
 
-// DecodeImage walks the decoders in priority order and returns the first
-// result, together with the name of the decoder that produced it. The ones
-// claiming the extension go first; when they all fail the remaining ones are
-// offered the file too, because a picture saved under the wrong picture name
-// is still a picture. A name no decoder claims at all is refused outright:
-// the extension is what says the file is meant to be an image, and sniffing
-// every file that is opened would promise something quite different.
+// Extension-claiming decoders first, the rest as fallbacks; a name nobody
+// claims is refused outright, never sniffed.
 func DecodeImage(path string, data []byte) (*vtui.ImageSurface, string, error) {
 	return DecodeImageContext(context.Background(), path, data)
 }
 
-// DecodeImageContext is DecodeImage with a way of saying that the answer is
-// no longer wanted. Only a decoder that leaves the process can act on it, but
-// that is exactly the decoder that can take seconds.
 func DecodeImageContext(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -232,12 +202,9 @@ func DecodeImageContext(ctx context.Context, path string, data []byte) (*vtui.Im
 
 	var lastErr error
 	for _, d := range decoders {
-		surf, err := d.decode(ctx, data)
-		if err == nil && surf.Valid() {
-			return surf, d.Name, nil
-		}
+		surf, name, err := decodeImage(d, ctx, data)
 		if err == nil {
-			err = fmt.Errorf("decoder %s produced an empty image", d.Name)
+			return surf, name, nil
 		}
 		lastErr = err
 	}
@@ -247,31 +214,61 @@ func DecodeImageContext(ctx context.Context, path string, data []byte) (*vtui.Im
 	return nil, "", lastErr
 }
 
-// maxImageFileSize guards against loading a multi gigabyte file into memory.
-// Tiled decoding of huge images is a separate job.
+func decoderDisplayName(d ImageDecoder, data []byte) string {
+	if d.Label != nil {
+		if label := d.Label(data); label != "" {
+			return label
+		}
+	}
+	return d.Name
+}
+
+func decodeImage(d ImageDecoder, ctx context.Context, data []byte) (*vtui.ImageSurface, string, error) {
+	surf, err := d.decode(ctx, data)
+	if err == nil && !surf.Valid() {
+		err = fmt.Errorf("decoder %s produced an empty image", d.Name)
+	}
+	return surf, decoderDisplayName(d, data), err
+}
+
+func findDecoder(name string) (ImageDecoder, bool) {
+	for _, d := range allImageDecoders() {
+		if d.Name == name {
+			return d, true
+		}
+	}
+	return ImageDecoder{}, false
+}
+
+// One named decoder even when unclaimed; fallbacks get their turn.
+func decodeImagePreferred(ctx context.Context, path string, data []byte, preferred string) (*vtui.ImageSurface, string, error) {
+	d, ok := findDecoder(preferred)
+	if !ok {
+		return nil, "", fmt.Errorf("no decoder named %q", preferred)
+	}
+	return decodeImage(d, ctx, data)
+}
+
 const maxImageFileSize = 128 << 20
 
-// imageMaxPixels bounds the geometry a decoder will honour, whatever the
-// file claims about itself.
 const imageMaxPixels = 64 << 20
 
-// LoadImage reads a file through the VFS and decodes it.
-func LoadImage(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+func imageFileBytes(ctx context.Context, v vfs.VFS, path string) ([]byte, error) {
 	if v == nil {
-		return nil, "", fmt.Errorf("no filesystem provider")
+		return nil, fmt.Errorf("no filesystem provider")
 	}
 	f, err := v.Open(ctx, path)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	defer f.Close()
 
 	size := f.Size()
 	if size <= 0 {
-		return nil, "", fmt.Errorf("file is empty")
+		return nil, fmt.Errorf("file is empty")
 	}
 	if size > maxImageFileSize {
-		return nil, "", fmt.Errorf("image is too large: %d bytes", size)
+		return nil, fmt.Errorf("image is too large: %d bytes", size)
 	}
 
 	data := make([]byte, size)
@@ -280,9 +277,148 @@ func LoadImage(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface,
 		if err == nil {
 			err = fmt.Errorf("nothing could be read")
 		}
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func LoadImage(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+	return loadImageForChoice(ctx, v, path, "")
+}
+
+type imageDecoderChoice struct {
+	key   string // what the viewer remembers: "go-std" or "external@im"
+	label string // what the interface shows
+}
+
+const imageDecoderChoiceTool = "external@"
+
+func imageDecoderChoices(path string) []imageDecoderChoice {
+	var out []imageDecoderChoice
+	for _, d := range imageCycleDecoders(path) {
+		if d.Name != externalImageDecoder {
+			out = append(out, imageDecoderChoice{key: d.Name, label: d.Name})
+			continue
+		}
+		for _, tool := range installedExternalImageTools() {
+			out = append(out, imageDecoderChoice{
+				key:   imageDecoderChoiceTool + tool.Label,
+				label: externalImageDecoder + " (" + tool.Label + ")",
+			})
+		}
+	}
+	return out
+}
+
+func imageCycleDecoders(path string) []ImageDecoder {
+	claimed := ImageDecodersFor(path)
+	if len(claimed) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(claimed))
+	for _, d := range claimed {
+		seen[d.Name] = true
+	}
+	rest := make([]ImageDecoder, 0, 4)
+	for _, d := range allImageDecoders() {
+		if !seen[d.Name] {
+			rest = append(rest, d)
+		}
+	}
+	sort.SliceStable(rest, func(i, j int) bool {
+		return rest[i].Priority > rest[j].Priority
+	})
+	return append(claimed, rest...)
+}
+
+func imageNextDecoder(opts []imageDecoderChoice, req, current string) string {
+	if len(opts) < 2 {
+		return ""
+	}
+	idx := indexOfChoice(opts, req)
+	if idx < 0 {
+		idx = indexOfChoice(opts, current)
+	}
+	if idx < 0 {
+		idx = len(opts) - 1
+	}
+	nxt := opts[(idx+1)%len(opts)].key
+	if nxt == req || (req == "" && nxt == current) {
+		return ""
+	}
+	return nxt
+}
+
+func indexOfChoice(opts []imageDecoderChoice, keyOrLabel string) int {
+	for i, o := range opts {
+		if o.key == keyOrLabel || o.label == keyOrLabel {
+			return i
+		}
+	}
+	return -1
+}
+
+// Still valid? A converter can vanish between pictures.
+func imageChoiceValid(key string) bool {
+	if label, ok := strings.CutPrefix(key, imageDecoderChoiceTool); ok {
+		_, found := externalImageToolByLabel(label)
+		return found
+	}
+	return imageDecoderRegistered(key)
+}
+
+func imageDecoderRegistered(name string) bool {
+	for _, d := range allImageDecoders() {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func loadImageForChoice(ctx context.Context, v vfs.VFS, path, choice string) (*vtui.ImageSurface, string, error) {
+	data, err := imageFileBytes(ctx, v, path)
+	if err != nil {
 		return nil, "", err
 	}
-	return DecodeImageContext(ctx, path, data[:n])
+	return loadImageForBytes(ctx, path, data, choice)
+}
+
+func loadImageForBytes(ctx context.Context, path string, data []byte, choice string) (*vtui.ImageSurface, string, error) {
+	if choice == "" {
+		return DecodeImageContext(ctx, path, data)
+	}
+	if label, ok := strings.CutPrefix(choice, imageDecoderChoiceTool); ok {
+		tool, found := externalImageToolByLabel(label)
+		if !found {
+			return nil, "", fmt.Errorf("no converter %q on the PATH", label)
+		}
+		surf, err := decodeImageExternallyTool(ctx, tool, data)
+		if err != nil {
+			return nil, "", err
+		}
+		return surf, externalImageDecoder + " (" + tool.Label + ")", nil
+	}
+	return decodeImagePreferred(ctx, path, data, choice)
+}
+
+// Built-ins decode whole; converters shrink while reading.
+func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) ImageResult {
+	if w < 1 {
+		w = (imageTileCols - 2) * imageViewFallbackCellW
+	}
+	if h < 1 {
+		h = (imageTileRows - 2) * imageViewFallbackCellH
+	}
+	decoders := ImageDecodersFor(path)
+	if len(decoders) == 0 || decoders[0].Name != externalImageDecoder {
+		return ImagePipe.LoadTileSync(ctx, v, path)
+	}
+	surf, decoder, err := loadImageScaled(ctx, v, path, w, h)
+	if err != nil {
+		return ImagePipe.LoadTileSync(ctx, v, path)
+	}
+	return ImageResult{Path: path, Surface: surf, Decoder: decoder}
 }
 
 func decodeStdImageStream(r io.Reader) (*vtui.ImageSurface, error) {
@@ -293,9 +429,7 @@ func decodeStdImageStream(r io.Reader) (*vtui.ImageSurface, error) {
 	return surfaceFromDecodedImage(img)
 }
 
-// surfaceFromDecodedImage maps 8-bit RGBA/NRGBA pixels straight to the
-// surface, skipping the copy+unpremultiply pass; others go via the generic
-// converter.
+// RGBA/NRGBA straight copy, skipping unpremultiply; others go the generic path.
 func surfaceFromDecodedImage(img image.Image) (*vtui.ImageSurface, error) {
 	var dx, dy, stride int
 	var pix []byte
@@ -317,8 +451,7 @@ func surfaceFromDecodedImage(img image.Image) (*vtui.ImageSurface, error) {
 	return surf, nil
 }
 
-// decodeImageWithStdlib routes PNG to a faster decoder; the magic bytes,
-// not the extension, decide.
+// PNG fast path: magic bytes, not the extension, decide.
 func decodeImageWithStdlib(data []byte) (*vtui.ImageSurface, error) {
 	if isPNG(data) {
 		img, err := png.Decode(bytes.NewReader(data))

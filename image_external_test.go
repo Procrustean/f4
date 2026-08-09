@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"errors"
-	"image/color"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,18 +26,22 @@ func fakeExternalTools(t *testing.T, bins ...string) {
 	}
 
 	savedLook := externalImageLookPath
-	savedRun := externalImageRun
+	savedDecode := externalImageDecode
+	savedDecodeScaled := externalImageDecodeScaled
 	savedTimeout := externalImageTimeout
 	savedDecoders := imageDecoders
 	savedConfig := AppConfig.ImageExternalTimeout
 	t.Cleanup(func() {
 		externalImageLookPath = savedLook
-		externalImageRun = savedRun
+		externalImageDecode = savedDecode
+		externalImageDecodeScaled = savedDecodeScaled
 		externalImageTimeout = savedTimeout
 		imageDecoders = savedDecoders
 		AppConfig.ImageExternalTimeout = savedConfig
 		SetImageDecoderPriorities(nil)
+		resetInstalledExternalImageTools()
 	})
+	resetInstalledExternalImageTools()
 
 	externalImageLookPath = func(bin string) (string, error) {
 		if present[bin] {
@@ -86,7 +90,7 @@ func TestSniffImageSuffix(t *testing.T) {
 func TestFindExternalImageToolPrefersImageMagick(t *testing.T) {
 	fakeExternalTools(t, "convert", "ffmpeg", "magick")
 
-	tool, ok := findExternalImageTool()
+	tool, ok := findExternalImageTool("")
 	if !ok {
 		t.Fatal("three converters are installed and none was found")
 	}
@@ -101,7 +105,7 @@ func TestFindExternalImageToolPrefersImageMagick(t *testing.T) {
 func TestFindExternalImageToolFallsBackToFFmpeg(t *testing.T) {
 	fakeExternalTools(t, "ffmpeg")
 
-	tool, ok := findExternalImageTool()
+	tool, ok := findExternalImageTool("")
 	if !ok {
 		t.Fatal("ffmpeg is installed and was not found")
 	}
@@ -119,7 +123,7 @@ func TestFindExternalImageToolFallsBackToFFmpeg(t *testing.T) {
 func TestFindExternalImageToolReportsAnEmptyPath(t *testing.T) {
 	fakeExternalTools(t)
 
-	if _, ok := findExternalImageTool(); ok {
+	if _, ok := findExternalImageTool(""); ok {
 		t.Fatal("nothing is installed and something was found")
 	}
 }
@@ -148,11 +152,10 @@ func TestRegisterExternalImageDecoderWithoutAConverter(t *testing.T) {
 
 func TestDecodeImageExternallyConvertsThroughATempFile(t *testing.T) {
 	fakeExternalTools(t, "magick")
-	converted := makeTestPNG(t, 4, 2, color.RGBA{R: 7, G: 8, B: 9, A: 255})
 	source := []byte("RIFF\x00\x00\x00\x00WEBPVP8 and the body")
 
 	var seen string
-	externalImageRun = func(ctx context.Context, tool externalImageTool, path string) ([]byte, error) {
+	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
 		seen = path
 		got, err := os.ReadFile(path)
 		if err != nil {
@@ -162,7 +165,7 @@ func TestDecodeImageExternallyConvertsThroughATempFile(t *testing.T) {
 		if string(got) != string(source) {
 			t.Error("the temporary file does not hold the original bytes")
 		}
-		return converted, nil
+		return vtui.NewImageSurface(4, 2), nil
 	}
 
 	surf, err := decodeImageExternally(context.Background(), source)
@@ -185,7 +188,7 @@ func TestDecodeImageExternallyPassesTheDeadlineOn(t *testing.T) {
 	AppConfig.ImageExternalTimeout = 7
 
 	var left time.Duration
-	externalImageRun = func(ctx context.Context, tool externalImageTool, path string) ([]byte, error) {
+	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			t.Error("the converter was started without a deadline")
@@ -206,7 +209,7 @@ func TestDecodeImageExternallyPassesTheDeadlineOn(t *testing.T) {
 func TestDecodeImageExternallyReportsATimeout(t *testing.T) {
 	fakeExternalTools(t, "ffmpeg")
 	externalImageTimeout = func() time.Duration { return 20 * time.Millisecond }
-	externalImageRun = func(ctx context.Context, tool externalImageTool, path string) ([]byte, error) {
+	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -220,7 +223,7 @@ func TestDecodeImageExternallyReportsATimeout(t *testing.T) {
 func TestDecodeImageExternallyIsCancelledWithItsCaller(t *testing.T) {
 	fakeExternalTools(t, "magick")
 	ctx, cancel := context.WithCancel(context.Background())
-	externalImageRun = func(runCtx context.Context, tool externalImageTool, path string) ([]byte, error) {
+	externalImageDecode = func(runCtx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
 		cancel()
 		<-runCtx.Done()
 		return nil, runCtx.Err()
@@ -233,7 +236,7 @@ func TestDecodeImageExternallyIsCancelledWithItsCaller(t *testing.T) {
 
 func TestDecodeImageExternallyRejectsAnEmptyAnswer(t *testing.T) {
 	fakeExternalTools(t, "magick")
-	externalImageRun = func(context.Context, externalImageTool, string) ([]byte, error) {
+	externalImageDecode = func(context.Context, externalImageTool, string) (*vtui.ImageSurface, error) {
 		return nil, nil
 	}
 
@@ -265,9 +268,8 @@ func TestExternalDecoderIsTheLastResort(t *testing.T) {
 		},
 	})
 
-	converted := makeTestPNG(t, 2, 2, color.RGBA{B: 200, A: 255})
-	externalImageRun = func(context.Context, externalImageTool, string) ([]byte, error) {
-		return converted, nil
+	externalImageDecode = func(context.Context, externalImageTool, string) (*vtui.ImageSurface, error) {
+		return vtui.NewImageSurface(2, 2), nil
 	}
 
 	list := ImageDecodersFor("a.webp")
@@ -276,7 +278,7 @@ func TestExternalDecoderIsTheLastResort(t *testing.T) {
 	}
 
 	_, name, err := DecodeImage("a.webp", []byte("RIFF\x00\x00\x00\x00WEBPbody"))
-	if err != nil || name != externalImageDecoder {
+	if err != nil || name != externalImageToolLabel([]byte("RIFF\x00\x00\x00\x00WEBPbody")) {
 		t.Fatalf("got %q %v", name, err)
 	}
 	if !tried {
@@ -295,7 +297,44 @@ func TestConfiguredExternalImageTimeout(t *testing.T) {
 	for _, bad := range []int{0, -1} {
 		AppConfig.ImageExternalTimeout = bad
 		if got := configuredExternalImageTimeout(); got != defaultImageExternalTimeout*time.Second {
-			t.Errorf("%d seconds should fall back to the default, got %v", bad, got)
+			t.Errorf("%d seconds should fall back to the default, got %d", bad, got)
 		}
+	}
+}
+
+// vips streams P6 (no PAM writer); the PPM flag must route it to the
+// netpbm decoder, not the stdlib one.
+func TestVipsPpmStreamDecodesInNetpbmPath(t *testing.T) {
+	if _, err := exec.LookPath("vips"); err != nil {
+		t.Skip("vips is not installed")
+	}
+	var raster []byte
+	for i := 0; i < 4*2; i++ {
+		raster = append(raster, byte(255-i*8), byte(i*3), byte(40+i))
+	}
+	ppm := append([]byte("P6\n4 2\n255\n"), raster...)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.ppm")
+	if err := os.WriteFile(in, ppm, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(context.Background(), "vips", "copy", in, ".ppm")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	surf, decodeErr := decodeNetpbmSurfaceStream(out)
+	runErr := cmd.Wait()
+	if runErr != nil {
+		t.Fatalf("vips failed: %v", runErr)
+	}
+	if decodeErr != nil {
+		t.Fatalf("the vips P6 stream must decode through netpbm, got: %v", decodeErr)
+	}
+	if surf.Width != 4 || surf.Height != 2 {
+		t.Fatalf("wrong geometry %dx%d", surf.Width, surf.Height)
 	}
 }

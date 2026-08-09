@@ -88,9 +88,10 @@ func TestImageDecoderPriorityAndOverride(t *testing.T) {
 	})
 
 	list := ImageDecodersFor("a.png")
-	if len(list) != 2 || list[0].Name != "test-high" {
+	if len(list) < 2 || list[0].Name != "test-high" {
 		t.Fatalf("priority order is wrong: %v", list)
 	}
+	before := len(list)
 
 	if _, name, err := DecodeImage("a.png", nil); err != nil || name != "test-high" {
 		t.Fatalf("the highest priority decoder must win, got %q %v", name, err)
@@ -106,7 +107,7 @@ func TestImageDecoderPriorityAndOverride(t *testing.T) {
 		Extensions: []string{"png"},
 		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
 	})
-	if len(ImageDecodersFor("a.png")) != 2 {
+	if len(ImageDecodersFor("a.png")) != before {
 		t.Error("re-registering a name must replace the old entry")
 	}
 }

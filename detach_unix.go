@@ -35,3 +35,6 @@ func checkAndDetach(attached bool) {
 		os.Exit(0)
 	}
 }
+
+// no-op on unix
+func hideConsoleWindow(cmd *exec.Cmd) {}

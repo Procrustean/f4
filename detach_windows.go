@@ -20,9 +20,7 @@ func checkAndDetach(attached bool) {
 
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "F4_DETACHED=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
-	}
+	hideConsoleWindow(cmd)
 
 	null, _ := os.Open(os.DevNull)
 	if null != nil {
@@ -33,5 +31,12 @@ func checkAndDetach(attached bool) {
 
 	if err := cmd.Start(); err == nil {
 		os.Exit(0)
+	}
+}
+
+// hideConsoleWindow: children don't flash a console when f4 has none.
+func hideConsoleWindow(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
 }
