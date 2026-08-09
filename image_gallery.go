@@ -33,8 +33,12 @@ type imageGallery struct {
 	top    int
 	cols   int
 	rows   int
+	tw     int // tile size in pixels
+	th     int
 	thumbs map[string]*vtui.ImageSurface
 	asked  map[string]bool
+	// in-flight tile decodes, so leaving the grid cancels them.
+	cancels map[string]func()
 }
 
 // layout works out how many tiles fit into the window.
@@ -106,6 +110,10 @@ func (iv *ImageView) ToggleGallery() {
 	// and there is nothing to divide that ownership with.
 	iv.stopSlideShow()
 	if iv.gal != nil {
+		// Stop in-flight tile decodes; their thumbs are no longer wanted.
+		for _, cancel := range iv.gal.cancels {
+			cancel()
+		}
 		iv.gal = nil
 		return
 	}
@@ -114,11 +122,12 @@ func (iv *ImageView) ToggleGallery() {
 		cursor = 0
 	}
 	iv.gal = &imageGallery{
-		cursor: cursor,
-		cols:   1,
-		rows:   1,
-		thumbs: make(map[string]*vtui.ImageSurface),
-		asked:  make(map[string]bool),
+		cursor:  cursor,
+		cols:    1,
+		rows:    1,
+		thumbs:  make(map[string]*vtui.ImageSurface),
+		asked:   make(map[string]bool),
+		cancels: make(map[string]func()),
 	}
 }
 
@@ -170,23 +179,24 @@ func (iv *ImageView) requestThumb(path string) {
 	g.asked[path] = true
 
 	v := iv.vfs
-	vtui.RunAsync(func(ctx *vtui.TaskContext) {
+	task := vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		res, ok := ImagePipe.PreviewSync(ctx.Context, v, path)
 		if !ok {
-			// No thumbnail inside the file: decoding it whole is the only
-			// way this tile will ever show anything.
-			res = ImagePipe.LoadSync(ctx.Context, v, path)
+			// No thumbnail: converters shrink RAW/AVIF, no full decode per tile.
+			res = loadGalleryTile(ctx.Context, v, path, g.tw, g.th)
 			if res.Err != nil {
 				return
 			}
 		}
 		surface := res.Surface
 		ctx.RunOnUI(func() {
-			if iv.gal != nil && surface.Valid() {
-				iv.gal.thumbs[path] = surface
+			if iv.gal == g && surface.Valid() {
+				g.thumbs[path] = surface
 			}
+			delete(g.cancels, path)
 		})
 	})
+	g.cancels[path] = task.Cancel
 }
 
 // showGallery paints the grid over the area the picture would have taken.
@@ -210,6 +220,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 	if cw <= 0 || ch <= 0 {
 		cw, ch = imageViewFallbackCellW, imageViewFallbackCellH
 	}
+	g.tw, g.th = (imageTileCols-2)*cw, (imageTileRows-2)*ch
 
 	first := g.top * g.cols
 	for slot := 0; slot < g.cols*g.rows; slot++ {
