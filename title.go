@@ -20,6 +20,8 @@ var (
 	cachedAdmin   string
 	cachedVersion string
 	cachedPlat    string
+	// static replacer only; %State and %Backend are per-call in renderConsoleTitle.
+	staticTitleReplacer *strings.Replacer
 )
 
 func initTitleCache() {
@@ -39,6 +41,10 @@ func initTitleCache() {
 	cachedAdmin = getAdminString()
 	cachedVersion = getShortVersionInfo()
 	cachedPlat = runtime.GOARCH
+
+	staticTitleReplacer = strings.NewReplacer(
+		"%Ver", cachedVersion, "%Platform", cachedPlat,
+		"%Host", cachedHost, "%User", cachedUser, "%Admin", cachedAdmin)
 }
 
 func isReleaseVersion(v string) bool {
@@ -169,28 +175,16 @@ func UpdateWindowTitle(scr *vtui.ScreenBuf) {
 	}
 
 	state := "Panels"
+	viewer := false
 	if len(vtui.FrameManager.Screens) > 0 {
-		state = stableWorkspaceTitle(vtui.FrameManager.Screens[vtui.FrameManager.ActiveIdx])
+		active := vtui.FrameManager.Screens[vtui.FrameManager.ActiveIdx]
+		state = stableWorkspaceTitle(active)
+		if n := len(active.Frames); n > 0 {
+			_, viewer = active.Frames[n-1].(*ImageView)
+		}
 	}
 
-	template := AppConfig.ConsoleTitleTemplate
-	if template == "" {
-		template = "f4 - %State"
-	}
-
-	r := strings.NewReplacer(
-		"%State", state,
-		"%Ver", cachedVersion,
-		"%Platform", cachedPlat,
-		"%Backend", getBackendName(),
-		"%Host", cachedHost,
-		"%User", cachedUser,
-		"%Admin", cachedAdmin,
-	)
-
-	title := r.Replace(template)
-	title = strings.ReplaceAll(title, "  ", " ") // Убираем двойные пробелы, если %Admin пустой
-	vtui.SetWindowTitle(title)
+	vtui.SetWindowTitle(renderConsoleTitle(titleTemplate(viewer), state))
 
 	// Macro recording indicator — drawn after MenuBar so it's always on top
 	if MacroMgr != nil && MacroMgr.Recording {
@@ -213,6 +207,28 @@ func stableWorkspaceTitle(screen *vtui.AppScreen) string {
 		}
 	}
 	return screen.GetTitle()
+}
+
+// titleTemplate: while the viewer is up, the file name leads — taskbar and
+// tabs truncate titles from the end, so the f4 build info goes after "-".
+func titleTemplate(viewerActive bool) string {
+	if viewerActive {
+		return "%State - f4 %Ver %Platform %Admin"
+	}
+	if t := AppConfig.ConsoleTitleTemplate; t != "" {
+		return t
+	}
+	return "f4 - %State"
+}
+
+// renderConsoleTitle: %State is parked on NUL so the double-space collapse
+// (meant for templates) cannot eat the state's own spacing.
+func renderConsoleTitle(template, state string) string {
+	title := strings.ReplaceAll(template, "%State", "\x00")
+	title = staticTitleReplacer.Replace(title)
+	title = strings.ReplaceAll(title, "%Backend", getBackendName())
+	title = strings.ReplaceAll(title, "  ", " ")
+	return strings.ReplaceAll(title, "\x00", state)
 }
 
 func getBackendName() string {

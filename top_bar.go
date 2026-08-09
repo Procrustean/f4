@@ -50,11 +50,16 @@ func (tb *TopBar) Show(scr *vtui.ScreenBuf) {
 	rightW := runewidth.StringWidth(rightStr)
 
 	if leftW+rightW > width {
-		if width > rightW+1 {
-			leftStr = runewidth.Truncate(leftStr, width-rightW-1, "…")
+		if width > leftW+1 {
+			// The status is shortened from the middle so that the size at the
+			// start and the state at the end survive; the name keeps its cell
+			// budget until there is no room left for the status at all.
+			rightStr = truncateMiddle(rightStr, width-leftW-1)
+			rightW = runewidth.StringWidth(rightStr)
 		} else {
-			leftStr = ""
-			rightStr = runewidth.Truncate(rightStr, width, "…")
+			rightStr = ""
+			rightW = 0
+			leftStr = runewidth.Truncate(leftStr, width, "…")
 		}
 	}
 
@@ -64,4 +69,18 @@ func (tb *TopBar) Show(scr *vtui.ScreenBuf) {
 	if rightStr != "" {
 		scr.Write(tb.X2-runewidth.StringWidth(rightStr)+1, tb.Y1, vtui.StringToCharInfo(rightStr, attr))
 	}
+}
+
+func truncateMiddle(s string, limit int) string {
+	w := runewidth.StringWidth(s)
+	if w <= limit {
+		return s
+	}
+	tail := (limit - 1) / 2
+	post := runewidth.TruncateLeft(s, w-tail, "")
+	head := limit - 1 - runewidth.StringWidth(post)
+	if head < 0 {
+		head = 0
+	}
+	return runewidth.Truncate(s, head, "") + "…" + post
 }

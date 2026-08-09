@@ -132,31 +132,51 @@ func TestTopBar_Truncation(t *testing.T) {
 	scr.AllocBuf(20, 5) // Narrow screen
 
 	tb := NewTopBar(
-		func() string { return "VeryLongLeftPartName" },
-		func() string { return "Right" },
+		func() string { return "Left" },
+		func() string { return "RightPartLongEnoughToCrop" },
 	)
 	tb.SetPosition(0, 0, 19, 0)
 	tb.SetVisible(true)
 
 	tb.Show(scr)
 
-	// Combined length (20 + 5 = 25) exceeds width (20).
-	// Right part ("Right" - 5 chars) should be preserved, and Left part should be truncated with "…".
-	// Left part should become: runewidth.Truncate("VeryLongLeftPartName", 20 - 5 - 1 = 14, "…") -> "VeryLongLeftP…"
-	expectedLeft := "VeryLongLeftP…"
+	expectedLeft := "Left"
 	for i, r := range expectedLeft {
 		cell := scr.GetCell(i, 0)
 		if cell.Char != uint64(r) {
-			t.Errorf("Expected truncated char %q at x=%d, got %q", r, i, rune(cell.Char))
+			t.Errorf("Expected char %q at x=%d, got %q", r, i, rune(cell.Char))
 		}
 	}
 
-	expectedRight := "Right"
-	rightStart := 20 - len(expectedRight)
-	for i, r := range expectedRight {
-		cell := scr.GetCell(rightStart+i, 0)
+	expectedRight := "RightPa…hToCrop"
+	rightStart := 20 - 15
+	idx := 0
+	for _, r := range expectedRight {
+		cell := scr.GetCell(rightStart+idx, 0)
 		if cell.Char != uint64(r) {
-			t.Errorf("Expected right char %q at x=%d, got %q", r, rightStart+i, rune(cell.Char))
+			t.Errorf("Expected right char %q at x=%d, got %q", r, rightStart+idx, rune(cell.Char))
+		}
+		idx++
+	}
+
+	// With no room for the status at all, the name wins.
+	scr2 := vtui.NewSilentScreenBuf()
+	scr2.AllocBuf(20, 5)
+
+	tb2 := NewTopBar(
+		func() string { return "VeryLongLeftPartName" },
+		func() string { return "Right" },
+	)
+	tb2.SetPosition(0, 0, 19, 0)
+	tb2.SetVisible(true)
+
+	tb2.Show(scr2)
+
+	expectedOnly := "VeryLongLeftPartName"
+	for i, r := range expectedOnly {
+		cell := scr2.GetCell(i, 0)
+		if cell.Char != uint64(r) {
+			t.Errorf("Expected char %q at x=%d, got %q", r, i, rune(cell.Char))
 		}
 	}
 }

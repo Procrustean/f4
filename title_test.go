@@ -8,6 +8,44 @@ import (
 	"github.com/unxed/vtui"
 )
 
+func TestRenderConsoleTitle(t *testing.T) {
+	initTitleCache()
+
+	// Template-only collapse: double spaces in the template become one,
+	// while the state keeps its own spacing verbatim.
+	if got := renderConsoleTitle("f4 - %State", "a  b"); got != "f4 - a  b" {
+		t.Errorf("state spacing was eaten: %q", got)
+	}
+	if got := renderConsoleTitle("%State  %State", "x"); got != "x x" {
+		t.Errorf("sentinel pair: %q", got)
+	}
+
+	want := cachedVersion + "|" + cachedPlat + "|" + cachedHost + "|" + cachedUser + "|" + cachedAdmin
+	if got := renderConsoleTitle("%Ver|%Platform|%Host|%User|%Admin", ""); got != want {
+		t.Errorf("static placeholders: %q, want %q", got, want)
+	}
+}
+
+func TestTitleTemplate(t *testing.T) {
+	orig := AppConfig.ConsoleTitleTemplate
+	defer func() { AppConfig.ConsoleTitleTemplate = orig }()
+
+	// Viewer: file + image info first, build info after the dash.
+	if got := titleTemplate(true); got != "%State - f4 %Ver %Platform %Admin" {
+		t.Errorf("viewer template = %q", got)
+	}
+
+	// Other frames keep the configured template; blank falls back.
+	AppConfig.ConsoleTitleTemplate = "custom %State"
+	if got := titleTemplate(false); got != "custom %State" {
+		t.Errorf("custom template = %q", got)
+	}
+	AppConfig.ConsoleTitleTemplate = ""
+	if got := titleTemplate(false); got != "f4 - %State" {
+		t.Errorf("fallback template = %q", got)
+	}
+}
+
 func TestUpdateWindowTitle(t *testing.T) {
 	// 1. Резервное копирование текущего состояния конфигурации
 	origTemplate := AppConfig.ConsoleTitleTemplate
