@@ -291,7 +291,7 @@ func TestImageViewArrowsPanAZoomedPicture(t *testing.T) {
 	}
 }
 
-func TestImageViewInsertPicksAndMovesOn(t *testing.T) {
+func TestImageViewInsertPicksWithoutMoving(t *testing.T) {
 	withStubPipeline(t, 20, 10)
 
 	iv := newTestImageView(t, 100, 100)
@@ -320,8 +320,8 @@ func TestImageViewInsertPicksAndMovesOn(t *testing.T) {
 	if !iv.selected["a.png"] {
 		t.Error("Insert must pick the picture on screen")
 	}
-	if iv.path != "b.png" {
-		t.Errorf("Insert must then move on, got %q", iv.path)
+	if iv.path != "a.png" {
+		t.Errorf("Insert must toggle selection without moving on, got %q", iv.path)
 	}
 
 	iv.GoTo(0)
@@ -339,21 +339,73 @@ func TestImageViewInsertPicksAndMovesOn(t *testing.T) {
 
 func TestImageViewTitleMarksAPickedPicture(t *testing.T) {
 	iv := newTestImageView(t, 10, 10)
-	if iv.pickMark() != "" || iv.titleAttr() != 0 {
+	if iv.titleName() != "test.png" {
 		t.Fatal("an unpicked picture must not be marked")
 	}
 
 	iv.SetSelected(iv.path, true)
-	if iv.pickMark() == "" {
-		t.Error("a picked picture must be marked in the title")
-	}
-	if iv.titleAttr() != imageTilePickedAttr {
-		t.Error("a picked picture must colour the title bar")
+	if iv.titleName() != "*test.png" {
+		t.Errorf("a picked picture must be marked in the title, got %q", iv.titleName())
 	}
 
 	iv.SetSelected(iv.path, false)
-	if iv.pickMark() != "" || iv.titleAttr() != 0 {
+	if iv.titleName() != "test.png" {
 		t.Error("unpicking must take the mark away again")
+	}
+}
+
+func TestImageViewDecodeToastDefersToUser(t *testing.T) {
+	iv := newTestImageView(t, 10, 10)
+	iv.toast("scale: 100%")
+
+	res := ImageResult{Surface: vtui.NewImageSurface(20, 20), Decoder: "png", DecodeDur: time.Second}
+	iv.accept(iv.loadGen, res)
+	if iv.tempMsg != "scale: 100%" {
+		t.Errorf("a decode report must not overwrite a user message, got %q", iv.tempMsg)
+	}
+
+	iv.tempMsg = ""
+	iv.accept(iv.loadGen, res)
+	if iv.tempMsg != "png 1.00s" {
+		t.Errorf("with the slot free the decode report is shown, got %q", iv.tempMsg)
+	}
+}
+
+func TestImageViewDecodeErrorToast(t *testing.T) {
+	iv := newTestImageView(t, 10, 10)
+
+	iv.accept(iv.loadGen, ImageResult{Err: errors.New("broken")})
+	if iv.err == nil || iv.err.Error() != "broken" {
+		t.Fatalf("the error must stay in the state, got %v", iv.err)
+	}
+	if iv.tempMsg != "error: broken" {
+		t.Errorf("the error must reach the toast too, got %q", iv.tempMsg)
+	}
+}
+
+func TestImageViewNavigationFollowsToThePanel(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "a.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 0)
+	for _, name := range []string{"a.png", "b.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	var followed []string
+	iv.OnNavigate = func(path string) { followed = append(followed, path) }
+
+	iv.Step(1)
+	if len(followed) != 1 || followed[0] != "b.png" {
+		t.Fatalf("stepping on must report the new picture, got %v", followed)
+	}
+
+	iv.Close()
+	if len(followed) != 2 || followed[1] != "b.png" {
+		t.Errorf("closing must leave the cursor on the viewed picture, got %v", followed)
 	}
 }
 

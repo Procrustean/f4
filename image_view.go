@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/unxed/f4/vfs"
@@ -16,6 +17,9 @@ const (
 	imageViewMinZoom = 0.05
 	imageViewMaxZoom = 40.0
 
+	// 20% per press: firm step between coarse 25% and a too-fine gradation.
+	imageViewZoomFactor = 1.2
+
 	// Terminal backends cannot always tell us how big a character cell is.
 	// The exact numbers only affect the aspect ratio, so a common default is
 	// good enough until the size can be queried.
@@ -25,14 +29,23 @@ const (
 	// imageViewPrefetchRadius is how many pictures on each side are decoded
 	// before anybody asks to see them.
 	imageViewPrefetchRadius = 2
+
+	// toast stays a moment.
+	imageViewToastDelay = 2 * time.Second
+
+	// decode may run this long before the viewer admits it is working.
+	imageViewDecodeDelay = 500 * time.Millisecond
 )
 
 var imageViewBackAttr = vtui.SetRGBBoth(0, 0xC0C0C0, 0x101010)
 
-// imageOverlayAttr is what the info panel is written with. The background
-// only matters on backends that paint it over the picture; where the terminal
-// honours a negative z index, the picture shows through it.
-var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x202020)
+// overlay: opaque dark slab keeps the info line legible.
+var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
+
+// toast: white on a dark slab. The picture lies over every cell background,
+// so the slab colour only shows where the picture does not reach; the light
+// glyphs are what keeps the message readable on top of the image.
+var imageToastAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x333333)
 
 // ImageView shows a single picture full screen.
 type ImageView struct {
@@ -55,7 +68,7 @@ type ImageView struct {
 	actual     bool
 	full       bool
 	lastScale  float64
-	zoom       float64
+	zoom       float64 // the zoom currently on screen
 	panX, panY float64
 
 	// How far the picture can still be moved along each axis, as of the last
@@ -81,12 +94,36 @@ type ImageView struct {
 	overlay   bool
 	fileSize  int64
 	sizeKnown bool
+	fileTime  time.Time
+	timeKnown bool
 	gal       *imageGallery
 	selected  map[string]bool
 	slideStop chan struct{}
 
-	OnClose  func()
-	OnSelect func(path string, selected bool)
+	// reqDecoder pins the next decode; empty = the automatic chain.
+	reqDecoder string
+
+	// decodeDur: decode time reported by the overlay.
+	decodeDur time.Duration
+
+	// zoomFocus: anchor under the window centre; anchorPending = not placed yet.
+	zoomFocusX, zoomFocusY float64
+	anchorPending          bool
+	visW, visH             int
+
+	// tempMsg: transient message, lower-left.
+	tempMsg   string
+	tempUntil time.Time
+
+	// decodeStart: toast once past imageViewDecodeDelay.
+	decodeStart time.Time
+
+	// decodeCancel: stops an in-flight external decode on moving on.
+	decodeCancel context.CancelFunc
+
+	OnClose    func()
+	OnSelect   func(path string, selected bool)
+	OnNavigate func(path string)
 }
 
 // NewImageView loads and decodes the file. Decoding happens here rather than
@@ -104,63 +141,40 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 	surf, decoder := res.Surface, res.Decoder
 
 	iv := &ImageView{
-		vfs:     v,
-		path:    path,
-		surface: surf,
-		decoder: decoder,
-		preview: res.Preview,
-		zoom:    1,
+		vfs:       v,
+		path:      path,
+		surface:   surf,
+		decoder:   decoder,
+		preview:   res.Preview,
+		zoom:      1,
+		full:      AppConfig.ImageFullScreen,
+		overlay:   AppConfig.ImageShowOverlay,
+		decodeDur: res.DecodeDur,
 	}
 	iv.gfxKey = fmt.Sprintf("f4.imageview:%p", iv)
 
 	iv.index = -1
 	iv.topBar = NewTopBar(
 		func() string {
-			base := iv.path
-			if v != nil {
-				base = v.Base(iv.path)
-			} else {
-				base = filepath.Base(iv.path)
-			}
-			return " " + base
+			return " " + iv.titleName()
 		},
 		func() string {
-			state := iv.decoder
-			switch {
-			case iv.err != nil:
-				state = "error: " + iv.err.Error()
-			case iv.loading:
-				state += ", loading"
-			case iv.preview:
-				state += ", preview"
-			}
-			if iv.slideStop != nil {
-				state += ", slideshow"
-			}
-
-			position := ""
-			if iv.index >= 0 && len(iv.siblings) > 1 {
-				position = fmt.Sprintf(" │ %d/%d", iv.index+1, len(iv.siblings))
-			}
-
-			position += iv.pickMark()
-
-			scale := iv.lastScale
-			if scale <= 0 {
-				scale = iv.zoom
-			}
-			return fmt.Sprintf(" %dx%d │ %d%%%s │ %s ",
-				iv.display().Width, iv.display().Height,
-				int(scale*100+0.5), position, state)
+			segs := iv.infoSegments()
+			// Blank tail for the workspace counter "[N]", drawn over the
+			// top-right corner after the bar.
+			return " " + strings.Join(segs, " │ ") + "   "
 		},
 	)
-	iv.topBar.GetAttr = iv.titleAttr
 	iv.topBar.SetVisible(true)
 	iv.SetCanFocus(true)
 	iv.SetFocus(true)
 
 	// What is on screen is a stand-in; ask for the real thing.
 	iv.loading = res.Preview
+	iv.decodeStart = time.Now()
+	if iv.overlay {
+		iv.requestFileSize()
+	}
 	if res.Preview {
 		gen := iv.loadGen
 		ImagePipe.Load(v, path, func(full ImageResult) {
@@ -217,6 +231,9 @@ func (iv *ImageView) GoTo(idx int) {
 	}
 	iv.index = idx
 	iv.open(iv.siblings[idx])
+	if iv.OnNavigate != nil {
+		iv.OnNavigate(iv.path)
+	}
 }
 
 // Reload decodes the file again, for a picture that has changed since it was
@@ -224,40 +241,100 @@ func (iv *ImageView) GoTo(idx int) {
 func (iv *ImageView) Reload() {
 	ImagePipe.Invalidate(iv.vfs, iv.path)
 	iv.open(iv.path)
+	iv.toast("re-decoded")
 }
 
 // open puts another picture on screen. One that is decoded already appears
 // at once; otherwise the previous picture stays until the new one arrives,
 // which is quieter than a flash of empty window.
 func (iv *ImageView) open(path string) {
+	iv.cancelDecode()
 	iv.path = path
 	iv.zoom = 1
 	iv.panX, iv.panY = 0, 0
 	iv.rotation, iv.flipH, iv.flipV = 0, false, false
 	iv.fileSize, iv.sizeKnown = 0, false
+	iv.fileTime, iv.timeKnown = time.Time{}, false
 	iv.shown = nil
 	iv.err = nil
+	iv.decodeDur = 0
 	iv.loadGen++
 	gen := iv.loadGen
 	iv.prefetch()
 	if iv.overlay {
 		iv.requestFileSize()
 	}
-
-	if res, ok := ImagePipe.Cached(iv.vfs, path); ok {
-		iv.accept(gen, res)
-		return
+	if iv.reqDecoder != "" && !imageChoiceValid(iv.reqDecoder) {
+		iv.reqDecoder = ""
 	}
 
+	if iv.reqDecoder == "" {
+		if res, ok := ImagePipe.Cached(iv.vfs, path); ok {
+			iv.accept(gen, res)
+			return
+		}
+		iv.openAutomatic(gen, path)
+		return
+	}
+	iv.openPinned(gen, path, iv.reqDecoder)
+}
+
+func (iv *ImageView) openAutomatic(gen uint64, path string) {
 	iv.loading = true
+	iv.decodeStart = time.Now()
 	v := iv.vfs
-	vtui.RunAsync(func(ctx *vtui.TaskContext) {
+	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		if res, ok := ImagePipe.PreviewSync(ctx.Context, v, path); ok {
 			ctx.RunOnUI(func() { iv.accept(gen, res) })
 		}
 		res := ImagePipe.LoadSync(ctx.Context, v, path)
 		ctx.RunOnUI(func() { iv.accept(gen, res) })
-	})
+	}).Cancel
+}
+
+// Pin: named decoder only; a non-reader falls back, dropping the pin.
+func (iv *ImageView) openPinned(gen uint64, path, dec string) {
+	iv.loading = true
+	iv.decodeStart = time.Now()
+	v := iv.vfs
+	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
+		start := time.Now()
+		data, err := imageFileBytes(ctx.Context, v, path)
+		pinned := false
+		var surf *vtui.ImageSurface
+		var decoder string
+		if err == nil {
+			surf, decoder, err = loadImageForBytes(ctx.Context, path, data, dec)
+			pinned = err == nil
+			if err != nil {
+				start = time.Now()
+				surf, decoder, err = loadImageForBytes(ctx.Context, path, data, "")
+			}
+		}
+		res := ImageResult{Path: path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}
+		ctx.RunOnUI(func() {
+			if gen == iv.loadGen && !pinned && err == nil {
+				iv.reqDecoder = ""
+			}
+			iv.accept(gen, res)
+		})
+	}).Cancel
+}
+
+func (iv *ImageView) CycleDecoder() {
+	next := imageNextDecoder(imageDecoderChoices(iv.path), iv.reqDecoder, iv.decoder)
+	if next == "" {
+		return
+	}
+	iv.reqDecoder = next
+	iv.open(iv.path)
+}
+
+func (iv *ImageView) cancelDecode() {
+	if iv.decodeCancel != nil {
+		iv.decodeCancel()
+		iv.decodeCancel = nil
+	}
 }
 
 // accept takes a result unless the reader has moved on since asking for it.
@@ -268,11 +345,15 @@ func (iv *ImageView) accept(gen uint64, res ImageResult) {
 	if res.Err != nil {
 		iv.loading = false
 		iv.err = res.Err
+		iv.toast("error: " + res.Err.Error())
 		vtui.DebugLog("IMAGE: %s: %v", res.Path, res.Err)
 		return
 	}
 	iv.SetImage(res)
 	iv.loading = res.Preview
+	if !res.Preview && res.Decoder != "" && res.DecodeDur > imageViewDecodeDelay && !iv.tempActive() {
+		iv.toast(decoderWithTime(res.Decoder, res.DecodeDur))
+	}
 }
 
 // baseScale is what a zoom of one means: the picture fitted into the window,
@@ -330,6 +411,7 @@ func (iv *ImageView) Rotate(delta int) {
 	iv.rotation = ((iv.rotation+delta)%360 + 360) % 360
 	iv.panX, iv.panY = 0, 0
 	iv.rebuild()
+	iv.toast("rotated")
 }
 
 // Flip mirrors the picture as it is seen, so it is applied after the turn.
@@ -342,11 +424,10 @@ func (iv *ImageView) Flip(horizontal, vertical bool) {
 	}
 	iv.panX, iv.panY = 0, 0
 	iv.rebuild()
+	iv.toast("mirrored")
 }
 
-// SetImage replaces the picture on screen, keeping the viewer looking at the
-// same part of it. Sizes differ between a thumbnail and the picture itself,
-// so the panning is measured in the new picture's pixels.
+// Keep the anchor centred, rescaled for the new size.
 func (iv *ImageView) SetImage(res ImageResult) {
 	if res.Surface == nil || !res.Surface.Valid() {
 		return
@@ -355,11 +436,17 @@ func (iv *ImageView) SetImage(res ImageResult) {
 	iv.surface = res.Surface
 	iv.decoder = res.Decoder
 	iv.preview = res.Preview
+	iv.decodeDur = res.DecodeDur
 	iv.rebuild()
-	if prev.Valid() && prev.Width > 0 {
-		scale := float64(iv.display().Width) / float64(prev.Width)
-		iv.panX *= scale
-		iv.panY *= scale
+	if prev.Valid() && prev.Width > 0 && prev.Height > 0 {
+		if !iv.anchorPending {
+			iv.zoomFocusX = iv.panX + float64(iv.visW)/2
+			iv.zoomFocusY = iv.panY + float64(iv.visH)/2
+		}
+		sc := float64(iv.display().Width) / float64(prev.Width)
+		iv.zoomFocusX *= sc
+		iv.zoomFocusY *= sc
+		iv.anchorPending = true
 	}
 }
 
@@ -381,7 +468,7 @@ func (iv *ImageView) ResizeConsole(w, h int) {
 	iv.SetPosition(0, 0, w-1, bottom)
 }
 
-// SetZoom applies a new zoom factor, 1 meaning "fit into the window".
+// SetZoom: 1 means fit; one press, one redraw (terminal too slow to animate).
 func (iv *ImageView) SetZoom(z float64) {
 	if z < imageViewMinZoom {
 		z = imageViewMinZoom
@@ -389,7 +476,13 @@ func (iv *ImageView) SetZoom(z float64) {
 	if z > imageViewMaxZoom {
 		z = imageViewMaxZoom
 	}
+	if !iv.anchorPending {
+		iv.zoomFocusX = iv.panX + float64(iv.visW)/2
+		iv.zoomFocusY = iv.panY + float64(iv.visH)/2
+		iv.anchorPending = true
+	}
 	iv.zoom = z
+	iv.toast(fmt.Sprintf("scale: %d%%", int(iv.zoom*100+0.5)))
 }
 
 // Pan moves the visible region by a step of one twentieth of the image.
@@ -491,6 +584,8 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 	if dispW <= boxW && dispH <= boxH {
 		iv.panX, iv.panY = 0, 0
 		iv.panMaxX, iv.panMaxY = 0, 0
+		iv.visW, iv.visH = img.Width, img.Height
+		iv.anchorPending = false
 		p.Cols, p.Rows = cellsFor(dispW, cw, cols), cellsFor(dispH, ch, rows)
 		p.Col = x1 + (cols-p.Cols)/2
 		p.Row = top + (rows-p.Rows)/2
@@ -518,6 +613,12 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 	}
 	if iv.panMaxY < 0 {
 		iv.panMaxY = 0
+	}
+	iv.visW, iv.visH = visW, visH
+	if iv.anchorPending {
+		iv.panX = iv.zoomFocusX - float64(visW)/2
+		iv.panY = iv.zoomFocusY - float64(visH)/2
+		iv.anchorPending = false
 	}
 	iv.clampPan(visW, visH)
 
@@ -561,24 +662,14 @@ func (iv *ImageView) arrow(dx, dy int) {
 	iv.Step(1)
 }
 
-// pickMark is what the title bar says about the picture being selected. The
-// colour says it as well, but a mark survives a terminal nobody has set the
-// colours of.
-func (iv *ImageView) pickMark() string {
+// titleName is what the title bar calls the picture: a leading * once it is
+// picked, so selection is visible without leaving the viewer. The colour says
+// it as well, but the mark survives a terminal nobody has set colours of.
+func (iv *ImageView) titleName() string {
 	if iv.selected[iv.path] {
-		return " *"
+		return "*" + iv.baseName()
 	}
-	return ""
-}
-
-// titleAttr colours the title bar. A picked picture gets the colour the grid
-// gives a picked tile, so that the two views say the same thing the same way.
-// Zero leaves the palette in charge.
-func (iv *ImageView) titleAttr() uint64 {
-	if iv.selected[iv.path] {
-		return imageTilePickedAttr
-	}
-	return 0
+	return iv.baseName()
 }
 
 // logGeometry records what the layout worked out to, once per change. It is
@@ -626,6 +717,8 @@ func (iv *ImageView) SetFullScreen(on bool) {
 		return
 	}
 	iv.full = on
+	AppConfig.ImageFullScreen = on
+	RequestSaveConfig()
 	vtui.FrameManager.HideBars = on
 	if iv.conW > 0 && iv.conH > 0 {
 		iv.ResizeConsole(iv.conW, iv.conH)
@@ -635,6 +728,8 @@ func (iv *ImageView) SetFullScreen(on bool) {
 // ToggleOverlay shows or hides the panel that describes the picture.
 func (iv *ImageView) ToggleOverlay() {
 	iv.overlay = !iv.overlay
+	AppConfig.ImageShowOverlay = iv.overlay
+	RequestSaveConfig()
 	if iv.overlay {
 		iv.requestFileSize()
 	}
@@ -656,6 +751,9 @@ func (iv *ImageView) requestFileSize() {
 		ctx.RunOnUI(func() {
 			if gen == iv.loadGen {
 				iv.fileSize, iv.sizeKnown = item.Size, true
+				if !item.MTime.IsZero() {
+					iv.fileTime, iv.timeKnown = item.MTime, true
+				}
 			}
 		})
 	})
@@ -677,35 +775,141 @@ func imageOrientationLabel(rotation int, flipH, flipV bool) string {
 	return strings.Join(parts, ", ")
 }
 
-// overlayLines is what the info panel has to say about the picture.
-func (iv *ImageView) overlayLines() []string {
-	name := filepath.Base(iv.path)
+// baseName is what the viewer calls the file it shows.
+func (iv *ImageView) baseName() string {
 	if iv.vfs != nil {
-		name = iv.vfs.Base(iv.path)
+		return iv.vfs.Base(iv.path)
 	}
+	return filepath.Base(iv.path)
+}
 
+// displaySize is the picture dimensions, "1442 x 2160".
+func (iv *ImageView) displaySize() string {
 	img := iv.display()
+	return fmt.Sprintf("%d x %d", img.Width, img.Height)
+}
+
+// scalePercent is how much of the picture fits the window, rounded.
+func (iv *ImageView) scalePercent() int {
 	scale := iv.lastScale
 	if scale <= 0 {
 		scale = iv.zoom
 	}
+	return int(scale*100 + 0.5)
+}
 
+// positionLabel is "4/683" when the viewer shares its folder with other files.
+func (iv *ImageView) positionLabel() string {
+	if iv.index >= 0 && len(iv.siblings) > 1 {
+		return fmt.Sprintf("%d/%d", iv.index+1, len(iv.siblings))
+	}
+	return ""
+}
+
+// decoderLabel is "go-std 15 ms" in the OSD and titles; a converter shows
+// up as plain "im" or "magick".
+func (iv *ImageView) decoderLabel() string {
+	return decoderWithTime(iv.decoder, iv.decodeDur)
+}
+
+func decoderWithTime(decoder string, dur time.Duration) string {
+	if dur <= 0 {
+		return decoder
+	}
+	return decoder + " " + formatImageDuration(dur)
+}
+
+// stateLabel adds the picture's status; ", slideshow" always goes last.
+func (iv *ImageView) stateLabel() string {
+	state := iv.decoderLabel()
+	switch {
+	case iv.err != nil:
+		state = "error: " + iv.err.Error()
+	case iv.loading:
+		state += ", loading"
+	case iv.preview:
+		state += ", preview"
+	}
+	if iv.slideStop != nil {
+		state += ", slideshow"
+	}
+	return state
+}
+
+// infoSegments is the top bar's right half; GetTitle spells it with 3 spaces.
+func (iv *ImageView) infoSegments() []string {
+	parts := []string{iv.displaySize(), fmt.Sprintf("%d%%", iv.scalePercent())}
+	if rel := iv.positionLabel(); rel != "" {
+		parts = append(parts, rel)
+	}
+	parts = append(parts, iv.stateLabel())
+	return parts
+}
+
+// overlayLines is what the info panel has to say about the picture.
+func (iv *ImageView) overlayLines() []string {
 	size := "unknown size"
 	if iv.sizeKnown {
 		size = formatSize(iv.fileSize)
 	}
 
 	lines := []string{
-		name,
-		fmt.Sprintf("%dx%d", img.Width, img.Height),
+		iv.baseName(),
+		iv.displaySize(),
 		size,
-		iv.decoder,
-		fmt.Sprintf("%d%%", int(scale*100+0.5)),
 	}
+	if iv.timeKnown {
+		lines = append(lines, iv.fileTime.Format("2006-01-02 15:04"))
+	}
+	lines = append(lines, iv.decoderLabel())
 	if label := imageOrientationLabel(iv.rotation, iv.flipH, iv.flipV); label != "" {
 		lines = append(lines, label)
 	}
 	return lines
+}
+
+func formatImageDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return fmt.Sprintf("%dµs", d.Microseconds())
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%.0fms", float64(d)/float64(time.Millisecond))
+	}
+	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+func (iv *ImageView) toast(msg string) {
+	iv.tempMsg = msg
+	iv.tempUntil = time.Now().Add(imageViewToastDelay)
+}
+
+func (iv *ImageView) tempActive() bool {
+	return iv.tempMsg != "" && time.Now().Before(iv.tempUntil)
+}
+
+func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64) {
+	width := runewidth.StringWidth(text)
+	if width > limit {
+		width = limit
+	}
+	text = runewidth.Truncate(text, width, "…")
+	if w := runewidth.StringWidth(text); w < width {
+		text += strings.Repeat(" ", width-w)
+	}
+	scr.Write(x, y, vtui.StringToCharInfo(text, attr))
+}
+
+func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf, msg string) {
+	x1, _, x2, y2 := iv.GetPosition()
+	limit := x2 - x1 - 1
+	if limit < 1 {
+		limit = 1
+	}
+	text := " " + msg + " "
+	if runewidth.StringWidth(text) > limit {
+		text = runewidth.Truncate(text, limit, "…")
+	}
+	scr.Write(x1, y2, vtui.StringToCharInfo(text, imageToastAttr))
 }
 
 // drawOverlay writes the info panel over the left edge of the picture.
@@ -724,23 +928,22 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 		}
 	}
 	width += 2
-	if limit := x2 - x1 + 1; width > limit {
+	if limit := (x2 - x1 + 1) / 2; width > limit {
 		width = limit
 	}
-	if width <= 0 {
+	rows := len(lines)
+	if rows > y2-top {
+		rows = y2 - top
+	}
+	if width <= 0 || rows <= 0 {
 		return
 	}
 
-	for i, line := range lines {
-		row := top + i
-		if row > y2 {
-			break
-		}
-		text := runewidth.Truncate(" "+line, width, "…")
-		if w := runewidth.StringWidth(text); w < width {
-			text += strings.Repeat(" ", width-w)
-		}
-		scr.Write(x1, row, vtui.StringToCharInfo(text, imageOverlayAttr))
+	// One slab under all the lines, with a row of air above it: the panel
+	// reads as a pane, not as separate stickers.
+	scr.FillRect(x1, top+1, x1+width-1, top+rows, ' ', imageOverlayAttr)
+	for i := 0; i < rows; i++ {
+		paintPadded(scr, x1, top+1+i, width, " "+lines[i], imageOverlayAttr)
 	}
 }
 
@@ -778,6 +981,16 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	iv.logGeometry(scr, p)
 	if iv.overlay {
 		iv.drawOverlay(scr)
+	}
+	if iv.tempMsg != "" {
+		if iv.tempActive() {
+			iv.drawToastText(scr, iv.tempMsg)
+		} else {
+			iv.tempMsg = ""
+		}
+	}
+	if iv.loading && !iv.tempActive() && time.Since(iv.decodeStart) > imageViewDecodeDelay {
+		iv.drawToastText(scr, "loading...")
 	}
 }
 
@@ -823,10 +1036,10 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 
 	switch e.Char {
 	case '+', '=', 'e', 'E':
-		iv.SetZoom(iv.zoom * 1.25)
+		iv.SetZoom(iv.zoom * imageViewZoomFactor)
 		return true
 	case '-', '_', 'q', 'Q':
-		iv.SetZoom(iv.zoom / 1.25)
+		iv.SetZoom(iv.zoom / imageViewZoomFactor)
 		return true
 	case '*', '0':
 		iv.ToggleActualSize()
@@ -882,13 +1095,14 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 	case vtinput.VK_F12:
 		iv.ToggleGallery()
 		return true
+	case vtinput.VK_F4:
+		iv.CycleDecoder()
+		return true
 	case vtinput.VK_INSERT:
 		iv.SetSelected(iv.path, !iv.selected[iv.path])
-		iv.Step(1)
 		return true
 	case vtinput.VK_DELETE:
 		iv.SetSelected(iv.path, false)
-		iv.Step(1)
 		return true
 	case vtinput.VK_LEFT:
 		iv.arrow(-1, 0)
@@ -918,9 +1132,14 @@ func (iv *ImageView) Close() {
 	// The whole screen mode is a state of the manager, not of the frame, so
 	// leaving the viewer has to hand the bars back.
 	iv.full = false
+	iv.cancelDecode()
 	iv.stopSlideShow()
 	vtui.FrameManager.HideBars = false
 	iv.BaseFrame.Close()
+	// Leave the panel cursor on the picture the viewer stopped at.
+	if iv.OnNavigate != nil {
+		iv.OnNavigate(iv.path)
+	}
 	if iv.OnClose != nil {
 		iv.OnClose()
 	}
@@ -936,9 +1155,13 @@ func (iv *ImageView) GetKeyLabels() *vtui.KeySet {
 
 func (iv *ImageView) GetType() vtui.FrameType { return vtui.TypeUser + 7 }
 
+// GetTitle is the window title while the viewer is on screen, the same data
+// as the top bar in plain spacing.
 func (iv *ImageView) GetTitle() string {
-	if iv.path != "" {
-		return "Image: " + filepath.Base(iv.path)
+	parts := []string{iv.titleName(), iv.displaySize(), fmt.Sprintf("%d%%", iv.scalePercent())}
+	if rel := iv.positionLabel(); rel != "" {
+		parts = append(parts, rel)
 	}
-	return "Image"
+	parts = append(parts, iv.stateLabel())
+	return strings.Join(parts, "   ")
 }

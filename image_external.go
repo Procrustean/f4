@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	// externalImageDecoder is the name the interface shows and the name the
-	// DecoderPriority setting uses.
+	// externalImageDecoder is the registry name of the external converter,
+	// the name the DecoderPriority setting stores. The interface shows the
+	// tool's own name ("im", "vips") instead, which is friendlier.
 	externalImageDecoder = "external"
 
 	// externalImagePriority puts the converter below every built-in
@@ -199,7 +200,7 @@ func externalImageToolLabel(data []byte) string {
 	if !ok {
 		return ""
 	}
-	return externalImageDecoder + " (" + tool.Label + ")"
+	return tool.Label
 }
 
 // configuredExternalImageTimeout reads the [Images] ExternalTimeout setting.
@@ -471,7 +472,7 @@ func loadImageScaled(ctx context.Context, v vfs.VFS, path string, w, h int) (*vt
 	if err != nil {
 		return nil, "", err
 	}
-	return surf, externalImageDecoder + " (" + tool.Label + ")", nil
+	return surf, tool.Label, nil
 }
 
 // installedExternalImageTools spreads one tool: magick and convert

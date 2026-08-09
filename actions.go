@@ -1255,6 +1255,9 @@ func tryOpenImageViewer(pf *PanelsFrame, v vfs.VFS, path string) bool {
 			iv.SetSiblings(siblings, index)
 			iv.SetSelection(picked)
 			if fsp != nil && v != nil {
+				iv.OnNavigate = func(sibling string) {
+					fsp.SelectName(v.Base(sibling))
+				}
 				iv.OnSelect = func(sibling string, on bool) {
 					if fsp.SetSelectedByName(v.Base(sibling), on) {
 						fsp.Refresh()
@@ -1262,6 +1265,7 @@ func tryOpenImageViewer(pf *PanelsFrame, v vfs.VFS, path string) bool {
 				}
 			}
 			iv.ResizeConsole(pf.lastW, pf.lastH)
+			vtui.FrameManager.HideBars = iv.full
 			vtui.FrameManager.AddScreen(iv)
 		})
 	})

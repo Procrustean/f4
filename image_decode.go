@@ -303,7 +303,7 @@ func imageDecoderChoices(path string) []imageDecoderChoice {
 		for _, tool := range installedExternalImageTools() {
 			out = append(out, imageDecoderChoice{
 				key:   imageDecoderChoiceTool + tool.Label,
-				label: externalImageDecoder + " (" + tool.Label + ")",
+				label: tool.Label,
 			})
 		}
 	}
@@ -397,7 +397,7 @@ func loadImageForBytes(ctx context.Context, path string, data []byte, choice str
 		if err != nil {
 			return nil, "", err
 		}
-		return surf, externalImageDecoder + " (" + tool.Label + ")", nil
+		return surf, tool.Label, nil
 	}
 	return decodeImagePreferred(ctx, path, data, choice)
 }
