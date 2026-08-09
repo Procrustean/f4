@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
@@ -33,6 +34,9 @@ type ImageResult struct {
 	Decoder string
 	Preview bool
 	Err     error
+
+	// DecodeDur is decode time incl. file read; the info panel reports it.
+	DecodeDur time.Duration
 }
 
 // imageCacheKey identifies a picture. The same path in two different file
@@ -59,6 +63,7 @@ type imageJob struct {
 	key     imageCacheKey
 	v       vfs.VFS
 	path    string
+	ctx     context.Context
 	urgent  bool
 	waiters []imageWaiter
 }
@@ -196,17 +201,26 @@ func (p *ImagePipeline) Load(v vfs.VFS, path string, done func(ImageResult)) {
 		}
 		return
 	}
-	p.request(v, path, true, imageWaiter{fn: done, ui: true})
+	p.request(v, path, true, imageWaiter{fn: done, ui: true}, context.Background())
 }
 
-// LoadSync decodes a picture and waits for it. It is meant for callers that
-// already run in the background and would rather block than be called back.
+// LoadSync decodes a picture and waits; callers already run in the background.
 func (p *ImagePipeline) LoadSync(ctx context.Context, v vfs.VFS, path string) ImageResult {
+	return p.loadSync(ctx, v, path, true)
+}
+
+// LoadTileSync is LoadSync for a gallery tile: never preempts the picture on
+// screen, which matters when a grid full of big files is opening.
+func (p *ImagePipeline) LoadTileSync(ctx context.Context, v vfs.VFS, path string) ImageResult {
+	return p.loadSync(ctx, v, path, false)
+}
+
+func (p *ImagePipeline) loadSync(ctx context.Context, v vfs.VFS, path string, urgent bool) ImageResult {
 	if res, ok := p.Cached(v, path); ok {
 		return res
 	}
 	ch := make(chan ImageResult, 1)
-	p.request(v, path, true, imageWaiter{fn: func(res ImageResult) { ch <- res }})
+	p.request(v, path, urgent, imageWaiter{fn: func(res ImageResult) { ch <- res }}, ctx)
 
 	if ctx == nil {
 		return <-ch
@@ -250,7 +264,7 @@ func (p *ImagePipeline) Prefetch(v vfs.VFS, paths []string) {
 		if cached {
 			continue
 		}
-		p.request(v, path, false, imageWaiter{})
+		p.request(v, path, false, imageWaiter{}, context.Background())
 	}
 }
 
@@ -281,7 +295,7 @@ func (p *ImagePipeline) CacheStats() (int, int64) {
 	return len(p.cache), p.bytes
 }
 
-func (p *ImagePipeline) request(v vfs.VFS, path string, urgent bool, w imageWaiter) {
+func (p *ImagePipeline) request(v vfs.VFS, path string, urgent bool, w imageWaiter, ctx context.Context) {
 	key := imageCacheKey{Source: imageSource(v), Path: path}
 
 	p.mu.Lock()
@@ -293,11 +307,18 @@ func (p *ImagePipeline) request(v vfs.VFS, path string, urgent bool, w imageWait
 		}
 		if urgent {
 			job.urgent = true
+			// Adopt the reader's context: a job started by a prefetch or an
+			// earlier reader belongs to whoever is asking now, so it dies
+			// when that reader steps away. context.Background keeps the
+			// original owner's lifetime.
+			if ctx != nil && ctx != context.Background() {
+				job.ctx = ctx
+			}
 		}
 		return
 	}
 
-	job := &imageJob{key: key, v: v, path: path, urgent: urgent}
+	job := &imageJob{key: key, v: v, path: path, ctx: ctx, urgent: urgent}
 	if w.fn != nil {
 		job.waiters = append(job.waiters, w)
 	}
@@ -337,8 +358,27 @@ func (p *ImagePipeline) nextJob() *imageJob {
 }
 
 func (p *ImagePipeline) run(job *imageJob) {
-	surf, decoder, err := p.load(context.Background(), job.v, job.path)
-	res := ImageResult{Path: job.path, Surface: surf, Decoder: decoder, Err: err}
+	// Snapshot ctx under the lock: request() may hand the job to a newer
+	// reader; aborting before the decode starts costs nothing.
+	p.mu.Lock()
+	ctx := job.ctx
+	p.mu.Unlock()
+
+	// A decode the reader stepped away from is wasted: not on screen, and
+	// its surface would push a live picture out of the cache.
+	if err := ctx.Err(); err != nil {
+		p.done(job, ImageResult{Path: job.path, Err: err})
+		return
+	}
+
+	start := time.Now()
+	surf, decoder, err := p.load(ctx, job.v, job.path)
+	res := ImageResult{Path: job.path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}
+
+	if ctx.Err() != nil {
+		p.done(job, res)
+		return
+	}
 
 	p.mu.Lock()
 	delete(p.jobs, job.key)
@@ -351,6 +391,25 @@ func (p *ImagePipeline) run(job *imageJob) {
 	p.pump()
 	p.mu.Unlock()
 
+	p.dispatchWaiters(waiters, res)
+}
+
+// done finishes a job whose decode was abandoned or never started, waking
+// waiters still listening. The caller holds no lock.
+func (p *ImagePipeline) done(job *imageJob, res ImageResult) {
+	p.mu.Lock()
+	delete(p.jobs, job.key)
+	p.busy--
+	waiters := job.waiters
+	job.waiters = nil
+	p.pump()
+	p.mu.Unlock()
+	p.dispatchWaiters(waiters, res)
+}
+
+// dispatchWaiters runs a finished job's waiters, UI ones on the UI thread.
+// The caller holds no lock.
+func (p *ImagePipeline) dispatchWaiters(waiters []imageWaiter, res ImageResult) {
 	var onUI []imageWaiter
 	for _, w := range waiters {
 		if w.ui {
