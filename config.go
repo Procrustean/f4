@@ -213,6 +213,7 @@ type F4Config struct {
 	ImageDecoderPriority   string
 	ImageFullScreen        bool
 	ImageShowOverlay       bool
+	ImageBlockRenderer     int // 0 = off, 1 = half-block fallback, 2 = always
 	RegisteredPlugins      []string
 	ConfirmCopy            bool
 	ConfirmMove            bool
@@ -573,6 +574,11 @@ func LoadConfig() {
 	SetImageDecoderPriorities(ParseImageDecoderPriorities(AppConfig.ImageDecoderPriority))
 	AppConfig.ImageFullScreen = ini.GetString("Images", "FullScreen", "0") == "1"
 	AppConfig.ImageShowOverlay = ini.GetString("Images", "ShowOverlay", "0") == "1"
+	AppConfig.ImageBlockRenderer = 1
+	fmt.Sscanf(ini.GetString("Images", "BlockRenderer", "1"), "%d", &AppConfig.ImageBlockRenderer)
+	if AppConfig.ImageBlockRenderer < 0 || AppConfig.ImageBlockRenderer > 2 {
+		AppConfig.ImageBlockRenderer = 1
+	}
 	AppConfig.UseExternalEditor = ini.GetString("Editor", "UseExternalEditor", "0") == "1"
 	AppConfig.ExternalEditorCommand = ini.GetString("Editor", "ExternalEditorCommand", "")
 	plugStr := ini.GetString("Plugins", "List", "")
@@ -740,6 +746,7 @@ func SaveConfig() {
 	sb.WriteString(fmt.Sprintf("DecoderPriority = %s\n", AppConfig.ImageDecoderPriority))
 	sb.WriteString(fmt.Sprintf("FullScreen = %d\n", map[bool]int{true: 1, false: 0}[AppConfig.ImageFullScreen]))
 	sb.WriteString(fmt.Sprintf("ShowOverlay = %d\n", map[bool]int{true: 1, false: 0}[AppConfig.ImageShowOverlay]))
+	sb.WriteString(fmt.Sprintf("BlockRenderer = %d\n", AppConfig.ImageBlockRenderer))
 	sb.WriteString("\n[Plugins]\n")
 	sb.WriteString(fmt.Sprintf("List = %s\n", strings.Join(AppConfig.RegisteredPlugins, "|")))
 

@@ -115,6 +115,7 @@ func (iv *ImageView) ToggleGallery() {
 			cancel()
 		}
 		iv.gal = nil
+		clear(iv.blockTiles)
 		return
 	}
 	cursor := iv.index
@@ -128,6 +129,9 @@ func (iv *ImageView) ToggleGallery() {
 		thumbs:  make(map[string]*vtui.ImageSurface),
 		asked:   make(map[string]bool),
 		cancels: make(map[string]func()),
+	}
+	if iv.blockTiles == nil {
+		iv.blockTiles = make(map[int]*blockRender)
 	}
 }
 
@@ -216,10 +220,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 	g.move(0, total)
 	g.scrollTo(g.cursor, total)
 
-	cw, ch := scr.Graphics().CellSize()
-	if cw <= 0 || ch <= 0 {
-		cw, ch = imageViewFallbackCellW, imageViewFallbackCellH
-	}
+	cw, ch := cellSize(scr)
 	g.tw, g.th = (imageTileCols-2)*cw, (imageTileRows-2)*ch
 
 	first := g.top * g.cols
@@ -228,7 +229,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 		if idx >= total {
 			break
 		}
-		iv.showTile(scr, idx,
+		iv.showTile(scr, slot, idx,
 			x1+(slot%g.cols)*imageTileCols,
 			top+(slot/g.cols)*imageTileRows,
 			cw, ch)
@@ -236,7 +237,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 }
 
 // showTile paints one thumbnail and the caption under it.
-func (iv *ImageView) showTile(scr *vtui.ScreenBuf, idx, col, row, cw, ch int) {
+func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch int) {
 	path := iv.siblings[idx]
 	name := filepath.Base(path)
 	if iv.vfs != nil {
@@ -262,17 +263,27 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, idx, col, row, cw, ch int) {
 		iv.requestThumb(path)
 		return
 	}
+
+	boxCols, boxRows := imageTileCols-2, imageTileRows-2
+
+	if imageBlockMode(scr) {
+		if p, ok := fitPlacement(surface, 1, 2, col+1, row, boxCols, boxRows); ok {
+			c := iv.blockTiles[slot]
+			if c == nil {
+				c = &blockRender{}
+				iv.blockTiles[slot] = c
+			}
+			c.draw(scr, p, blockImageBack)
+		}
+		return
+	}
 	if !scr.SupportsGraphics() {
 		return
 	}
 
-	boxCols, boxRows := imageTileCols-2, imageTileRows-2
-	w, h := vtui.FitInside(surface.Width, surface.Height, boxCols*cw, boxRows*ch)
-	p := vtui.ImagePlacement{Surface: surface}
-	p.Cols, p.Rows = cellsFor(w, cw, boxCols), cellsFor(h, ch, boxRows)
-	p.Col = col + 1 + (boxCols-p.Cols)/2
-	p.Row = row + (boxRows-p.Rows)/2
-	scr.Graphics().DrawImage(fmt.Sprintf("%s#%d", iv.gfxKey, idx), p)
+	if p, ok := fitPlacement(surface, cw, ch, col+1, row, boxCols, boxRows); ok {
+		scr.Graphics().DrawImage(fmt.Sprintf("%s#%d", iv.gfxKey, idx), p)
+	}
 }
 
 // galleryKey handles the grid. Anything it does not know falls through to the

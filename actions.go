@@ -1215,14 +1215,18 @@ func actionSwitchViewerToEditor(vv *ViewerView) {
 }
 
 // tryOpenImageViewer opens the picture viewer when the file looks like an
-// image and the backend can actually show one. It returns false to let the
-// ordinary viewer handle the file.
+// image and the picture can actually be shown: through a graphics protocol,
+// or through the half-block cell renderer when the backend has none. It
+// returns false to let the ordinary viewer handle the file.
 func tryOpenImageViewer(pf *PanelsFrame, v vfs.VFS, path string) bool {
 	if pf == nil || !IsImageFile(path) {
 		return false
 	}
 	scr := vtui.FrameManager.Screen()
-	if scr == nil || !scr.SupportsGraphics() {
+	if scr == nil {
+		return false
+	}
+	if !scr.SupportsGraphics() && AppConfig.ImageBlockRenderer == 0 {
 		return false
 	}
 

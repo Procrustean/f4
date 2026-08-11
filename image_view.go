@@ -37,7 +37,7 @@ const (
 	imageViewDecodeDelay = 500 * time.Millisecond
 )
 
-var imageViewBackAttr = vtui.SetRGBBoth(0, 0xC0C0C0, 0x101010)
+var imageViewBackAttr = vtui.SetRGBBoth(0, 0xC0C0C0, blockImageBack)
 
 // overlay: opaque dark slab keeps the info line legible.
 var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
@@ -121,6 +121,11 @@ type ImageView struct {
 	// decodeCancel: stops an in-flight external decode on moving on.
 	decodeCancel context.CancelFunc
 
+	// block and blockTiles cache half-block cells, one per picture on screen
+	// and one per gallery tile, so resampling runs only on geometry moves.
+	block      *blockRender
+	blockTiles map[int]*blockRender
+
 	OnClose    func()
 	OnSelect   func(path string, selected bool)
 	OnNavigate func(path string)
@@ -150,6 +155,7 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 		full:      AppConfig.ImageFullScreen,
 		overlay:   AppConfig.ImageShowOverlay,
 		decodeDur: res.DecodeDur,
+		block:     &blockRender{},
 	}
 	iv.gfxKey = fmt.Sprintf("f4.imageview:%p", iv)
 
@@ -533,11 +539,31 @@ func (iv *ImageView) clampPan(visW, visH int) {
 	}
 }
 
+// cellSize returns the graphics cell size, with the fallback for backends
+// that report none.
+func cellSize(scr *vtui.ScreenBuf) (int, int) {
+	cw, ch := scr.Graphics().CellSize()
+	if cw <= 0 || ch <= 0 {
+		return imageViewFallbackCellW, imageViewFallbackCellH
+	}
+	return cw, ch
+}
+
 // placementFor computes where and how the picture should appear. While it
 // fits, the placement is centred and shows the whole surface; once it is
 // zoomed past the window, the placement fills the window and the source
 // rectangle is cropped and panned instead.
 func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, bool) {
+	if scr == nil {
+		return vtui.ImagePlacement{}, false
+	}
+	cw, ch := cellSize(scr)
+	return iv.placementForSize(scr, cw, ch)
+}
+
+// placementForSize is placementFor with an explicit cell size, so the block
+// renderer (1x2 pixels per cell) and the graphics backend share one path.
+func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.ImagePlacement, bool) {
 	img := iv.display()
 	if scr == nil || !img.Valid() {
 		return vtui.ImagePlacement{}, false
@@ -551,11 +577,6 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 		return vtui.ImagePlacement{}, false
 	}
 
-	cw, ch := scr.Graphics().CellSize()
-	if cw <= 0 || ch <= 0 {
-		cw, ch = imageViewFallbackCellW, imageViewFallbackCellH
-	}
-
 	boxW := cols * cw
 	boxH := rows * ch
 	scale := iv.baseScale(boxW, boxH) * iv.zoom
@@ -564,14 +585,8 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 	}
 	iv.lastScale = scale
 
-	dispW := int(float64(img.Width)*scale + 0.5)
-	dispH := int(float64(img.Height)*scale + 0.5)
-	if dispW < 1 {
-		dispW = 1
-	}
-	if dispH < 1 {
-		dispH = 1
-	}
+	dispW := max(1, int(float64(img.Width)*scale+0.5))
+	dispH := max(1, int(float64(img.Height)*scale+0.5))
 
 	p := vtui.ImagePlacement{Surface: img}
 	if iv.overlay {
@@ -592,28 +607,10 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 		return p, true
 	}
 
-	visW := int(float64(boxW) / scale)
-	visH := int(float64(boxH) / scale)
-	if visW > img.Width {
-		visW = img.Width
-	}
-	if visH > img.Height {
-		visH = img.Height
-	}
-	if visW < 1 {
-		visW = 1
-	}
-	if visH < 1 {
-		visH = 1
-	}
-	iv.panMaxX = float64(img.Width - visW)
-	iv.panMaxY = float64(img.Height - visH)
-	if iv.panMaxX < 0 {
-		iv.panMaxX = 0
-	}
-	if iv.panMaxY < 0 {
-		iv.panMaxY = 0
-	}
+	visW := max(1, min(img.Width, int(float64(boxW)/scale)))
+	visH := max(1, min(img.Height, int(float64(boxH)/scale)))
+	iv.panMaxX = max(0, float64(img.Width-visW))
+	iv.panMaxY = max(0, float64(img.Height-visH))
 	iv.visW, iv.visH = visW, visH
 	if iv.anchorPending {
 		iv.panX = iv.zoomFocusX - float64(visW)/2
@@ -708,6 +705,24 @@ func cellsFor(pixels, cellSize, limit int) int {
 	return n
 }
 
+// fitPlacement fits a surface inside a cell box of cw x ch pixel cells and
+// centres it there. The block renderer passes 1x2 (one pixel per column, two
+// per row) so its cells and the graphics backend's agree on what fits.
+func fitPlacement(surface *vtui.ImageSurface, cw, ch, col, row, boxCols, boxRows int) (vtui.ImagePlacement, bool) {
+	if !surface.Valid() || boxCols <= 0 || boxRows <= 0 {
+		return vtui.ImagePlacement{}, false
+	}
+	fw, fh := vtui.FitInside(surface.Width, surface.Height, boxCols*cw, boxRows*ch)
+	if fw <= 0 || fh <= 0 {
+		return vtui.ImagePlacement{}, false
+	}
+	p := vtui.ImagePlacement{Surface: surface}
+	p.Cols, p.Rows = cellsFor(fw, cw, boxCols), cellsFor(fh, ch, boxRows)
+	p.Col = col + (boxCols-p.Cols)/2
+	p.Row = row + (boxRows-p.Rows)/2
+	return p, true
+}
+
 // SetFullScreen gives the rows of the title and key bars to the picture. The
 // key bar is drawn by the frame manager rather than by the frame, and
 // ScreenObject.Show makes an object visible whether it wants to be or not, so
@@ -733,6 +748,31 @@ func (iv *ImageView) ToggleOverlay() {
 	if iv.overlay {
 		iv.requestFileSize()
 	}
+}
+
+// CycleRenderer round-robins the picture renderer: the graphics protocol
+// and the half-block cells. A backend without a graphics protocol leaves
+// the cycle one stop long, so the half-block cells stay put and the
+// setting is not touched. Otherwise the choice is saved and both stations
+// alternate, no matter which one the picture uses at the moment.
+func (iv *ImageView) CycleRenderer() {
+	scr := vtui.FrameManager.Screen()
+	if scr == nil || !scr.SupportsGraphics() {
+		iv.toast("renderer: half-block")
+		return
+	}
+	mode := 1
+	label := "graphics"
+	if !imageBlockMode(scr) {
+		// Currently the graphics protocol: the next stop is the cells.
+		mode = 2
+		label = "half-block"
+	}
+	if AppConfig.ImageBlockRenderer != mode {
+		AppConfig.ImageBlockRenderer = mode
+		RequestSaveConfig()
+	}
+	iv.toast("renderer: " + label)
 }
 
 // requestFileSize asks the file system how big the file is. Stat can be a
@@ -964,11 +1004,12 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 		return
 	}
 
-	p, ok := iv.placementFor(scr)
-	if !ok {
-		return
-	}
-	if !scr.SupportsGraphics() {
+	if imageBlockMode(scr) {
+		if p, ok := iv.placementForSize(scr, 1, 2); ok {
+			iv.block.draw(scr, p, blockImageBack)
+			iv.logGeometry(scr, p)
+		}
+	} else if !scr.SupportsGraphics() {
 		msg := "This backend cannot display images."
 		x := x1 + (x2-x1+1-len(msg))/2
 		if x < x1 {
@@ -976,9 +1017,14 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 		}
 		scr.Write(x, (top+y2)/2, vtui.StringToCharInfo(msg, imageViewBackAttr))
 		return
+	} else {
+		p, ok := iv.placementFor(scr)
+		if !ok {
+			return
+		}
+		scr.Graphics().DrawImage(iv.gfxKey, p)
+		iv.logGeometry(scr, p)
 	}
-	scr.Graphics().DrawImage(iv.gfxKey, p)
-	iv.logGeometry(scr, p)
 	if iv.overlay {
 		iv.drawOverlay(scr)
 	}
@@ -1032,6 +1078,17 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 			return true
 		}
 		return false
+	}
+
+	// Shift+F4: round-robin the renderer, but only while a picture is
+	// actually being viewed; in the gallery the key is swallowed without
+	// an effect so that it does not fall through to the F4 decoder cycle.
+	shift := (e.ControlKeyState & vtinput.ShiftPressed) != 0
+	if shift && e.VirtualKeyCode == vtinput.VK_F4 {
+		if iv.gal == nil {
+			iv.CycleRenderer()
+		}
+		return true
 	}
 
 	switch e.Char {

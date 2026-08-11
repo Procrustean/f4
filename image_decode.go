@@ -228,7 +228,23 @@ func decodeImage(d ImageDecoder, ctx context.Context, data []byte) (*vtui.ImageS
 	if err == nil && !surf.Valid() {
 		err = fmt.Errorf("decoder %s produced an empty image", d.Name)
 	}
+	// One pass over the alpha channel nets any decoder's surface; the
+	// block renderer skips per-pixel blending for the (common) opaque case.
+	if err == nil && surf != nil && !surf.Opaque {
+		surf.Opaque = surfaceIsOpaque(surf)
+	}
 	return surf, decoderDisplayName(d, data), err
+}
+
+// surfaceIsOpaque scans alpha bytes; it is the universal fallback for
+// decoders that do not set ImageSurface.Opaque directly.
+func surfaceIsOpaque(s *vtui.ImageSurface) bool {
+	for o := 3; o < len(s.Pix); o += 4 {
+		if s.Pix[o] != 255 {
+			return false
+		}
+	}
+	return true
 }
 
 func findDecoder(name string) (ImageDecoder, bool) {

@@ -23,6 +23,7 @@ func CopySurface(src *vtui.ImageSurface) *vtui.ImageSurface {
 		d := y * dst.Stride
 		copy(dst.Pix[d:d+line], src.Pix[s:s+line])
 	}
+	dst.Opaque = src.Opaque
 	return dst
 }
 
@@ -45,6 +46,7 @@ func RotateSurface(src *vtui.ImageSurface, degrees int) *vtui.ImageSurface {
 		dstW, dstH = h, w
 	}
 	dst := vtui.NewImageSurface(dstW, dstH)
+	dst.Opaque = src.Opaque
 
 	for y := 0; y < h; y++ {
 		row := y * src.Stride
@@ -77,6 +79,7 @@ func FlipSurface(src *vtui.ImageSurface, horizontal, vertical bool) *vtui.ImageS
 	}
 
 	dst := vtui.NewImageSurface(src.Width, src.Height)
+	dst.Opaque = src.Opaque
 	for y := 0; y < src.Height; y++ {
 		dy := y
 		if vertical {
