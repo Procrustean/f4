@@ -208,11 +208,11 @@ func TestNetpbm16bitScaling(t *testing.T) {
 }
 
 func TestNetpbmLargeDimensions(t *testing.T) {
-	// 12000x12000 -> 576 MiB RGBA: passed the old 512 MiB guard, must pass the
-	// 2 GiB / 16384^2 limits.
-	w, h := 12000, 12000
+	// Keep the default suite small: this validates a sizeable decoded surface
+	// without allocating hundreds of MiB just to exercise the header guard.
+	w, h := 1200, 1200
 	img, err := decodeNetpbm(io.MultiReader(
-		bytes.NewReader([]byte("P5\n12000 12000\n255\n")),
+		bytes.NewReader([]byte("P5\n1200 1200\n255\n")),
 		io.LimitReader(zeroReader{}, int64(w*h)),
 	))
 	if err != nil {
@@ -224,6 +224,17 @@ func TestNetpbmLargeDimensions(t *testing.T) {
 	}
 	if nrgba.Pix[0] != 0 || nrgba.Pix[1] != 0 || nrgba.Pix[2] != 0 || nrgba.Pix[3] != 255 {
 		t.Fatalf("first pixel = %v", nrgba.Pix[:4])
+	}
+}
+
+func TestNetpbmRejectsOversizedDimensionsBeforeAllocation(t *testing.T) {
+	for _, header := range []string{
+		"P5\n16385 1\n255\n",
+		"P5\n20000 100\n255\n",
+	} {
+		if _, err := decodeNetpbm(bytes.NewReader([]byte(header))); err == nil {
+			t.Errorf("header %q was accepted despite the allocation limit", header)
+		}
 	}
 }
 

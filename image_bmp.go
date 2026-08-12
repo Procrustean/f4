@@ -42,8 +42,8 @@ func decodeBMP(data []byte) (*vtui.ImageSurface, error) {
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf("the image has no size")
 	}
-	if int64(width)*int64(height) > imageMaxPixels {
-		return nil, fmt.Errorf("the image is too large: %dx%d", width, height)
+	if err := validateImageAllocation(width, height, 4, imageMaxPixels, 0); err != nil {
+		return nil, fmt.Errorf("the image is too large: %dx%d: %w", width, height, err)
 	}
 	if compression != 0 {
 		return nil, fmt.Errorf("compressed BMP images are not supported")
@@ -70,8 +70,12 @@ func decodeBMP(data []byte) (*vtui.ImageSurface, error) {
 		}
 	}
 
-	stride := ((width*bits + 31) / 32) * 4
-	if pixelOffset < bmpFileHeaderSize+headerSize || pixelOffset+stride*height > len(data) {
+	rowBits := uint64(width) * uint64(bits)
+	if rowBits/uint64(width) != uint64(bits) || rowBits > uint64(^uint(0)>>1)-31 {
+		return nil, fmt.Errorf("BMP row stride overflows")
+	}
+	stride := int((rowBits + 31) / 32 * 4)
+	if pixelOffset < bmpFileHeaderSize+headerSize || pixelOffset > len(data) || uint64(stride)*uint64(height) > uint64(len(data)-pixelOffset) {
 		return nil, fmt.Errorf("the pixel data is truncated")
 	}
 
@@ -132,11 +136,7 @@ func decodeBMP(data []byte) (*vtui.ImageSurface, error) {
 		}
 	}
 
-	surf := vtui.NewImageSurfaceFromPix(width, height, width*4, pix)
-	if !surf.Valid() {
-		return nil, fmt.Errorf("unsupported image geometry")
-	}
-	return surf, nil
+	return surfaceFromRGBA(width, height, width*4, pix)
 }
 
 // bmpScale5 stretches a five bit channel over the whole byte.

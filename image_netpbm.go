@@ -1,6 +1,6 @@
 package main
 
-// Netpbm (P1..P7, PF, Pf) decoder / f4 pipe streaming: ASCII, raw, 16-bit, float32.
+// Netpbm (P1..P7, PF, Pf) decoder with streaming and raw/ASCII support.
 
 import (
 	"bufio"
@@ -244,12 +244,13 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 		return nil, fmt.Errorf("netpbm: unsupported magic %q", magic)
 	}
 
-	if width <= 0 || height <= 0 || width > maxNetpbmDimension || height > maxNetpbmDimension {
+	if width > maxNetpbmDimension || height > maxNetpbmDimension {
 		return nil, fmt.Errorf("netpbm: invalid dimensions %dx%d", width, height)
 	}
-	// 16384^2 / 2 GiB ceiling fits 16K RGBA (old 512 MiB blocked 8K+).
-	if int64(width)*int64(height) > maxNetpbmDimension*maxNetpbmDimension || int64(width)*int64(height)*4 > 2<<30 {
-		return nil, fmt.Errorf("netpbm: image limits exceeded %dx%d", width, height)
+	// Reject before make: the shared guard keeps pixel and decoded-memory
+	// arithmetic overflow-safe and consistent with the other image decoders.
+	if err := validateImageAllocation(width, height, 4, int64(maxNetpbmDimension)*maxNetpbmDimension, 2<<30); err != nil {
+		return nil, fmt.Errorf("netpbm: image limits exceeded %dx%d: %w", width, height, err)
 	}
 	if maxVal <= 0 || maxVal > 65535 {
 		return nil, fmt.Errorf("netpbm: invalid MAXVAL %d", maxVal)
@@ -637,9 +638,9 @@ func decodeNetpbmSurfaceStream(r io.Reader) (*vtui.ImageSurface, error) {
 		return nil, fmt.Errorf("netpbm: unexpected decode type %T", img)
 	}
 	b := img.Bounds()
-	surf := vtui.NewImageSurfaceFromPix(b.Dx(), b.Dy(), b.Dx()*4, nrgba.Pix)
-	if !surf.Valid() {
-		return nil, fmt.Errorf("netpbm: unsupported image geometry")
+	surf, err := surfaceFromRGBA(b.Dx(), b.Dy(), b.Dx()*4, nrgba.Pix)
+	if err != nil {
+		return nil, fmt.Errorf("netpbm: %w", err)
 	}
 	return surf, nil
 }

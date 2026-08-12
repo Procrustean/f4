@@ -1,7 +1,6 @@
 package main
 
-// QOI, the Quite OK Image format. The whole specification fits on one page,
-// which makes a decoder cheaper to carry than a dependency.
+// QOI decoder; keeping it local avoids a dependency for a small format.
 
 import (
 	"encoding/binary"
@@ -41,8 +40,8 @@ func decodeQOI(data []byte) (*vtui.ImageSurface, error) {
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf("the image has no size")
 	}
-	if int64(width)*int64(height) > imageMaxPixels {
-		return nil, fmt.Errorf("the image is too large: %dx%d", width, height)
+	if err := validateImageAllocation(width, height, 4, imageMaxPixels, 0); err != nil {
+		return nil, fmt.Errorf("the image is too large: %dx%d: %w", width, height, err)
 	}
 
 	pix := make([]byte, width*height*4)
@@ -102,11 +101,7 @@ func decodeQOI(data []byte) (*vtui.ImageSurface, error) {
 		pix[i], pix[i+1], pix[i+2], pix[i+3] = px.r, px.g, px.b, px.a
 	}
 
-	surf := vtui.NewImageSurfaceFromPix(width, height, width*4, pix)
-	if !surf.Valid() {
-		return nil, fmt.Errorf("unsupported image geometry")
-	}
-	return surf, nil
+	return surfaceFromRGBA(width, height, width*4, pix)
 }
 
 func init() {

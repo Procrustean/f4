@@ -158,6 +158,7 @@ func resetInstalledExternalImageTools() {
 
 func installedExternalImageToolsLookup() map[string]externalImageTool {
 	installedMu.Lock()
+	defer installedMu.Unlock()
 	installedOnce.Do(func() {
 		m := make(map[string]externalImageTool, len(externalImageTools))
 		for _, t := range externalImageTools {
@@ -169,8 +170,10 @@ func installedExternalImageToolsLookup() map[string]externalImageTool {
 		}
 		installedByBin = m
 	})
-	out := installedByBin
-	installedMu.Unlock()
+	out := make(map[string]externalImageTool, len(installedByBin))
+	for bin, tool := range installedByBin {
+		out[bin] = tool
+	}
 	return out
 }
 
@@ -270,9 +273,15 @@ func streamExternalImageCmd(ctx context.Context, tool externalImageTool, cmd *ex
 		surf, decodeErr = decodeStdImageStream(stdout)
 	}
 
-	// drain stdout before Wait — a full pipe would deadlock.
-	go func() { _, _ = io.Copy(io.Discard, stdout) }()
+	// Drain stdout before Wait — a full pipe would deadlock. Wait for the
+	// drain goroutine too, so a cancelled process cannot leave it behind.
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, stdout)
+		close(drained)
+	}()
 	runErr := cmd.Wait()
+	<-drained
 
 	if runErr != nil {
 		return nil, externalImageCmdError(tool, runErr, stderr.buf.Bytes())
@@ -460,7 +469,7 @@ func decodeImageExternallyVia(ctx context.Context, tool externalImageTool, data 
 
 // shrink-while-reading: never a full decode of RAW/AVIF for a tile.
 func loadImageScaled(ctx context.Context, v vfs.VFS, path string, w, h int) (*vtui.ImageSurface, string, error) {
-	data, err := imageFileBytes(ctx, v, path)
+	data, err := ImagePipe.FileBytes(ctx, v, path)
 	if err != nil {
 		return nil, "", err
 	}

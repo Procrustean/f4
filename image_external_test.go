@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,11 @@ import (
 // binaries are installed, and puts everything back afterwards. Without it the
 // tests would say different things on a machine with ImageMagick and on one
 // without.
+//
+// The returned path is deliberately fake: no real converter is ever executed,
+// so the tests stay deterministic on every platform. The path only has to be
+// a valid relative name (filepath.Base must still recover the binary name),
+// and it must not accidentally collide with a real one.
 func fakeExternalTools(t *testing.T, bins ...string) {
 	t.Helper()
 
@@ -45,7 +51,7 @@ func fakeExternalTools(t *testing.T, bins ...string) {
 
 	externalImageLookPath = func(bin string) (string, error) {
 		if present[bin] {
-			return filepath.Join("/opt/bin", bin), nil
+			return filepath.Join("fake-bin", bin), nil
 		}
 		return "", os.ErrNotExist
 	}
@@ -87,6 +93,23 @@ func TestSniffImageSuffix(t *testing.T) {
 	}
 }
 
+func TestInstalledExternalImageToolsLookupReturnsSnapshot(t *testing.T) {
+	fakeExternalTools(t, "magick")
+
+	// installedExternalImageToolsLookup keys by the registry name ("magick"),
+	// not by the resolved path, and must hand out a copy: mutating what it
+	// returned must not leak into the next call.
+	first := installedExternalImageToolsLookup()
+	first["magick"] = externalImageTool{Label: "mutated"}
+	delete(first, "convert")
+
+	second := installedExternalImageToolsLookup()
+	tool, ok := second["magick"]
+	if !ok || tool.Label != "im" {
+		t.Fatalf("lookup returned mutable internal state: %#v", second)
+	}
+}
+
 func TestFindExternalImageToolPrefersImageMagick(t *testing.T) {
 	fakeExternalTools(t, "convert", "ffmpeg", "magick")
 
@@ -125,6 +148,20 @@ func TestFindExternalImageToolReportsAnEmptyPath(t *testing.T) {
 
 	if _, ok := findExternalImageTool(""); ok {
 		t.Fatal("nothing is installed and something was found")
+	}
+}
+
+// Windows ships a convert.exe of its own that has nothing to do with
+// ImageMagick; the probe must reject it there and accept it elsewhere.
+func TestConvertIsRejectedOnWindows(t *testing.T) {
+	fakeExternalTools(t, "convert")
+
+	_, ok := findExternalImageTool("")
+	if runtime.GOOS == "windows" && ok {
+		t.Error("Windows' own convert.exe must not be mistaken for ImageMagick")
+	}
+	if runtime.GOOS != "windows" && !ok {
+		t.Error("on non-Windows, convert is a valid ImageMagick binary and must be found")
 	}
 }
 
