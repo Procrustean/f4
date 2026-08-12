@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image/jpeg"
+	"io"
 
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
@@ -45,6 +46,12 @@ func imageQuickPreview(ctx context.Context, v vfs.VFS, path string) (*vtui.Image
 	if err != nil {
 		return nil, "", err
 	}
+	return imagePreviewFromHead(head)
+}
+
+// imagePreviewFromHead decodes the embedded thumbnail out of a JPEG header;
+// the caller decides where the header came from.
+func imagePreviewFromHead(head []byte) (*vtui.ImageSurface, string, error) {
 	thumb, err := exifThumbnail(head)
 	if err != nil {
 		return nil, "", err
@@ -54,7 +61,7 @@ func imageQuickPreview(ctx context.Context, v vfs.VFS, path string) (*vtui.Image
 		return nil, "", err
 	}
 	surf := vtui.NewImageSurfaceFromImage(img)
-	if !surf.Valid() {
+	if surf == nil || !surf.Valid() {
 		return nil, "", fmt.Errorf("the thumbnail has no pixels")
 	}
 	return surf, imagePreviewDecoder, nil
@@ -79,13 +86,19 @@ func imageReadHead(ctx context.Context, v vfs.VFS, path string, limit int) ([]by
 	}
 	buf := make([]byte, limit)
 	n, err := f.ReadAt(ctx, buf, 0)
-	if n <= 0 {
+	if n != len(buf) {
 		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		if n == 0 && err == io.ErrUnexpectedEOF {
 			err = fmt.Errorf("nothing could be read")
 		}
 		return nil, err
 	}
-	return buf[:n], nil
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // exifThumbnail finds the small copy a camera stored in a JPEG file.
