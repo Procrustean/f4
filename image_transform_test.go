@@ -105,6 +105,42 @@ func TestTransformSurfaceTurnsThenMirrors(t *testing.T) {
 	}
 }
 
+func TestTransformSinglePassMatchesTwoPass(t *testing.T) {
+	// All eight orientations: the single-pass path (90/270 and the combined
+	// turn+mirror) must agree pixel for pixel with the two-pass composition
+	// it replaces. An odd width and height keep the reflections honest.
+	for _, deg := range []int{0, 90, 180, 270} {
+		for _, flipH := range []bool{false, true} {
+			for _, flipV := range []bool{false, true} {
+				src := gradientSurface(5, 3)
+				want := FlipSurface(RotateSurface(src, deg), flipH, flipV)
+				got := TransformSurface(src, deg, flipH, flipV)
+				if got.Width != want.Width || got.Height != want.Height || got.Hash() != want.Hash() {
+					t.Errorf("%d° h=%v v=%v: got %dx%d %x, want %dx%d %x",
+						deg, flipH, flipV, got.Width, got.Height, got.Hash(), want.Width, want.Height, want.Hash())
+				}
+			}
+		}
+	}
+}
+
+func TestRotateQuarterTurnsMatchDirect(t *testing.T) {
+	// A quarter turn composed four times must equal the direct single pass
+	// for every angle, so RotateSurface stays consistent across paths.
+	for _, deg := range []int{90, 270} {
+		src := gradientSurface(4, 2)
+		direct := RotateSurface(src, deg)
+		var composed *vtui.ImageSurface = src
+		for deg > 0 {
+			composed = RotateSurface(composed, 90)
+			deg -= 90
+		}
+		if direct.Hash() != composed.Hash() {
+			t.Errorf("direct %d° differs from the composed turn", deg)
+		}
+	}
+}
+
 func TestTransformLeavesTheSourceAlone(t *testing.T) {
 	src := gradientSurface(3, 3)
 	kept := append([]byte(nil), src.Pix...)

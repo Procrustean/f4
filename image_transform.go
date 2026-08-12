@@ -1,6 +1,10 @@
 package main
 
-import "github.com/unxed/vtui"
+import (
+	"unsafe"
+
+	"github.com/unxed/vtui"
+)
 
 // Rotation and mirroring of decoded pictures. This is deliberately plain Go
 // over the RGBA bytes of an ImageSurface: the graphics backends only know how
@@ -10,6 +14,12 @@ import "github.com/unxed/vtui"
 // Every function here returns a fresh, tightly packed surface and never
 // touches the source, so the viewer can keep the decoded picture around and
 // rebuild the shown one whenever the orientation changes.
+//
+// A quarter turn is a transposition, the classic cache-hostile layout switch:
+// it is done in one cache-blocked pass over uint32 pixels, which also lets a
+// turn followed by a mirroring land in a single allocation instead of two.
+// Plain half turns and mirrorings stay per-pixel, where they are already
+// close to a memcpy.
 
 // CopySurface returns a tightly packed copy of a surface.
 func CopySurface(src *vtui.ImageSurface) *vtui.ImageSurface {
@@ -48,23 +58,22 @@ func RotateSurface(src *vtui.ImageSurface, degrees int) *vtui.ImageSurface {
 	dst := vtui.NewImageSurface(dstW, dstH)
 	dst.Opaque = src.Opaque
 
-	for y := 0; y < h; y++ {
-		row := y * src.Stride
-		for x := 0; x < w; x++ {
-			var dx, dy int
-			switch deg {
-			case 90:
-				dx, dy = h-1-y, x
-			case 180:
-				dx, dy = w-1-x, h-1-y
-			default:
-				dx, dy = y, w-1-x
+	if deg == 180 {
+		// A half turn reverses every row in reverse order: per-pixel, but
+		// row-wise sequential, already near memcpy speed.
+		for y := 0; y < h; y++ {
+			srow := (h - 1 - y) * src.Stride
+			drow := y * dst.Stride
+			for x := 0; x < w; x++ {
+				s := srow + (w-1-x)*4
+				d := drow + x*4
+				copy(dst.Pix[d:d+4], src.Pix[s:s+4])
 			}
-			s := row + x*4
-			d := dy*dst.Stride + dx*4
-			copy(dst.Pix[d:d+4], src.Pix[s:s+4])
 		}
+		return dst
 	}
+
+	rotateFlipPixels(dst, src, deg, false, false)
 	return dst
 }
 
@@ -100,14 +109,82 @@ func FlipSurface(src *vtui.ImageSurface, horizontal, vertical bool) *vtui.ImageS
 
 // TransformSurface applies a rotation and then a mirroring. The order matters:
 // the flip is meant as "mirror what I see", so it works on the already turned
-// picture rather than on the decoded one.
+// picture rather than on the decoded one. A quarter turn with a mirror is the
+// viewer's rebuild path, and it is done in one pass and one allocation.
 func TransformSurface(src *vtui.ImageSurface, degrees int, horizontal, vertical bool) *vtui.ImageSurface {
 	if !src.Valid() {
 		return nil
 	}
-	out := RotateSurface(src, degrees)
-	if horizontal || vertical {
-		out = FlipSurface(out, horizontal, vertical)
+	deg := ((degrees % 360) + 360) % 360
+	if deg%90 != 0 {
+		deg = 0
 	}
-	return out
+	if deg == 0 {
+		return FlipSurface(src, horizontal, vertical)
+	}
+	if deg == 180 {
+		// A half turn and a mirroring commute and are both row-wise fast;
+		// the two-pass form stays on their fast path.
+		out := RotateSurface(src, 180)
+		if horizontal || vertical {
+			out = FlipSurface(out, horizontal, vertical)
+		}
+		return out
+	}
+
+	dst := vtui.NewImageSurface(src.Height, src.Width)
+	dst.Opaque = src.Opaque
+	rotateFlipPixels(dst, src, deg, horizontal, vertical)
+	return dst
+}
+
+// rotateFlipPixels writes the turned and mirrored source into dst in one
+// cache-blocked pass over uint32 pixels. dst is tightly packed; src may be
+// padded, so its stride is honoured.
+func rotateFlipPixels(dst, src *vtui.ImageSurface, deg int, flipH, flipV bool) {
+	w, h := src.Width, src.Height
+	srcStride := src.Stride / 4
+	src32 := unsafe.Slice((*uint32)(unsafe.Pointer(&src.Pix[0])), len(src.Pix)/4)
+	dst32 := unsafe.Slice((*uint32)(unsafe.Pointer(&dst.Pix[0])), dst.Width*dst.Height)
+
+	// A clockwise quarter turn is the transposition sx = y, sy = h-1-x, and
+	// a mirroring folds an axis. A 270 turn is the 90 with both axes
+	// mirrored, so its flags are folded in first. The four coefficients are
+	// precomputed once instead of switched per pixel:
+	//   sx = sxY*y,  sy = syX*x + syC
+	if deg == 270 {
+		flipH, flipV = !flipH, !flipV
+	}
+	sxY, sxC := 1, 0
+	syX, syC := -1, h-1
+	if flipV {
+		sxY, sxC = -1, w-1
+	}
+	if flipH {
+		syX, syC = 1, 0
+	}
+
+	// Cache blocking: a block of destination rows reads a block of source
+	// rows, so the transposed access stays in cache.
+	const block = 32
+	for y0 := 0; y0 < dst.Height; y0 += block {
+		y1 := y0 + block
+		if y1 > dst.Height {
+			y1 = dst.Height
+		}
+		for x0 := 0; x0 < dst.Width; x0 += block {
+			x1 := x0 + block
+			if x1 > dst.Width {
+				x1 = dst.Width
+			}
+			for y := y0; y < y1; y++ {
+				sx := sxY*y + sxC
+				d := y * dst.Width
+				for x := x0; x < x1; x++ {
+					sy := syX*x + syC
+					dst32[d+x] = src32[sy*srcStride+sx]
+				}
+			}
+		}
+	}
 }
