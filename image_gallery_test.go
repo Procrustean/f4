@@ -151,6 +151,110 @@ func TestImageViewGalleryEnterOpensTheCursor(t *testing.T) {
 	}
 }
 
+// gallerySiblings builds a named sibling list for the request-order tests.
+func gallerySiblings(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("pic%02d.png", i)
+	}
+	return out
+}
+
+func TestGalleryRingDistance(t *testing.T) {
+	g := &imageGallery{cols: 4, cursor: 5} // row 1, column 1
+	cases := []struct {
+		idx  int
+		dist int
+	}{
+		{5, 0},  // the cursor itself
+		{1, 1},  // row 0, column 1
+		{4, 1},  // row 1, column 0
+		{6, 1},  // row 1, column 2
+		{9, 1},  // row 2, column 1
+		{0, 1},  // row 0, column 0: Chebyshev max(1,1)
+		{2, 1},  // row 0, column 2: Chebyshev max(1,1)
+		{3, 2},  // row 0, column 3: Chebyshev max(2,1)
+		{14, 2}, // row 3, column 2: Chebyshev max(2,2)
+	}
+	for _, tc := range cases {
+		if d := galleryRing(g, tc.idx); d != tc.dist {
+			t.Errorf("slot %d is ring %d, got %d", tc.idx, tc.dist, d)
+		}
+	}
+}
+
+// TestGalleryThumbnailBudgetAndSpiral verifies G2: opening the grid must not
+// fire every visible tile at once — a frame is allowed galleryThumbBudget
+// decodes, nearest the cursor first.
+func TestGalleryThumbnailBudgetAndSpiral(t *testing.T) {
+	iv := newTestImageView(t, 100, 100)
+	siblings := gallerySiblings(30)
+	iv.SetSiblings(siblings, 7) // the cursor sits on pic07
+	iv.ToggleGallery()
+
+	g := iv.gal
+	g.layout(80, 45) // 4 columns, 5 rows: slots 0..19 visible
+	g.scrollTo(g.cursor, len(siblings))
+
+	iv.requestVisibleThumbs()
+	if n := len(g.asked); n > galleryThumbBudget {
+		t.Fatalf("one frame asked for %d thumbnails, budget is %d", n, galleryThumbBudget)
+	}
+
+	// The cursor is slot 7: row 1, column 3 of a 4-wide grid. Its rings of
+	// Chebyshev distance over the visible 20 slots are
+	//   ring 0: {7}
+	//   ring 1: {2,3,6,10,11}
+	//   ring 2: {1,5,9,13,14,15}
+	//   ring 3: {0,4,8,12,16,17,18,19}
+	// A budget of 12 takes ring 0..2 whole and stops there.
+	for _, name := range []string{
+		"pic07.png",                                                     // ring 0
+		"pic02.png", "pic03.png", "pic06.png", "pic10.png", "pic11.png", // ring 1
+		"pic01.png", "pic05.png", "pic09.png", "pic13.png", "pic14.png", "pic15.png", // ring 2
+	} {
+		if !g.asked[name] {
+			t.Errorf("ring 0/1/2 tile %s was not asked in the first frame", name)
+		}
+	}
+	// pic00 and the rest of ring 3 wait for a later frame.
+	for _, name := range []string{"pic00.png", "pic04.png", "pic16.png", "pic19.png"} {
+		if g.asked[name] {
+			t.Errorf("%s is ring 3 and must wait for a later frame", name)
+		}
+	}
+
+	// The second frame picks up the eight ring-3 tiles and stops.
+	before := len(g.asked)
+	iv.requestVisibleThumbs()
+	if len(g.asked) != 20 {
+		t.Errorf("after two frames all 20 visible tiles should be asked, got %d", len(g.asked))
+	}
+	if len(g.asked) > before && !g.asked["pic00.png"] {
+		t.Error("the second frame did not pick up the ring-3 tiles")
+	}
+}
+
+// TestGalleryThumbnailBudgetNotExceededOnScreen verifies the same budget
+// holds when the request goes through the drawing path with a real pipeline.
+func TestGalleryThumbnailBudgetNotExceededOnScreen(t *testing.T) {
+	withStubPipeline(t, 8, 8)
+
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 40, 20)
+	iv.path = "a.png"
+	iv.SetSiblings(gallerySiblings(30), 0)
+	iv.ToggleGallery()
+
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+
+	if n := len(iv.gal.asked); n > galleryThumbBudget {
+		t.Errorf("a screenful of tiles asked for %d decodes in one frame, budget is %d", n, galleryThumbBudget)
+	}
+}
+
 func TestPanelSelectionByName(t *testing.T) {
 	fp := &FileSystemPanel{
 		entries: []*fileEntry{

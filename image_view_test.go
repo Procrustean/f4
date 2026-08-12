@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,24 @@ func newTestImageView(t *testing.T, w, h int) *ImageView {
 	}
 	iv.ResizeConsole(80, 25)
 	return iv
+}
+
+// restoreBars keeps the whole screen flag from leaking between tests.
+func restoreBars(t *testing.T) {
+	t.Helper()
+	was := vtui.FrameManager.HideBars
+	t.Cleanup(func() { vtui.FrameManager.HideBars = was })
+}
+
+// screenRow reads a stretch of one row back out of the screen.
+func screenRow(scr *vtui.ScreenBuf, y, x1, x2 int) string {
+	var b strings.Builder
+	for x := x1; x <= x2; x++ {
+		if r := rune(scr.GetCell(x, y).Char); r != 0 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func TestImageViewFitsAndCentres(t *testing.T) {
@@ -411,27 +430,59 @@ func TestImageViewNavigationFollowsToThePanel(t *testing.T) {
 
 func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
 	asked := withStubPipeline(t, 8, 8)
+	// The ring beyond the full decodes is only thumbnailed: catch those
+	// preview requests on a second channel.
+	previewed := make(chan string, 8)
+	ImagePipe.preview = func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		previewed <- path
+		return imageTestSurface(4, 4), imagePreviewDecoder, nil
+	}
 
 	iv := newTestImageView(t, 100, 100)
 	iv.path = "2.png"
 	iv.SetSiblings([]string{"0.png", "1.png", "2.png", "3.png", "4.png"}, 2)
 
+	// The nearest neighbours are decoded whole; the ones beyond them are
+	// only worth a thumbnail.
 	seen := map[string]bool{}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 2; i++ {
+		deadline := time.NewTimer(time.Second)
 		select {
 		case path := <-asked:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
 			seen[path] = true
-		case <-time.After(time.Second):
-			t.Fatalf("only %d neighbours were prepared: %v", len(seen), seen)
+		case <-deadline.C:
+			t.Fatalf("only %d neighbours were decoded: %v", len(seen), seen)
 		}
 	}
-	for _, want := range []string{"1.png", "3.png", "0.png", "4.png"} {
+	for _, want := range []string{"1.png", "3.png"} {
 		if !seen[want] {
-			t.Errorf("%s was not prepared", want)
+			t.Errorf("%s was not decoded whole", want)
 		}
 	}
 	if seen["2.png"] {
 		t.Error("the picture on screen is not its own neighbour")
+	}
+
+	previewSeen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		deadline := time.NewTimer(time.Second)
+		select {
+		case path := <-previewed:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
+			previewSeen[path] = true
+		case <-deadline.C:
+			t.Fatalf("only %d thumbnails were prepared: %v", len(previewSeen), previewSeen)
+		}
+	}
+	for _, want := range []string{"0.png", "4.png"} {
+		if !previewSeen[want] {
+			t.Errorf("%s was not thumbnailed", want)
+		}
 	}
 }
 
@@ -458,10 +509,16 @@ func TestImageViewActualSize(t *testing.T) {
 	if iv.lastScale != 1 {
 		t.Errorf("the actual size is a scale of one, got %v", iv.lastScale)
 	}
+	if iv.tempMsg != "scale: 100%" {
+		t.Errorf("the literal size must say so, got %q", iv.tempMsg)
+	}
 
 	iv.ToggleActualSize()
 	if p, _ = iv.placementFor(scr); p.Rows != 23 {
 		t.Errorf("switching back must fit the window again: %dx%d", p.Cols, p.Rows)
+	}
+	if iv.tempMsg != "scale: 368%" {
+		t.Errorf("back to the fitted scale, got %q", iv.tempMsg)
 	}
 }
 
@@ -497,6 +554,399 @@ func TestImageViewIgnoresStaleResults(t *testing.T) {
 	iv.accept(iv.loadGen, ImageResult{Path: "new.png", Surface: vtui.NewImageSurface(7, 7), Decoder: "stub"})
 	if iv.surface.Width != 7 {
 		t.Error("the awaited result must be taken")
+	}
+}
+
+func TestImageViewFullScreenIsAToggle(t *testing.T) {
+	restoreBars(t)
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 100, 100)
+	p, ok := iv.placementFor(scr)
+	if !ok || p.Rows != 23 {
+		t.Fatalf("with both bars the picture gets 23 rows, got %+v", p)
+	}
+	e := &vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_F}
+	e.ControlKeyState |= vtinput.LeftCtrlPressed
+	if !iv.ProcessKey(e) || !iv.full || !vtui.FrameManager.HideBars {
+		t.Fatal("Ctrl+F did not reach whole screen mode")
+	}
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: 'f'}) || iv.full || vtui.FrameManager.HideBars {
+		t.Error("F must leave whole screen mode")
+	}
+}
+
+func TestImageViewCloseGivesTheBarsBack(t *testing.T) {
+	restoreBars(t)
+	iv := newTestImageView(t, 10, 10)
+	iv.SetFullScreen(true)
+	iv.Close()
+	if vtui.FrameManager.HideBars {
+		t.Error("a closed viewer must not leave bars hidden")
+	}
+}
+
+func TestImageViewOverlayLines(t *testing.T) {
+	iv := newTestImageView(t, 320, 200)
+	iv.path, iv.decoder = "photo.png", "png"
+	iv.fileSize, iv.sizeKnown = 4096, true
+	iv.fileTime, iv.timeKnown = time.Date(2024, 5, 17, 9, 30, 0, 0, time.Local), true
+	lines := iv.overlayLines()
+	if len(lines) != 5 || lines[0] != "photo.png" || lines[1] != "320 x 200" || lines[4] != "png" || !strings.Contains(lines[2], "4.0") || lines[3] != "2024-05-17 09:30" {
+		t.Errorf("the panel says %v", lines)
+	}
+	iv.Rotate(90)
+	lines = iv.overlayLines()
+	if lines[1] != "200 x 320" || len(lines) != 6 || !strings.Contains(lines[5], "90") {
+		t.Errorf("turned picture panel: %v", lines)
+	}
+	if got := newTestImageView(t, 8, 8).overlayLines()[2]; got != "unknown size" {
+		t.Errorf("unknown size line is %q", got)
+	}
+}
+
+func TestImageViewOverlayGoesOverPicture(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 100, 100)
+	iv.path, iv.decoder = "photo.png", "png"
+	if p, _ := iv.placementFor(scr); p.ZIndex != 0 {
+		t.Fatalf("without overlay z index = %d", p.ZIndex)
+	}
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: 'i'}) {
+		t.Fatal("I was not handled")
+	}
+	if p, _ := iv.placementFor(scr); p.ZIndex >= 0 {
+		t.Errorf("overlay z index = %d", p.ZIndex)
+	}
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	if row := screenRow(scr, 2, 0, 20); !strings.Contains(row, "photo.png") {
+		t.Errorf("overlay first line is %q", row)
+	}
+	if row := screenRow(scr, 3, 0, 20); !strings.Contains(row, "100 x 100") {
+		t.Errorf("overlay second line is %q", row)
+	}
+}
+
+func TestImageViewOverlayWidthIsCapped(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 100, 100)
+	iv.path, iv.decoder = "this-file-name-is-very-long-and-would-not-fit-anywhere.png", "png"
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: 'i'}) {
+		t.Fatal("I was not handled")
+	}
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	row := screenRow(scr, 2, 0, 79)
+	if !strings.Contains(row, "…") || strings.Contains(row, "anywhere.png") {
+		t.Errorf("truncated overlay row is %q", row)
+	}
+	slab := 0
+	for x := 0; x < 80; x++ {
+		if scr.GetCell(x, 2).Attributes == imageOverlayAttr {
+			slab++
+		}
+	}
+	if slab != 40 {
+		t.Errorf("overlay slab is %d cells, want 40", slab)
+	}
+
+	// The wall flash inverts the pane for its short life.
+	iv.tempFlashUntil = time.Now().Add(time.Second)
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	flashed := 0
+	for x := 0; x < 80; x++ {
+		if scr.GetCell(x, 2).Attributes == imageWallFlashAttr {
+			flashed++
+		}
+	}
+	if flashed != 40 {
+		t.Errorf("the wall flash must invert the overlay pane, %d cells", flashed)
+	}
+}
+
+func TestImageViewToastNarrow(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 10, 10)
+	iv.toast("scale: 100%")
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	first, last := -1, -1
+	for x := 0; x < 80; x++ {
+		if scr.GetCell(x, 23).Attributes == imageToastAttr {
+			if first < 0 {
+				first = x
+			}
+			last = x
+		}
+	}
+	if first != 0 || last != 12 {
+		t.Errorf("toast slab spans %d..%d, want 0..12", first, last)
+	}
+}
+
+func TestImageViewToastSlidesOutThenClears(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 10, 10)
+	iv.toast("scale: 100%")
+	iv.tempUntil = time.Now().Add(-time.Second)
+
+	// The first paint after the expiry begins the exit; the message must
+	// stay on the row while the slide runs.
+	paint := func() {
+		scr.Graphics().BeginFrame()
+		iv.Show(scr)
+		scr.Graphics().EndFrame()
+	}
+	paint()
+	if iv.tempMsg != "scale: 100%" {
+		t.Fatalf("the toast must not vanish in the same frame the slide starts, got %q", iv.tempMsg)
+	}
+	if iv.tempSlideStart.IsZero() {
+		t.Fatal("an expired toast must begin its exit animation")
+	}
+	iv.stopAnimIfIdle()
+
+	// Halfway through the window the toast has moved left: its right edge
+	// has already left cell 12 even though the message is still on screen.
+	iv.tempSlideStart = time.Now().Add(-100 * time.Millisecond)
+	paint()
+	if iv.tempMsg == "" {
+		t.Fatal("mid-slide the message must still be alive")
+	}
+	if scr.GetCell(12, 23).Attributes == imageToastAttr {
+		t.Error("mid-slide the toast must have left its right edge behind")
+	}
+	iv.stopAnimIfIdle()
+
+	// Once the slide window is over the message is gone for good.
+	iv.tempSlideStart = time.Now().Add(-imageToastSlideDur - time.Millisecond)
+	paint()
+	if iv.tempMsg != "" {
+		t.Errorf("after the slide the toast must be gone, got %q", iv.tempMsg)
+	}
+	if iv.animStop != nil {
+		t.Error("a finished slide must stop its redraw ticker")
+	}
+}
+
+// One ticker serves every toast animation: starting it twice must leave a
+// single redraw ticker, and stopping it once must end it.
+func TestImageViewToastAnimationsShareOneTicker(t *testing.T) {
+	iv := newTestImageView(t, 10, 10)
+	iv.ensureAnim()
+	iv.ensureAnim()
+	if iv.animStop == nil {
+		t.Fatal("ensureAnim must start the redraw ticker")
+	}
+	iv.stopAnimIfIdle()
+	if iv.animStop != nil {
+		t.Error("stopAnimIfIdle must stop the redraw ticker")
+	}
+}
+
+// The wall flash is a paint-level state: once tempFlashUntil is in the
+// past, the very next paint restores the resting colours.
+func TestImageViewWallFlashRestoresRestingColours(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 10, 10)
+	iv.toast("wall")
+	iv.tempFlashUntil = time.Now().Add(time.Second)
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	if scr.GetCell(0, 23).Attributes != imageWallFlashAttr {
+		t.Fatal("the flash must show the toast in the inverted colours")
+	}
+	iv.tempFlashUntil = time.Now().Add(-time.Millisecond)
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	if scr.GetCell(0, 23).Attributes != imageToastAttr {
+		t.Error("once the flash has run out the toast must be back to its resting colours")
+	}
+}
+
+// Clearing the toast must also end the redraw ticker that kept its
+// animation in motion.
+func TestImageViewToastClearStopsTicker(t *testing.T) {
+	iv := newTestImageView(t, 10, 10)
+	iv.toast("gone soon")
+	iv.tempSlideStart = time.Now()
+	iv.ensureAnim()
+	iv.toastClear()
+	if iv.animStop != nil {
+		t.Error("clearing the toast must stop the redraw ticker")
+	}
+}
+
+func TestImageViewLoadingToastNamesTheWait(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 10, 10)
+	iv.loading = true
+	iv.decodeStart = time.Now().Add(-time.Second)
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	row := screenRow(scr, 23, 0, 79)
+	if !strings.Contains(row, "decoding") {
+		t.Errorf("the loading toast must name what it is waiting for, got %q", row)
+	}
+	iv.stopAnimIfIdle()
+}
+
+// The loading toast animates in pure grey and stays readable: the comet
+// fades in from nothing and out into nothing (phase 0 and 1 are the plain
+// toast), the slab shimmers inside its band range, and no cell ever
+// brightens anywhere near the letters' grey — the brightest shade of the
+// pass never lands under a letter of its own brightness.
+func TestImageViewLoadingToastKeepsLettersReadable(t *testing.T) {
+	for _, phase := range []float64{0, 1} {
+		if slab := loadingToastShade(10, 40, phase); slab != imageSlabDim {
+			t.Errorf("phase %v: slab %#x, want resting %#x", phase, slab, imageSlabDim)
+		}
+	}
+	brightest := uint32(imageSlabDim)
+	for x := range 40 {
+		slab := loadingToastShade(x, 40, 0.5)
+		if slab < imageSlabDim || slab > imageSlabBright {
+			t.Errorf("x=%d: slab %#x outside the band range", x, slab)
+		}
+		// The gap to the text grey is the readability budget: it must never
+		// close.
+		if slab >= imageLoadingText {
+			t.Errorf("x=%d: slab %#x collides with text grey %#x", x, slab, imageLoadingText)
+		}
+		if slab > brightest {
+			brightest = slab
+		}
+	}
+	if brightest == imageSlabDim {
+		t.Errorf("comet never appears: brightest slab cell is the resting grey")
+	}
+	// The comet must move: the same cell brightens mid-pass and rests at
+	// the pass quarter.
+	a := loadingToastShade(11, 40, 0.25)
+	b := loadingToastShade(11, 40, 0.75)
+	if a == b {
+		t.Errorf("comet does not move: slab %#x at both 0.25 and 0.75", a)
+	}
+}
+
+func TestImageViewStepAnnouncesEdgesAndWalls(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "b.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	iv.Step(-1) // to a.png, the top edge
+	if iv.tempMsg != "[1/3]" {
+		t.Fatalf("arriving at the top must announce the position, got %q", iv.tempMsg)
+	}
+	if !iv.tempFlashUntil.IsZero() {
+		t.Error("arriving at an edge must not flash")
+	}
+
+	iv.Step(-1) // above the top: the wall
+	if iv.tempMsg != "[1/3]" {
+		t.Errorf("a blocked step must keep the position, got %q", iv.tempMsg)
+	}
+	if iv.tempFlashUntil.IsZero() || time.Now().After(iv.tempFlashUntil) {
+		t.Error("a blocked step must flash the toast")
+	}
+
+	iv.Step(+2) // to c.png, the bottom edge
+	if iv.tempMsg != "[3/3]" {
+		t.Errorf("arriving at the bottom must announce the position, got %q", iv.tempMsg)
+	}
+	if !iv.tempFlashUntil.IsZero() {
+		t.Error("arriving at an edge must not flash")
+	}
+
+	iv.Step(-1) // back to b.png, a plain move
+	if iv.tempMsg != "" {
+		t.Errorf("a move to another picture must drop the toast, got %q", iv.tempMsg)
+	}
+}
+
+func TestImageViewDecodeWaitOutranksThePosition(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	// Already on the first picture, with a decode still at work: the wall
+	// must keep quiet, so the "decoding" label has the corner to itself.
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "a.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 0)
+	iv.loading = true
+	iv.Step(-1) // blocked above the top
+	if iv.tempMsg != "" {
+		t.Errorf("a pending decode must outrank the wall toast, got %q", iv.tempMsg)
+	}
+
+	// Once the wait is over the wall may speak, and it flashes.
+	iv.loading = false
+	iv.Step(-1) // blocked again, now quiet
+	if iv.tempMsg != "[1/3]" {
+		t.Errorf("a quiet wall step must still announce, got %q", iv.tempMsg)
+	}
+	if iv.tempFlashUntil.IsZero() || time.Now().After(iv.tempFlashUntil) {
+		t.Error("a quiet wall step must still flash")
+	}
+
+	// Another shove at the same wall blinks again without touching the
+	// message.
+	before := iv.tempFlashUntil
+	// The wall-clock tick on some Windows systems is coarse enough that
+	// two back-to-back time.Now() calls return the same instant, which
+	// would make the re-flash indistinguishable from the first flash.
+	time.Sleep(2 * time.Millisecond)
+	iv.Step(-1)
+	if iv.tempMsg != "[1/3]" {
+		t.Errorf("a repeated shove must keep the message, got %q", iv.tempMsg)
+	}
+	if !iv.tempFlashUntil.After(before) {
+		t.Error("a repeated shove at the wall must re-flash")
+	}
+}
+
+func TestImageViewHomeEndAnnounceTheEdges(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "b.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	press := func(vk uint16) bool {
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vk})
+	}
+
+	if !press(vtinput.VK_HOME) || iv.index != 0 {
+		t.Fatalf("Home should go to the first picture, index is %d", iv.index)
+	}
+	if iv.tempMsg != "[1/3]" {
+		t.Errorf("Home must announce the edge, got %q", iv.tempMsg)
+	}
+
+	if !press(vtinput.VK_END) || iv.index != 2 {
+		t.Fatalf("End should go to the last picture, index is %d", iv.index)
+	}
+	if iv.tempMsg != "[3/3]" {
+		t.Errorf("End must announce the edge, got %q", iv.tempMsg)
 	}
 }
 

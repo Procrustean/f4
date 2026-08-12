@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/mattn/go-runewidth"
@@ -17,6 +18,12 @@ import (
 const (
 	imageTileCols = 18
 	imageTileRows = 9
+
+	// galleryThumbBudget bounds how many thumbnail decodes one frame may
+	// start. A screenful of tiles at once would flood the pipeline and push
+	// the viewer's own prefetch out of the queue; the nearest tiles get
+	// their turn first, the rest wait for the next frame.
+	galleryThumbBudget = 12
 )
 
 var (
@@ -109,6 +116,7 @@ func (iv *ImageView) ToggleGallery() {
 	// A grid and a slide show both want to own which picture is current,
 	// and there is nothing to divide that ownership with.
 	iv.stopSlideShow()
+	iv.stopAnimIfIdle()
 	if iv.gal != nil {
 		// Stop in-flight tile decodes; their thumbs are no longer wanted.
 		for _, cancel := range iv.gal.cancels {
@@ -171,6 +179,67 @@ func (iv *ImageView) SetSelected(path string, on bool) {
 	}
 }
 
+// requestVisibleThumbs asks for the thumbnails the grid can currently see,
+// closest to the cursor first, at most galleryThumbBudget per frame. Tiles
+// already asked for are skipped, so repeated frames walk the screen in rings
+// around the cursor instead of firing every missing tile at once.
+func (iv *ImageView) requestVisibleThumbs() {
+	g := iv.gal
+	if g == nil {
+		return
+	}
+	total := len(iv.siblings)
+	if total == 0 {
+		return
+	}
+	first := g.top * g.cols
+	last := first + g.cols*g.rows
+	if last > total {
+		last = total
+	}
+
+	type slot struct {
+		idx  int
+		dist int
+	}
+	visible := make([]slot, 0, last-first)
+	for idx := first; idx < last; idx++ {
+		if g.asked[iv.siblings[idx]] {
+			continue
+		}
+		visible = append(visible, slot{idx, galleryRing(g, idx)})
+	}
+	sort.SliceStable(visible, func(i, j int) bool {
+		return visible[i].dist < visible[j].dist
+	})
+	if len(visible) > galleryThumbBudget {
+		visible = visible[:galleryThumbBudget]
+	}
+	for _, s := range visible {
+		iv.requestThumb(iv.siblings[s.idx])
+	}
+}
+
+// galleryRing is how many tile steps a slot is from the grid cursor; the
+// ring order is what makes a freshly opened grid fill around the cursor.
+func galleryRing(g *imageGallery, idx int) int {
+	cols := g.cols
+	if cols < 1 {
+		cols = 1
+	}
+	dx, dy := idx%cols-g.cursor%cols, idx/cols-g.cursor/cols
+	if dx < 0 {
+		dx = -dx
+	}
+	if dy < 0 {
+		dy = -dy
+	}
+	if dx > dy {
+		return dx
+	}
+	return dy
+}
+
 // requestThumb decodes one thumbnail off the drawing path. PreviewSync is
 // cheap on a picture that is already known and reads only the header on one
 // that is not, but cheap is not free, and a screenful of tiles would
@@ -194,7 +263,7 @@ func (iv *ImageView) requestThumb(path string) {
 		}
 		surface := res.Surface
 		ctx.RunOnUI(func() {
-			if iv.gal == g && surface.Valid() {
+			if iv.gal == g && surface != nil && surface.Valid() {
 				g.thumbs[path] = surface
 			}
 			delete(g.cancels, path)
@@ -219,6 +288,10 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 	}
 	g.move(0, total)
 	g.scrollTo(g.cursor, total)
+
+	// A frame's worth of decodes, nearest the cursor first; the rest of the
+	// screen fills in over the coming frames.
+	iv.requestVisibleThumbs()
 
 	cw, ch := cellSize(scr)
 	g.tw, g.th = (imageTileCols-2)*cw, (imageTileRows-2)*ch
@@ -259,8 +332,9 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 	scr.Write(col, row+imageTileRows-1, vtui.StringToCharInfo(caption, attr))
 
 	surface := iv.gal.thumbs[path]
-	if !surface.Valid() {
-		iv.requestThumb(path)
+	if surface == nil || !surface.Valid() {
+		// No request here: the per-frame budget in requestVisibleThumbs
+		// decides which tiles are asked for and in what order.
 		return
 	}
 

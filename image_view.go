@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -33,8 +34,41 @@ const (
 	// toast stays a moment.
 	imageViewToastDelay = 2 * time.Second
 
+	// The toast leaves by sliding over the left edge. The window is meant
+	// to read as a dismiss, not a wait: 150ms is the fast step of the
+	// Material motion scale. The exit slide, the wall flash, and the
+	// loading band are all redrawn on the same tick.
+	imageToastSlideDur  = 150 * time.Millisecond
+	imageToastSlideTick = 30 * time.Millisecond
+
+	// One full pass of the bright band across the loading toast's slab.
+	imageLoadingCycle = 900 * time.Millisecond
+
+	// How long the end-of-list toast keeps its inverted "wall" colours.
+	// 200ms is the pulse step of the Material motion scale: long enough
+	// for the eye to read the wall, short enough not to feel like a blink
+	// the user has to wait out.
+	imageToastFlashDur = 200 * time.Millisecond
+
 	// decode may run this long before the viewer admits it is working.
 	imageViewDecodeDelay = 500 * time.Millisecond
+
+	// The loading toast's palette: pure grey ramps only — a dark slab near
+	// #1E1E1E and near-white text #E3E3E3, both snapped onto the XTerm-256
+	// grayscale ramp (levels 3 and 23), so the 256-colour fallback shows
+	// the same shades as truecolor.
+	imageLoadingText = 0xE4E4E4
+
+	// The resting and brightest slab greys of the loading toast. The comet
+	// swings ~23% luminance (ramp levels 3..9). The brightest grey 0x58
+	// stays a 14-step gap below the text grey 0xE4, so no bright shade ever
+	// lands under a letter of its own brightness.
+	imageSlabDim    = 0x1C1C1C
+	imageSlabBright = 0x585858
+
+	// The comet's half-width in letters: the raised-cosine bright patch on
+	// the slab spans this many cells either side of its centre.
+	imageCometHalfWidth = 3
 )
 
 var imageViewBackAttr = vtui.SetRGBBoth(0, 0xC0C0C0, blockImageBack)
@@ -46,6 +80,12 @@ var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
 // so the slab colour only shows where the picture does not reach; the light
 // glyphs are what keeps the message readable on top of the image.
 var imageToastAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x333333)
+
+// A blocked step into the edge of the list flashes the toast and the OSD
+// pane together in the inverted "wall" colours: dark glyphs on a lit slab,
+// loud without a sound. 0xC0C0C0 is the XTerm-256 light grey (about 250),
+// so the flash survives the fallback.
+var imageWallFlashAttr = vtui.SetRGBBoth(0, 0x101010, 0xC0C0C0)
 
 // ImageView shows a single picture full screen.
 type ImageView struct {
@@ -66,6 +106,7 @@ type ImageView struct {
 	err        error
 	loadGen    uint64
 	actual     bool
+	fitPct     int // the fitted percentage, for the scale toast on the way out
 	full       bool
 	lastScale  float64
 	zoom       float64 // the zoom currently on screen
@@ -114,6 +155,21 @@ type ImageView struct {
 	// tempMsg: transient message, lower-left.
 	tempMsg   string
 	tempUntil time.Time
+
+	// tempFlashUntil: how long the toast keeps the inverted "wall" colours.
+	tempFlashUntil time.Time
+
+	// tempSlideStart: when the toast's exit began (zero = not exiting).
+	tempSlideStart time.Time
+
+	// animStop ends the single redraw ticker that keeps the toast's
+	// animations in motion — the exit slide, the wall flash, and the
+	// loading band; nil while nothing animates.
+	animStop chan struct{}
+
+	// loadRow reuses the loading toast's slab cells across frames, so a
+	// long decode does not allocate a row per redraw tick.
+	loadRow []vtui.CharInfo
 
 	// decodeStart: toast once past imageViewDecodeDelay.
 	decodeStart time.Time
@@ -176,8 +232,9 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 	iv.SetFocus(true)
 
 	// What is on screen is a stand-in; ask for the real thing.
-	iv.loading = res.Preview
-	iv.decodeStart = time.Now()
+	if res.Preview {
+		iv.startDecode()
+	}
 	if iv.overlay {
 		iv.requestFileSize()
 	}
@@ -207,27 +264,61 @@ func (iv *ImageView) SetSiblings(paths []string, index int) {
 }
 
 // prefetch has the neighbours decoded while nobody is looking at them yet.
+// The nearest ones are decoded whole, so the next step lands on a finished
+// picture; the ring beyond them only gets its embedded thumbnail, which
+// costs a header read instead of a full decode.
 func (iv *ImageView) prefetch() {
 	if iv.index < 0 || iv.index >= len(iv.siblings) {
 		return
 	}
-	ImagePipe.Prefetch(iv.vfs, ImageNeighbourhood(iv.siblings, iv.index, imageViewPrefetchRadius))
+	near := ImageNeighbourhood(iv.siblings, iv.index, 1)
+	ImagePipe.Prefetch(iv.vfs, near)
+	if ring := ImageNeighbourhood(iv.siblings, iv.index, imageViewPrefetchRadius); len(ring) > len(near) {
+		ImagePipe.PreviewPrefetch(iv.vfs, ring[len(near):])
+	}
 }
 
 // Step walks the siblings. It stops at the ends rather than wrapping around,
-// so that it stays obvious where the directory begins and where it ends.
+// so that it stays obvious where the directory begins and where it ends. The
+// toast says where: "[3/10]" when the walk lands on an edge, and the same
+// message flashing in inverted colours when the edge refused to move.
 func (iv *ImageView) Step(delta int) {
-	if len(iv.siblings) == 0 || iv.index < 0 {
+	total := len(iv.siblings)
+	if total == 0 || iv.index < 0 {
 		return
 	}
 	idx := iv.index + delta
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= len(iv.siblings) {
-		idx = len(iv.siblings) - 1
+	if idx >= total {
+		idx = total - 1
 	}
+	blocked := idx == iv.index
 	iv.GoTo(idx)
+	// Another shove at the same wall blinks the number that is already in
+	// the corner; a fresh edge or wall announces it.
+	if blocked && iv.tempMsg == fmt.Sprintf("[%d/%d]", idx+1, total) {
+		iv.reFlash()
+	} else if !iv.loading && (blocked || idx == 0 || idx == total-1) {
+		iv.edgeToast(idx, blocked)
+	}
+}
+
+// edgeToast says where the walk landed: "[3/10]" on an edge, flashing when
+// the edge refused to move. A decode at work or another message in the
+// corner keeps it quiet, so the position never hides the "decoding" label
+// or a report about the picture itself.
+func (iv *ImageView) edgeToast(idx int, blocked bool) {
+	if iv.loading || iv.tempMsg != "" {
+		return
+	}
+	msg := fmt.Sprintf("[%d/%d]", idx+1, len(iv.siblings))
+	if blocked {
+		iv.flashToast(msg)
+	} else {
+		iv.toast(msg)
+	}
 }
 
 // GoTo shows the sibling at the given position.
@@ -254,6 +345,11 @@ func (iv *ImageView) Reload() {
 // at once; otherwise the previous picture stays until the new one arrives,
 // which is quieter than a flash of empty window.
 func (iv *ImageView) open(path string) {
+	if path != iv.path {
+		// The toast answers the picture it was said over; moving to
+		// another file drops it at once, slide-out animation included.
+		iv.toastClear()
+	}
 	iv.cancelDecode()
 	iv.path = path
 	iv.zoom = 1
@@ -266,6 +362,7 @@ func (iv *ImageView) open(path string) {
 	iv.decodeDur = 0
 	iv.loadGen++
 	gen := iv.loadGen
+	iv.startDecode()
 	iv.prefetch()
 	if iv.overlay {
 		iv.requestFileSize()
@@ -285,9 +382,14 @@ func (iv *ImageView) open(path string) {
 	iv.openPinned(gen, path, iv.reqDecoder)
 }
 
-func (iv *ImageView) openAutomatic(gen uint64, path string) {
+// startDecode marks the moment the decoder went to work, so the loading
+// toast can appear once imageViewDecodeDelay has passed.
+func (iv *ImageView) startDecode() {
 	iv.loading = true
 	iv.decodeStart = time.Now()
+}
+
+func (iv *ImageView) openAutomatic(gen uint64, path string) {
 	v := iv.vfs
 	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		if res, ok := ImagePipe.PreviewSync(ctx.Context, v, path); ok {
@@ -300,12 +402,10 @@ func (iv *ImageView) openAutomatic(gen uint64, path string) {
 
 // Pin: named decoder only; a non-reader falls back, dropping the pin.
 func (iv *ImageView) openPinned(gen uint64, path, dec string) {
-	iv.loading = true
-	iv.decodeStart = time.Now()
 	v := iv.vfs
 	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		start := time.Now()
-		data, err := imageFileBytes(ctx.Context, v, path)
+		data, err := ImagePipe.FileBytes(ctx.Context, v, path)
 		pinned := false
 		var surf *vtui.ImageSurface
 		var decoder string
@@ -377,11 +477,19 @@ func (iv *ImageView) baseScale(boxW, boxH int) float64 {
 }
 
 // ToggleActualSize switches between the window and the picture itself
-// deciding how large it is shown.
+// deciding how large it is shown. The toast says what the new scale is:
+// the literal pixels are always a hundred percent, and the fitted
+// percentage saved on the way in comes back with the picture.
 func (iv *ImageView) ToggleActualSize() {
 	iv.actual = !iv.actual
 	iv.zoom = 1
 	iv.panX, iv.panY = 0, 0
+	if iv.actual {
+		iv.fitPct = iv.scalePercent()
+		iv.toast("scale: 100%")
+	} else {
+		iv.toast(fmt.Sprintf("scale: %d%%", iv.fitPct))
+	}
 }
 
 // display is the picture the viewer works with: the turned and mirrored copy
@@ -866,7 +974,7 @@ func (iv *ImageView) stateLabel() string {
 	case iv.err != nil:
 		state = "error: " + iv.err.Error()
 	case iv.loading:
-		state += ", loading"
+		state += ", decoding"
 	case iv.preview:
 		state += ", preview"
 	}
@@ -921,10 +1029,84 @@ func formatImageDuration(d time.Duration) string {
 func (iv *ImageView) toast(msg string) {
 	iv.tempMsg = msg
 	iv.tempUntil = time.Now().Add(imageViewToastDelay)
+	iv.tempSlideStart = time.Time{}
+	iv.tempFlashUntil = time.Time{}
+}
+
+// toastClear drops the toast at once, exit animation included: the moment
+// another picture is asked for, whatever the old toast said is stale.
+func (iv *ImageView) toastClear() {
+	iv.tempMsg = ""
+	iv.tempSlideStart = time.Time{}
+	iv.tempFlashUntil = time.Time{}
+	iv.stopAnimIfIdle()
+}
+
+// flashToast is toast plus a short-lived "wall" flash: used when a step
+// into the first or the last picture could not move anywhere. The redraw
+// ticker restores the resting colours once the flash has run out.
+func (iv *ImageView) flashToast(msg string) {
+	iv.toast(msg)
+	iv.tempFlashUntil = time.Now().Add(imageToastFlashDur)
+	iv.ensureAnim()
+}
+
+// reFlash restarts the wall flash without touching the message, for a
+// shove at the same wall while its number is still on screen. The redraw
+// ticker restores the resting colours once the flash has run out.
+func (iv *ImageView) reFlash() {
+	iv.tempFlashUntil = time.Now().Add(imageToastFlashDur)
+	iv.ensureAnim()
 }
 
 func (iv *ImageView) tempActive() bool {
 	return iv.tempMsg != "" && time.Now().Before(iv.tempUntil)
+}
+
+// flashing reports whether the toast keeps its inverted "wall" colours.
+func (iv *ImageView) flashing() bool {
+	return time.Now().Before(iv.tempFlashUntil)
+}
+
+// tempSliding reports whether the toast is in its exit animation.
+func (iv *ImageView) tempSliding() bool {
+	return !iv.tempSlideStart.IsZero() && time.Since(iv.tempSlideStart) < imageToastSlideDur
+}
+
+// ensureAnim starts the single redraw ticker that keeps the toast's
+// animations in motion — the exit slide, the wall flash, and the loading
+// band all ride on the same tick. Idempotent.
+func (iv *ImageView) ensureAnim() {
+	if iv.animStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	iv.animStop = stop
+	go func() {
+		ticker := time.NewTicker(imageToastSlideTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				vtui.FrameManager.PostTask(func() {
+					if iv.animStop == stop {
+						vtui.FrameManager.Redraw()
+					}
+				})
+			}
+		}
+	}()
+}
+
+// stopAnimIfIdle ends the redraw ticker, if one is running.
+func (iv *ImageView) stopAnimIfIdle() {
+	if iv.animStop == nil {
+		return
+	}
+	close(iv.animStop)
+	iv.animStop = nil
 }
 
 func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64) {
@@ -939,17 +1121,112 @@ func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64)
 	scr.Write(x, y, vtui.StringToCharInfo(text, attr))
 }
 
-func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf, msg string) {
+func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
 	x1, _, x2, y2 := iv.GetPosition()
 	limit := x2 - x1 - 1
 	if limit < 1 {
 		limit = 1
 	}
-	text := " " + msg + " "
-	if runewidth.StringWidth(text) > limit {
+	text := " " + iv.tempMsg + " "
+	width := runewidth.StringWidth(text)
+	if width > limit {
 		text = runewidth.Truncate(text, limit, "…")
+		width = runewidth.StringWidth(text)
 	}
-	scr.Write(x1, y2, vtui.StringToCharInfo(text, imageToastAttr))
+	attr := imageToastAttr
+	if iv.flashing() {
+		attr = imageWallFlashAttr
+	}
+	scr.Write(x1+iv.tempSlideOffset(width), y2, vtui.StringToCharInfo(text, attr))
+}
+
+// tempSlideOffset is how far the toast has slid left, eased so the motion
+// gathers gently and lets go of the edge softly. At the end every slab cell
+// has left the screen and Write clips whatever sticks out of the left edge.
+func (iv *ImageView) tempSlideOffset(width int) int {
+	if !iv.tempSliding() {
+		return 0
+	}
+	p := float64(time.Since(iv.tempSlideStart)) / float64(imageToastSlideDur)
+	p = p * p * (3 - 2*p) // smoothstep
+	return -int(p * float64(width))
+}
+
+// loadingToastShade is one cell of the loading toast's slab. A comet — a
+// soft bright patch — crosses the row once per cycle, while the whole pass
+// ramps up from nothing and back down into nothing: it comes out of
+// nowhere, travels, and fades away with no hard edge, so no restart is ever
+// visible. The letters stay at their fixed light grey throughout: the
+// brightest slab cell (0x58) is a 14-step gap below the text grey (0xE4)
+// on the 256 ramp, so no bright shade ever lands under a letter of its own
+// brightness. phase is the pass position, [0,1).
+func loadingToastShade(x, width int, phase float64) uint32 {
+	if width <= 0 {
+		return imageSlabDim
+	}
+	span := float64(width + imageCometHalfWidth)
+	// Pass envelope: zero at both ends, one in the middle — the comet fades
+	// in from nothing and out into nothing.
+	t := phase * span
+	env := math.Sin(math.Pi * t / span)
+	// Local comet profile: a raised cosine centred on the comet, so the
+	// slab brightens into one smooth patch.
+	d := float64(x) - t
+	prof := 0.0
+	if d > -float64(imageCometHalfWidth) && d < float64(imageCometHalfWidth) {
+		prof = 0.5 + 0.5*math.Cos(math.Pi*d/float64(imageCometHalfWidth))
+	}
+	m := env * prof
+	base := uint32(imageSlabDim >> 16)
+	c := base + uint32(m*float64(imageSlabBright>>16-base))
+	return c<<16 | c<<8 | c
+}
+
+// loadingToastOn reports whether the loading toast is drawn: a decode at
+// work past imageViewDecodeDelay, with no other message in the corner.
+func (iv *ImageView) loadingToastOn() bool {
+	return iv.loading && !iv.tempActive() && time.Since(iv.decodeStart) > imageViewDecodeDelay
+}
+
+// drawLoadingToast shows that the decoder is still at work: the seconds
+// already spent, over a slab a bright band keeps crossing, so a long decode
+// reads as progress, not silence.
+func (iv *ImageView) drawLoadingToast(scr *vtui.ScreenBuf) {
+	x1, _, x2, y2 := iv.GetPosition()
+	limit := x2 - x1 - 1
+	if limit < 1 {
+		limit = 1
+	}
+	// One clock read drives both the counter and the band phase, so the
+	// comet always sits where the seconds say it is.
+	dur := time.Since(iv.decodeStart)
+	text := " decoding " + formatImageDuration(dur) + " "
+	text = runewidth.Truncate(text, limit, "…")
+	// Phase counts from decodeStart (pinned when loading began), never from
+	// the frame clock, so the band cannot sit frozen at its first shape.
+	phase := float64(dur%imageLoadingCycle) / float64(imageLoadingCycle)
+	iv.loadRow = buildLoadingRow(iv.loadRow[:0], text, phase)
+	scr.Write(x1, y2, iv.loadRow)
+}
+
+// buildLoadingRow renders one loading-toast frame into row, reusing its
+// backing array so a steady decode allocates nothing per frame. The slab
+// comes up in its resting grey; only the comet's own cells get the bright
+// pass shade, which is exactly what loadingToastShade leaves outside the
+// band anyway, so every cell matches the per-cell pass.
+func buildLoadingRow(row []vtui.CharInfo, text string, phase float64) []vtui.CharInfo {
+	base := vtui.SetRGBBoth(0, imageLoadingText, imageSlabDim)
+	for _, r := range text {
+		row = append(row, vtui.CharInfo{Char: uint64(r), Attributes: base})
+	}
+	hw := float64(imageCometHalfWidth)
+	t := phase * float64(len(row)+imageCometHalfWidth)
+	for i := range row {
+		if d := float64(i) - t; d > -hw && d < hw {
+			row[i].Attributes = vtui.SetRGBBoth(0, imageLoadingText, loadingToastShade(i, len(row), phase))
+		}
+	}
+	return row
 }
 
 // drawOverlay writes the info panel over the left edge of the picture.
@@ -980,10 +1257,15 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 	}
 
 	// One slab under all the lines, with a row of air above it: the panel
-	// reads as a pane, not as separate stickers.
-	scr.FillRect(x1, top+1, x1+width-1, top+rows, ' ', imageOverlayAttr)
+	// reads as a pane, not as separate stickers. While the wall flash
+	// lasts, the pane inverts with the toast.
+	attr := imageOverlayAttr
+	if iv.flashing() {
+		attr = imageWallFlashAttr
+	}
+	scr.FillRect(x1, top+1, x1+width-1, top+rows, ' ', attr)
 	for i := 0; i < rows; i++ {
-		paintPadded(scr, x1, top+1+i, width, " "+lines[i], imageOverlayAttr)
+		paintPadded(scr, x1, top+1+i, width, " "+lines[i], attr)
 	}
 }
 
@@ -1028,16 +1310,40 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	if iv.overlay {
 		iv.drawOverlay(scr)
 	}
+	iv.toastUpdate()
 	if iv.tempMsg != "" {
-		if iv.tempActive() {
-			iv.drawToastText(scr, iv.tempMsg)
-		} else {
-			iv.tempMsg = ""
-		}
+		iv.drawToastText(scr)
 	}
-	if iv.loading && !iv.tempActive() && time.Since(iv.decodeStart) > imageViewDecodeDelay {
-		iv.drawToastText(scr, "loading...")
+	if iv.loadingToastOn() {
+		iv.ensureAnim()
+		iv.drawLoadingToast(scr)
+	} else if iv.flashing() || iv.tempSliding() {
+		iv.ensureAnim() // the wall flash or the exit slide still needs its ticks
+	} else {
+		iv.stopAnimIfIdle()
 	}
+}
+
+// toastUpdate advances the toast's life once per frame: a message still in
+// its window, or one sliding out, stays; a finished exit is dropped and
+// the redraw ticker stopped. Show draws what is left after this.
+func (iv *ImageView) toastUpdate() {
+	if iv.tempMsg == "" {
+		iv.stopAnimIfIdle()
+		return
+	}
+	if iv.tempActive() || iv.tempSliding() {
+		return // still within its window, or still sliding out
+	}
+	if iv.tempSlideStart.IsZero() {
+		// The window is over: the exit begins, and the ticker keeps the
+		// slide in motion until the toast has left the screen.
+		iv.tempSlideStart = time.Now()
+		iv.ensureAnim()
+		return
+	}
+	iv.tempMsg = ""
+	iv.stopAnimIfIdle()
 }
 
 func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
@@ -1141,10 +1447,16 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 		iv.Step(-1)
 		return true
 	case vtinput.VK_HOME:
-		iv.GoTo(0)
+		if len(iv.siblings) > 0 {
+			iv.GoTo(0)
+			iv.edgeToast(0, false)
+		}
 		return true
 	case vtinput.VK_END:
-		iv.GoTo(len(iv.siblings) - 1)
+		if len(iv.siblings) > 0 {
+			iv.GoTo(len(iv.siblings) - 1)
+			iv.edgeToast(len(iv.siblings)-1, false)
+		}
 		return true
 	case vtinput.VK_TAB:
 		iv.ToggleActualSize()
@@ -1191,6 +1503,7 @@ func (iv *ImageView) Close() {
 	iv.full = false
 	iv.cancelDecode()
 	iv.stopSlideShow()
+	iv.stopAnimIfIdle()
 	vtui.FrameManager.HideBars = false
 	iv.BaseFrame.Close()
 	// Leave the panel cursor on the picture the viewer stopped at.
