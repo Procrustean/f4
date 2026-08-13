@@ -560,6 +560,75 @@ CursorColor = foreground:#FF9238
 	}
 }
 
+func TestFileEntry_HighlightCache(t *testing.T) {
+	vtui.SetDefaultPalette()
+	SetDefaultF4Palette()
+
+	oldHL := GlobalFileHighlighter
+	oldCfg := AppConfig
+	AppConfig.EnforceColorCorrection = false
+	AppConfig.ShowHighlightMarks = true
+	defer func() {
+		GlobalFileHighlighter = oldHL
+		AppConfig = oldCfg
+	}()
+
+	iniData := `[Highlight_0]
+Name = Go files
+Mask = *.go
+NormalColor = foreground:#00FF00
+Mark = G
+`
+	hl := &FileHighlighter{}
+	hl.LoadFromIni(ParseIni(strings.NewReader(iniData)))
+	GlobalFileHighlighter = hl
+
+	entry := &fileEntry{VFSItem: vfs.VFSItem{Name: "main.go"}}
+	base := vtui.Palette[ColPanelText]
+
+	if got := vtui.GetRGBFore(entry.GetCellAttr(0, base)); got != 0x00FF00 {
+		t.Fatalf("first GetCellAttr fg = #%06x, want #00FF00", got)
+	}
+	if got := entry.displayName(entry.Name); !strings.HasPrefix(got, "G ") {
+		t.Fatalf("displayName = %q, want marker prefix \"G \"", got)
+	}
+
+	// Mutate the rules in place without a generation bump: the per-entry
+	// caches must keep serving the old values (no re-match on scroll).
+	hl.UserRules[0].NormalStr = "foreground:#FF0000"
+	hl.UserRules[0].Mark = "X"
+	hl.Rules[0].NormalStr = "foreground:#FF0000"
+	hl.Rules[0].Mark = "X"
+
+	if got := entry.GetCellAttr(0, base); got != base {
+		fg := vtui.GetRGBFore(got)
+		if fg != 0x00FF00 {
+			t.Fatalf("cache miss: GetCellAttr returned #%06x before a generation bump", fg)
+		}
+	}
+	if got := entry.displayName(entry.Name); !strings.HasPrefix(got, "G ") {
+		t.Fatalf("marker cache miss: displayName = %q after rule edit", got)
+	}
+
+	// A generation bump (any rules reload) must refresh both caches.
+	hl.CombineRules()
+	if got := vtui.GetRGBFore(entry.GetCellAttr(0, base)); got != 0xFF0000 {
+		t.Fatalf("after CombineRules fg = #%06x, want #FF0000 (stale cache?)", got)
+	}
+	if got := entry.displayName(entry.Name); !strings.HasPrefix(got, "X ") {
+		t.Fatalf("marker cache stale: displayName = %q after CombineRules", got)
+	}
+
+	// Selection state is part of the cache key: the selected lookup must not
+	// reuse the unselected entry (no SelectedColor rule falls back to the
+	// default attribute, which differs from the matched colour above).
+	unselected := entry.GetCellAttr(0, base)
+	entry.Selected = true
+	if sel := entry.GetCellAttr(0, base); sel == unselected {
+		t.Fatalf("selection did not change the cached attribute")
+	}
+}
+
 func TestFileHighlighter_SelectedCursorFallsBackToSelectedColor(t *testing.T) {
 	vtui.SetDefaultPalette()
 	SetDefaultF4Palette()

@@ -64,6 +64,14 @@ type FileHighlighter struct {
 	UserRules  []HighlightRule
 	ThemeRules []HighlightRule
 	Rules      []HighlightRule
+
+	// Generation increments whenever the rules change. fileEntry caches
+	// resolved colours and markers keyed by this value, so scrolling a
+	// panel does not re-run rule matching for rows that did not change.
+	Generation uint64
+	// HasDateRules reports whether any rule filters by relative dates. Such
+	// rules flip as time passes, so per-entry colour caches are bypassed.
+	HasDateRules bool
 }
 
 var GlobalFileHighlighter *FileHighlighter
@@ -95,6 +103,15 @@ func (fh *FileHighlighter) CombineRules() {
 		fh.Rules = append(fh.Rules, fh.UserRules...)
 		fh.Rules = append(fh.Rules, fh.ThemeRules...)
 	}
+	fh.HasDateRules = false
+	for i := range fh.Rules {
+		r := &fh.Rules[i]
+		if !r.DateAfter.IsZero() || r.DateAfterDur > 0 || !r.DateBefore.IsZero() || r.DateBeforeDur > 0 {
+			fh.HasDateRules = true
+			break
+		}
+	}
+	fh.Generation++
 }
 
 func parseHighlightRules(ini *IniFile) []HighlightRule {

@@ -29,6 +29,18 @@ type fileEntry struct {
 	PrevSelected   bool // snapshot of Selected taken by SaveSelection; swapped in by RestoreSelection (Ctrl+M)
 	SizeCalculated bool
 	IsCached       bool
+
+	// Highlight caches: rule matching is deterministic per (rules generation,
+	// selection state, cursor attribute), so a row that scrolls in and out of
+	// view is not re-matched on every frame. Keys are opaque tuples; a fresh
+	// generation resets the slot count. See highlightCacheKey.
+	hlGen       uint64
+	hlKeys      [4]uint64
+	hlAttrs     [4]uint64
+	hlCount     int
+	hlMarkGen   uint64
+	hlMarkReady bool
+	hlMark      string
 }
 type mediumRow struct {
 	fp *FileSystemPanel
@@ -83,7 +95,17 @@ func (f *fileEntry) displayName(name string) string {
 	}
 	marker := ""
 	if AppConfig.ShowHighlightMarks {
-		marker = GlobalFileHighlighter.GetMarker(&f.VFSItem)
+		hl := GlobalFileHighlighter
+		if hl == nil || hl.HasDateRules {
+			marker = hl.GetMarker(&f.VFSItem)
+		} else if f.hlMarkReady && f.hlMarkGen == hl.Generation {
+			marker = f.hlMark
+		} else {
+			marker = hl.GetMarker(&f.VFSItem)
+			f.hlMarkGen = hl.Generation
+			f.hlMarkReady = true
+			f.hlMark = marker
+		}
 	}
 	if marker == "" && f.IsSymlink {
 		marker = "→"
@@ -331,12 +353,51 @@ func (f *fileEntry) GetCellText(col int) string {
 	return ""
 }
 func (f *fileEntry) GetCellAttr(col int, defaultAttr uint64) uint64 {
-	attr := defaultAttr
-	isCursor := (defaultAttr == vtui.Palette[ColPanelCursor] || defaultAttr == vtui.Palette[ColPanelSelectedCursor] || defaultAttr == vtui.Palette[ColPanelInactiveCursor] || defaultAttr == vtui.Palette[ColPanelInactiveSelectedCursor])
+	hl := GlobalFileHighlighter
+	if hl == nil || hl.HasDateRules {
+		// Relative-date rules flip with the clock; never cache those.
+		attr := defaultAttr
+		isCursor := highlightCursorAttr(defaultAttr)
+		return hl.GetColor(&f.VFSItem, attr, f.Selected, isCursor)
+	}
 
-	attr = GlobalFileHighlighter.GetColor(&f.VFSItem, attr, f.Selected, isCursor)
-
+	key := highlightCacheKey(defaultAttr, f.Selected, AppConfig.EnforceColorCorrection)
+	if f.hlGen != hl.Generation {
+		f.hlGen = hl.Generation
+		f.hlCount = 0
+	}
+	for i := 0; i < f.hlCount; i++ {
+		if f.hlKeys[i] == key {
+			return f.hlAttrs[i]
+		}
+	}
+	attr := hl.GetColor(&f.VFSItem, defaultAttr, f.Selected, highlightCursorAttr(defaultAttr))
+	if f.hlCount < len(f.hlKeys) {
+		f.hlKeys[f.hlCount] = key
+		f.hlAttrs[f.hlCount] = attr
+		f.hlCount++
+	}
 	return attr
+}
+
+// highlightCursorAttr reports whether defaultAttr is one of the cursor
+// palette entries; cursor rows resolve colours differently.
+func highlightCursorAttr(defaultAttr uint64) bool {
+	return defaultAttr == vtui.Palette[ColPanelCursor] || defaultAttr == vtui.Palette[ColPanelSelectedCursor] || defaultAttr == vtui.Palette[ColPanelInactiveCursor] || defaultAttr == vtui.Palette[ColPanelInactiveSelectedCursor]
+}
+
+// highlightCacheKey folds the cursor attribute, selection state and the
+// contrast-correction flag into one value. Multiplication is injective over
+// (defaultAttr, selected, enforce), so distinct states never collide.
+func highlightCacheKey(defaultAttr uint64, selected, enforce bool) uint64 {
+	key := defaultAttr * 4
+	if selected {
+		key += 2
+	}
+	if enforce {
+		key += 1
+	}
+	return key
 }
 
 // FileSystemPanel is a panel displaying files on disk.
