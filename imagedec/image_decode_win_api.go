@@ -1,6 +1,6 @@
 //go:build windows
 
-package imagedecoders
+package imagedec
 
 // Native Windows decoders: WIC for pixel formats, the shell thumbnailer for
 // what WIC cannot read (SVG, EMF/WMF, video). WIC decodes from memory; the

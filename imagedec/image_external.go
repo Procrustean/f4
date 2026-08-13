@@ -1,4 +1,4 @@
-package imagedecoders
+package imagedec
 
 // external decode: converter reads the file, its stdout
 // (PAM/PNG) becomes the picture — webp/avif/heic/jxl and the long tail.

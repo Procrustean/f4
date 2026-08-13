@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package imagedecoders
+package imagedec
 
 /*
 #cgo LDFLAGS: -framework CoreFoundation -framework CoreGraphics -framework ImageIO

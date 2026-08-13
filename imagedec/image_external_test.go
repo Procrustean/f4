@@ -1,4 +1,4 @@
-package imagedecoders
+package imagedec
 
 import (
 	"context"

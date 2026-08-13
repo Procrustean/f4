@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package imagedecoders
+package imagedec
 
 import (
 	"bytes"

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/vtui"
 )
 
@@ -522,7 +522,7 @@ func (kg *KittyGraphics) replyID(cmd kittyCommand, id uint32, msg string) {
 // kittySurface turns the received bytes into pixels.
 func kittySurface(cmd kittyCommand, data []byte) (*vtui.ImageSurface, string) {
 	if cmd.Int('f', 32) == 100 {
-		surf, err := imagedecoders.DecodeImageWithStdlib(data)
+		surf, err := imagedec.DecodeImageWithStdlib(data)
 		if err != nil || !surf.Valid() {
 			return nil, "EINVAL:the image could not be decoded"
 		}

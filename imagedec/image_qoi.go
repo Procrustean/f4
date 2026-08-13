@@ -1,4 +1,4 @@
-package imagedecoders
+package imagedec
 
 // QOI decoder; keeping it local avoids a dependency for a small format.
 

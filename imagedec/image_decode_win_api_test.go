@@ -1,6 +1,6 @@
 //go:build windows
 
-package imagedecoders
+package imagedec
 
 import (
 	"bytes"

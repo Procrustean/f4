@@ -11,7 +11,7 @@ import (
 	"image/jpeg"
 	"io"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 )
@@ -31,7 +31,7 @@ const (
 func imageQuickPreview(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 	// Only JPEG carries an Exif thumbnail; skip the pointless open and
 	// 256 KiB head read for other formats.
-	switch imagedecoders.ImageExtension(path) {
+	switch imagedec.ImageExtension(path) {
 	case "jpg", "jpeg", "jfif":
 	default:
 		return nil, "", fmt.Errorf("embedded preview is only supported for JPEG files")

@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattn/go-runewidth"
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -739,8 +739,8 @@ func (q *QuickViewPanel) refreshCache(key quickViewSelectionKey, path string, it
 	// size <= 0, video is not worth the attempt on a virtual file system), so
 	// the file gets the ordinary text/hex preview instead of a "too large"
 	// refusal.
-	skipVideoPreview := imagedecoders.IsVideoFile(path) && (item.Size <= 0 || item.Size > imagedecoders.VideoPreviewMaxSize)
-	if imagedecoders.IsImageFile(path) && !skipVideoPreview {
+	skipVideoPreview := imagedec.IsVideoFile(path) && (item.Size <= 0 || item.Size > imagedec.VideoPreviewMaxSize)
+	if imagedec.IsImageFile(path) && !skipVideoPreview {
 		q.cacheImage = true
 		gen := q.imageLoadGen
 		source := q.src.vfs

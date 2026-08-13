@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -264,7 +264,7 @@ func TestGalleryThumbnailBudgetNotExceededOnScreen(t *testing.T) {
 // refusal surfaced.
 func TestGalleryVideoTileNeverReadsBytesWhole(t *testing.T) {
 	// A size decoder that would eagerly claim mp4 if the guard slipped.
-	imagedecoders.RegisterImageDecoder(imagedecoders.ImageDecoder{
+	imagedec.RegisterImageDecoder(imagedec.ImageDecoder{
 		Name:       "test-video-size",
 		Priority:   5000,
 		Extensions: []string{"mp4"},
@@ -275,7 +275,7 @@ func TestGalleryVideoTileNeverReadsBytesWhole(t *testing.T) {
 			return imageTestSurface(w, h), nil
 		},
 	})
-	defer imagedecoders.UnregisterImageDecoder("test-video-size")
+	defer imagedec.UnregisterImageDecoder("test-video-size")
 	registerVideoPathDecoder(t, func(context.Context, string, []byte) (*vtui.ImageSurface, error) {
 		return imageTestSurface(2, 2), nil
 	})

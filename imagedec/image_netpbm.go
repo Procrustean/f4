@@ -1,4 +1,4 @@
-package imagedecoders
+package imagedec
 
 // Netpbm (P1..P7, PF, Pf) decoder with streaming and raw/ASCII support.
 

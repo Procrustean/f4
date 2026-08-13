@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 )
@@ -400,14 +400,14 @@ func TestImagePipelineLoadSyncHonoursCancellation(t *testing.T) {
 // fake chain is what the video guards see on every platform.
 func registerVideoPathDecoder(t *testing.T, fn func(context.Context, string, []byte) (*vtui.ImageSurface, error)) {
 	t.Helper()
-	imagedecoders.RegisterImageDecoder(imagedecoders.ImageDecoder{
+	imagedec.RegisterImageDecoder(imagedec.ImageDecoder{
 		Name:       "test-video-path",
 		Priority:   4000,
 		Extensions: []string{"mp4"},
 		FromPath:   true,
 		DecodeCtx:  fn,
 	})
-	t.Cleanup(func() { imagedecoders.UnregisterImageDecoder("test-video-path") })
+	t.Cleanup(func() { imagedec.UnregisterImageDecoder("test-video-path") })
 }
 
 // TestImagePipelineVideoNeverReadsBytesWhole locks in the video-preview
@@ -424,7 +424,7 @@ func TestImagePipelineVideoNeverReadsBytesWhole(t *testing.T) {
 	p := newTestPipeline(nil)
 
 	surf, _, err := p.loadWithCache(context.Background(), v, "clip.mp4")
-	if !errors.Is(err, imagedecoders.ErrVideoPreviewUnavailable) {
+	if !errors.Is(err, imagedec.ErrVideoPreviewUnavailable) {
 		t.Fatalf("the failing path decode must be the quiet video refusal, got %v", err)
 	}
 	if surf != nil {

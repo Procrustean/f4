@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/piecetable"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
@@ -1220,7 +1220,7 @@ func actionSwitchViewerToEditor(vv *ViewerView) {
 // or through the half-block cell renderer when the backend has none. It
 // returns false to let the ordinary viewer handle the file.
 func tryOpenImageViewer(pf *PanelsFrame, v vfs.VFS, path string) bool {
-	if pf == nil || !imagedecoders.IsImageFile(path) {
+	if pf == nil || !imagedec.IsImageFile(path) {
 		return false
 	}
 	scr := vtui.FrameManager.Screen()

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/mattn/go-runewidth"
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -349,7 +349,7 @@ func (iv *ImageView) open(path string) {
 	if iv.overlay {
 		iv.requestFileSize()
 	}
-	if iv.reqDecoder != "" && !imagedecoders.ImageChoiceValid(iv.reqDecoder) {
+	if iv.reqDecoder != "" && !imagedec.ImageChoiceValid(iv.reqDecoder) {
 		iv.reqDecoder = ""
 	}
 
@@ -389,7 +389,7 @@ func (iv *ImageView) progressContext(ctx context.Context) context.Context {
 	if iv.decodePct == nil {
 		iv.decodePct = new(atomic.Int32)
 	}
-	return imagedecoders.WithDecodeProgress(ctx, iv.decodePct)
+	return imagedec.WithDecodeProgress(ctx, iv.decodePct)
 }
 
 // Pin: named decoder only; a non-reader falls back, dropping the pin.
@@ -405,15 +405,15 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 		// A path-rendering decoder (the shell) reads the real file itself;
 		// a video must not be pulled into memory just to hand over its path.
 		// The pin sticks only when it names this decoder.
-		if d, ok := imagedecoders.PathDecoderFor(path); ok {
-			surf, decoder, err = imagedecoders.DecodeImageFromPath(dctx, path, d)
+		if d, ok := imagedec.PathDecoderFor(path); ok {
+			surf, decoder, err = imagedec.DecodeImageFromPath(dctx, path, d)
 			switch {
 			case err == nil && (dec == "" || dec == d.Name):
 				pinned = true
 			case err == nil:
 				surf, decoder, err = nil, "", nil // honour a different pin below
-			case imagedecoders.IsVideoFile(path):
-				err = imagedecoders.ErrVideoPreviewUnavailable // no real path
+			case imagedec.IsVideoFile(path):
+				err = imagedec.ErrVideoPreviewUnavailable // no real path
 			default:
 				surf, decoder, err = nil, "", nil // fall through to the bytes
 			}
@@ -425,11 +425,11 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 			if derr != nil {
 				err = derr
 			} else {
-				surf, decoder, err = imagedecoders.LoadImageForBytes(dctx, path, data, dec)
+				surf, decoder, err = imagedec.LoadImageForBytes(dctx, path, data, dec)
 				pinned = err == nil
 				if err != nil {
 					start = time.Now()
-					surf, decoder, err = imagedecoders.LoadImageForBytes(dctx, path, data, "")
+					surf, decoder, err = imagedec.LoadImageForBytes(dctx, path, data, "")
 				}
 			}
 		}
@@ -444,7 +444,7 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 }
 
 func (iv *ImageView) CycleDecoder() {
-	next := imagedecoders.ImageNextDecoder(imagedecoders.ImageDecoderChoices(iv.path), iv.reqDecoder, iv.decoder)
+	next := imagedec.ImageNextDecoder(imagedec.ImageDecoderChoices(iv.path), iv.reqDecoder, iv.decoder)
 	if next == "" {
 		return
 	}
@@ -613,17 +613,17 @@ func (iv *ImageView) sizedDecodeTarget() (int, int) {
 // shell-rendered format goes through the pipeline's guarded load unchanged.
 func (iv *ImageView) loadSized(ctx context.Context, v vfs.VFS, path string) ImageResult {
 	w, h := iv.sizedDecodeTarget()
-	if w <= 0 || h <= 0 || imagedecoders.IsVideoFile(path) {
+	if w <= 0 || h <= 0 || imagedec.IsVideoFile(path) {
 		return ImagePipe.LoadSync(ctx, v, path)
 	}
-	if _, ok := imagedecoders.PathDecoderFor(path); ok {
+	if _, ok := imagedec.PathDecoderFor(path); ok {
 		return ImagePipe.LoadSync(ctx, v, path)
 	}
 	data, err := ImagePipe.FileBytes(ctx, v, path)
 	if err != nil {
 		return ImageResult{Path: path, Err: err}
 	}
-	surf, decoder, sized, err := imagedecoders.LoadImageForBytesSize(ctx, path, data, "", w, h)
+	surf, decoder, sized, err := imagedec.LoadImageForBytesSize(ctx, path, data, "", w, h)
 	if err != nil {
 		return ImagePipe.LoadSync(ctx, v, path)
 	}

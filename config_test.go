@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/vtui"
 )
 
@@ -451,7 +451,7 @@ func TestConfig_ImagesSectionRoundTrip(t *testing.T) {
 		getUserConfigIniPath = origUserPathFunc
 		getConfigIniPaths = origPathsFunc
 		AppConfig = oldCfg
-		imagedecoders.SetImageDecoderPriorities(nil)
+		imagedec.SetImageDecoderPriorities(nil)
 	}()
 
 	AppConfig.SlideShowDelay = 9
@@ -473,10 +473,10 @@ func TestConfig_ImagesSectionRoundTrip(t *testing.T) {
 	if AppConfig.ImageDecoderPriority != "external:-5|go-std:3" {
 		t.Errorf("DecoderPriority is %q", AppConfig.ImageDecoderPriority)
 	}
-	if got := imagedecoders.ImageDecoderPriorityOf("external", -10); got != -5 {
+	if got := imagedec.ImageDecoderPriorityOf("external", -10); got != -5 {
 		t.Errorf("loading must apply the priorities, external is %d", got)
 	}
-	if got := imagedecoders.ImageDecoderPriorityOf("go-bmp", 10); got != 10 {
+	if got := imagedec.ImageDecoderPriorityOf("go-bmp", 10); got != 10 {
 		t.Errorf("a decoder nobody overrode must keep its own priority, got %d", got)
 	}
 }

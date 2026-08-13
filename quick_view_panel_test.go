@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -176,7 +176,7 @@ func TestQuickView_VideoPreviewRespectsSizeLimit(t *testing.T) {
 	huge := NewFileSystemPanel(0, 0, 40, 20, vfs.NewOSVFS(tmp))
 	huge.entries = []*fileEntry{
 		{VFSItem: vfs.VFSItem{Name: "..", IsDir: true}},
-		{VFSItem: vfs.VFSItem{Name: "clip.mp4", Size: imagedecoders.VideoPreviewMaxSize + 1}},
+		{VFSItem: vfs.VFSItem{Name: "clip.mp4", Size: imagedec.VideoPreviewMaxSize + 1}},
 	}
 	huge.cursorIdx = 1
 	huge.Refresh()

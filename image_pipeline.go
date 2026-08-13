@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 )
@@ -166,22 +166,22 @@ func (p *ImagePipeline) loadWithCache(ctx context.Context, v vfs.VFS, path strin
 	// A path-rendering decoder (the shell) needs no bytes; reading a video
 	// into memory to hand over its path would trip the byte cap. The shell
 	// resolves a real local file; anything else falls through to the bytes.
-	if d, ok := imagedecoders.PathDecoderFor(path); ok {
-		if surf, name, err := imagedecoders.DecodeImageFromPath(ctx, path, d); err == nil {
+	if d, ok := imagedec.PathDecoderFor(path); ok {
+		if surf, name, err := imagedec.DecodeImageFromPath(ctx, path, d); err == nil {
 			return surf, name, nil
 		}
 		// The shell failed (a virtual FS has no real path). Don't read a
 		// video whole for a frame — that's how the "too large" refusal
 		// surfaced — just skip its preview quietly.
-		if imagedecoders.IsVideoFile(path) {
-			return nil, "", imagedecoders.ErrVideoPreviewUnavailable
+		if imagedec.IsVideoFile(path) {
+			return nil, "", imagedec.ErrVideoPreviewUnavailable
 		}
 	}
 	data, err := p.FileBytes(ctx, v, path)
 	if err != nil {
 		return nil, "", err
 	}
-	return imagedecoders.LoadImageForBytes(ctx, path, data, "")
+	return imagedec.LoadImageForBytes(ctx, path, data, "")
 }
 
 // imageSource names the file system a path belongs to.
@@ -528,7 +528,7 @@ func (p *ImagePipeline) run(job *imageJob) {
 	surf, decoder, err := p.load(ctx, job.v, job.path)
 	res := ImageResult{Path: job.path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}
 	if err == nil && (surf == nil || !surf.Valid()) {
-		res.Err = fmt.Errorf("image pipeline: %w", imagedecoders.ErrEmptyDecoderResult)
+		res.Err = fmt.Errorf("image pipeline: %w", imagedec.ErrEmptyDecoderResult)
 		res.Surface = nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -657,7 +657,7 @@ func (p *ImagePipeline) FileBytes(ctx context.Context, v vfs.VFS, path string) (
 	p.bytesJobs[key] = job
 	p.mu.Unlock()
 
-	data, err := imagedecoders.ImageReadFileBytes(ctx, v, path)
+	data, err := imagedec.ImageReadFileBytes(ctx, v, path)
 
 	p.mu.Lock()
 	if err == nil && job.generation == p.bytesGen && len(data) <= imageBytesCacheMaxFile {

@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/mattn/go-runewidth"
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -433,11 +433,11 @@ func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) Imag
 	if h < 1 {
 		h = (imageTileRows - 2) * imageViewFallbackCellH
 	}
-	decoders := imagedecoders.ImageDecodersFor(path)
+	decoders := imagedec.ImageDecodersFor(path)
 	// A video renders only from a real path; never hand its bytes to a size
 	// decoder or converter, which would read the whole container. The
 	// pipeline's guarded load serves the frame and skips quietly.
-	if len(decoders) == 0 || imagedecoders.IsVideoFile(path) {
+	if len(decoders) == 0 || imagedec.IsVideoFile(path) {
 		return ImagePipe.LoadTileSync(ctx, v, path)
 	}
 	if d := decoders[0]; d.DecodeSize != nil {
@@ -447,7 +447,7 @@ func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) Imag
 			}
 		}
 	}
-	if decoders[0].Name == imagedecoders.ExternalImageDecoder {
+	if decoders[0].Name == imagedec.ExternalImageDecoder {
 		surf, decoder, err := loadImageScaled(ctx, v, path, w, h)
 		if err != nil {
 			return ImagePipe.LoadTileSync(ctx, v, path)
@@ -471,11 +471,11 @@ func loadImageScaled(ctx context.Context, v vfs.VFS, path string, w, h int) (*vt
 	if err != nil {
 		return nil, "", err
 	}
-	tool, ok := imagedecoders.ExternalImageToolFor(data)
+	tool, ok := imagedec.ExternalImageToolFor(data)
 	if !ok {
 		return nil, "", fmt.Errorf("no external image converter on the PATH")
 	}
-	surf, err := imagedecoders.DecodeImageExternallyScaled(ctx, tool, data, w, h)
+	surf, err := imagedec.DecodeImageExternallyScaled(ctx, tool, data, w, h)
 	if err != nil {
 		return nil, "", err
 	}

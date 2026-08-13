@@ -16,7 +16,7 @@ import (
 
 	"github.com/mattn/go-runewidth"
 
-	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -3261,7 +3261,7 @@ func (fp *FileSystemPanel) ImageSiblings() ([]string, int) {
 	names := make([]string, 0, len(fp.entries))
 	index := -1
 	for _, e := range fp.entries {
-		if e.IsDir || e.Name == ".." || !imagedecoders.IsImageFile(e.Name) {
+		if e.IsDir || e.Name == ".." || !imagedec.IsImageFile(e.Name) {
 			continue
 		}
 		if e.Name == current {

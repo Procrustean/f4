@@ -1,4 +1,4 @@
-package imagedecoders
+package imagedec
 
 // BMP. Nothing produces it on purpose any more and everything produces it by
 // accident, so a file manager had better read it.
