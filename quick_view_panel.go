@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -732,7 +733,7 @@ func (q *QuickViewPanel) refreshCache(key quickViewSelectionKey, path string, it
 	}
 	q.cancelScan()
 
-	if IsImageFile(path) {
+	if imagedecoders.IsImageFile(path) {
 		q.cacheImage = true
 		gen := q.imageLoadGen
 		source := q.src.vfs

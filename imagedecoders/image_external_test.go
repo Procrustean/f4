@@ -1,4 +1,4 @@
-package main
+package imagedecoders
 
 import (
 	"context"
@@ -36,18 +36,22 @@ func fakeExternalTools(t *testing.T, bins ...string) {
 	savedDecodeScaled := externalImageDecodeScaled
 	savedTimeout := externalImageTimeout
 	savedDecoders := imageDecoders
-	savedConfig := AppConfig.ImageExternalTimeout
+	savedConfig := ImageExternalTimeoutSeconds
 	t.Cleanup(func() {
 		externalImageLookPath = savedLook
 		externalImageDecode = savedDecode
 		externalImageDecodeScaled = savedDecodeScaled
 		externalImageTimeout = savedTimeout
 		imageDecoders = savedDecoders
-		AppConfig.ImageExternalTimeout = savedConfig
+		ImageExternalTimeoutSeconds = savedConfig
 		SetImageDecoderPriorities(nil)
 		resetInstalledExternalImageTools()
 	})
 	resetInstalledExternalImageTools()
+	// The Windows-native decoders claim formats the external tests probe;
+	// drop them so the registry here matches every other platform.
+	UnregisterImageDecoder("wic")
+	UnregisterImageDecoder("shell")
 
 	externalImageLookPath = func(bin string) (string, error) {
 		if present[bin] {
@@ -100,7 +104,7 @@ func TestInstalledExternalImageToolsLookupReturnsSnapshot(t *testing.T) {
 	// not by the resolved path, and must hand out a copy: mutating what it
 	// returned must not leak into the next call.
 	first := installedExternalImageToolsLookup()
-	first["magick"] = externalImageTool{Label: "mutated"}
+	first["magick"] = ExternalImageTool{Label: "mutated"}
 	delete(first, "convert")
 
 	second := installedExternalImageToolsLookup()
@@ -140,6 +144,23 @@ func TestFindExternalImageToolFallsBackToFFmpeg(t *testing.T) {
 	}
 	if hasFormat(tool.Formats, "psd") {
 		t.Error("ffmpeg must not claim the formats only ImageMagick reads")
+	}
+}
+
+// The formats every converter reads are claimed by all of them, so a broken
+// or exotic variant of a common format still falls through to a converter.
+// ffmpeg additionally reads the Windows icon container (ico/cur).
+func TestExternalToolsClaimCommonGuaranteedFormats(t *testing.T) {
+	fakeExternalTools(t, "ffmpeg")
+	for _, ext := range []string{"bmp", "gif", "ico", "cur", "webp", "tga"} {
+		tool, ok := findExternalImageTool(ext)
+		if !ok {
+			t.Errorf("ffmpeg must read %q and claim it", ext)
+			continue
+		}
+		if !hasFormat(tool.Formats, ext) {
+			t.Errorf("ffmpeg claims %q? got formats %v", ext, tool.Formats)
+		}
 	}
 }
 
@@ -192,7 +213,7 @@ func TestDecodeImageExternallyConvertsThroughATempFile(t *testing.T) {
 	source := []byte("RIFF\x00\x00\x00\x00WEBPVP8 and the body")
 
 	var seen string
-	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(ctx context.Context, tool ExternalImageTool, path string) (*vtui.ImageSurface, error) {
 		seen = path
 		got, err := os.ReadFile(path)
 		if err != nil {
@@ -205,7 +226,7 @@ func TestDecodeImageExternallyConvertsThroughATempFile(t *testing.T) {
 		return vtui.NewImageSurface(4, 2), nil
 	}
 
-	surf, err := decodeImageExternally(context.Background(), source)
+	surf, err := decodeImageExternally(context.Background(), "", source)
 	if err != nil {
 		t.Fatalf("the conversion failed: %v", err)
 	}
@@ -222,10 +243,10 @@ func TestDecodeImageExternallyConvertsThroughATempFile(t *testing.T) {
 
 func TestDecodeImageExternallyPassesTheDeadlineOn(t *testing.T) {
 	fakeExternalTools(t, "magick")
-	AppConfig.ImageExternalTimeout = 7
+	ImageExternalTimeoutSeconds = 7
 
 	var left time.Duration
-	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(ctx context.Context, tool ExternalImageTool, path string) (*vtui.ImageSurface, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			t.Error("the converter was started without a deadline")
@@ -235,7 +256,7 @@ func TestDecodeImageExternallyPassesTheDeadlineOn(t *testing.T) {
 		return nil, errors.New("cannot read it")
 	}
 
-	if _, err := decodeImageExternally(context.Background(), []byte("II*\x00body")); err == nil {
+	if _, err := decodeImageExternally(context.Background(), "", []byte("II*\x00body")); err == nil {
 		t.Fatal("a converter that fails must produce an error")
 	}
 	if left <= 6*time.Second || left > 7*time.Second {
@@ -246,12 +267,12 @@ func TestDecodeImageExternallyPassesTheDeadlineOn(t *testing.T) {
 func TestDecodeImageExternallyReportsATimeout(t *testing.T) {
 	fakeExternalTools(t, "ffmpeg")
 	externalImageTimeout = func() time.Duration { return 20 * time.Millisecond }
-	externalImageDecode = func(ctx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(ctx context.Context, tool ExternalImageTool, path string) (*vtui.ImageSurface, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 
-	_, err := decodeImageExternally(context.Background(), []byte("RIFF\x00\x00\x00\x00WEBPbody"))
+	_, err := decodeImageExternally(context.Background(), "", []byte("RIFF\x00\x00\x00\x00WEBPbody"))
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected a timeout, got %v", err)
 	}
@@ -260,24 +281,24 @@ func TestDecodeImageExternallyReportsATimeout(t *testing.T) {
 func TestDecodeImageExternallyIsCancelledWithItsCaller(t *testing.T) {
 	fakeExternalTools(t, "magick")
 	ctx, cancel := context.WithCancel(context.Background())
-	externalImageDecode = func(runCtx context.Context, tool externalImageTool, path string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(runCtx context.Context, tool ExternalImageTool, path string) (*vtui.ImageSurface, error) {
 		cancel()
 		<-runCtx.Done()
 		return nil, runCtx.Err()
 	}
 
-	if _, err := decodeImageExternally(ctx, []byte("8BPS\x00\x01body")); err == nil {
+	if _, err := decodeImageExternally(ctx, "", []byte("8BPS\x00\x01body")); err == nil {
 		t.Fatal("a cancelled conversion must produce an error")
 	}
 }
 
 func TestDecodeImageExternallyRejectsAnEmptyAnswer(t *testing.T) {
 	fakeExternalTools(t, "magick")
-	externalImageDecode = func(context.Context, externalImageTool, string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(context.Context, ExternalImageTool, string) (*vtui.ImageSurface, error) {
 		return nil, nil
 	}
 
-	if _, err := decodeImageExternally(context.Background(), []byte("8BPS\x00\x01body")); err == nil {
+	if _, err := decodeImageExternally(context.Background(), "", []byte("8BPS\x00\x01body")); err == nil {
 		t.Fatal("an empty answer is not a picture")
 	}
 }
@@ -285,7 +306,7 @@ func TestDecodeImageExternallyRejectsAnEmptyAnswer(t *testing.T) {
 func TestDecodeImageExternallyWithoutAConverter(t *testing.T) {
 	fakeExternalTools(t)
 
-	if _, err := decodeImageExternally(context.Background(), []byte("II*\x00body")); err == nil {
+	if _, err := decodeImageExternally(context.Background(), "", []byte("II*\x00body")); err == nil {
 		t.Fatal("there is nothing to convert with and no error was reported")
 	}
 }
@@ -305,12 +326,12 @@ func TestExternalDecoderIsTheLastResort(t *testing.T) {
 		},
 	})
 
-	externalImageDecode = func(context.Context, externalImageTool, string) (*vtui.ImageSurface, error) {
+	externalImageDecode = func(context.Context, ExternalImageTool, string) (*vtui.ImageSurface, error) {
 		return vtui.NewImageSurface(2, 2), nil
 	}
 
 	list := ImageDecodersFor("a.webp")
-	if len(list) != 2 || list[0].Name != "test-webp" || list[1].Name != externalImageDecoder {
+	if len(list) != 2 || list[0].Name != "test-webp" || list[1].Name != ExternalImageDecoder {
 		t.Fatalf("wrong order: %v", list)
 	}
 
@@ -324,16 +345,16 @@ func TestExternalDecoderIsTheLastResort(t *testing.T) {
 }
 
 func TestConfiguredExternalImageTimeout(t *testing.T) {
-	saved := AppConfig.ImageExternalTimeout
-	t.Cleanup(func() { AppConfig.ImageExternalTimeout = saved })
+	saved := ImageExternalTimeoutSeconds
+	t.Cleanup(func() { ImageExternalTimeoutSeconds = saved })
 
-	AppConfig.ImageExternalTimeout = 3
+	ImageExternalTimeoutSeconds = 3
 	if got := configuredExternalImageTimeout(); got != 3*time.Second {
 		t.Errorf("got %v, want three seconds", got)
 	}
 	for _, bad := range []int{0, -1} {
-		AppConfig.ImageExternalTimeout = bad
-		if got := configuredExternalImageTimeout(); got != defaultImageExternalTimeout*time.Second {
+		ImageExternalTimeoutSeconds = bad
+		if got := configuredExternalImageTimeout(); got != DefaultImageExternalTimeout*time.Second {
 			t.Errorf("%d seconds should fall back to the default, got %d", bad, got)
 		}
 	}

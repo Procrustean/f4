@@ -1,4 +1,4 @@
-package main
+package imagedecoders
 
 // Netpbm (P1..P7, PF, Pf) decoder with streaming and raw/ASCII support.
 
@@ -90,7 +90,9 @@ func floatTo8(val float32, absScale float64) uint8 {
 	return uint8(v*255.0 + 0.5)
 }
 
-func decodeNetpbm(r io.Reader) (image.Image, error) {
+// decodeNetpbm decodes a Netpbm stream; the bool says whether the format is
+// opaque by construction (no alpha).
+func decodeNetpbm(r io.Reader) (image.Image, bool, error) {
 	var br *bufio.Reader
 	if b, ok := r.(*bufio.Reader); ok {
 		br = b
@@ -100,10 +102,10 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 
 	magicLine, err := br.ReadSlice('\n')
 	if err == bufio.ErrBufferFull || len(magicLine) > maxNetpbmHeaderLine {
-		return nil, fmt.Errorf("netpbm: header read error: line too long")
+		return nil, false, fmt.Errorf("netpbm: header read error: line too long")
 	}
 	if err != nil {
-		return nil, fmt.Errorf("netpbm: header read error: %w", err)
+		return nil, false, fmt.Errorf("netpbm: header read error: %w", err)
 	}
 	magic := string(bytes.TrimSpace(magicLine))
 
@@ -115,18 +117,18 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 	case "P1", "P4": // PBM
 		wTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if width, err = parseUint(wTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		hTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if height, err = parseUint(hTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		maxVal = 1
 		depth = 1
@@ -134,26 +136,26 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 	case "P2", "P3", "P5", "P6": // PGM / PPM
 		wTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if width, err = parseUint(wTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		hTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if height, err = parseUint(hTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		mTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if maxVal, err = parseUint(mTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		if magic == "P3" || magic == "P6" {
@@ -165,27 +167,27 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 	case "PF", "Pf": // PFM Float
 		wTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if width, err = parseUint(wTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		hTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		if height, err = parseUint(hTok); err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 
 		sTok, err := readNetpbmToken(br, tokBuf[:0])
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 		}
 		pfmScale, err = strconv.ParseFloat(string(sTok), 64)
 		if err != nil {
-			return nil, fmt.Errorf("netpbm: PFM scale parse error: %w", err)
+			return nil, false, fmt.Errorf("netpbm: PFM scale parse error: %w", err)
 		}
 		maxVal = 255
 		if magic == "PF" {
@@ -199,10 +201,10 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 		for {
 			line, err := br.ReadSlice('\n')
 			if err == bufio.ErrBufferFull || len(line) > maxNetpbmHeaderLine {
-				return nil, errNetpbmHeaderLong
+				return nil, false, errNetpbmHeaderLong
 			}
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 			}
 			line = bytes.TrimSpace(line)
 			if len(line) == 0 || line[0] == '#' {
@@ -233,34 +235,34 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				tupleType = string(bytes.TrimSpace(val))
 			}
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: header parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: header parse error: %w", err)
 			}
 		}
 		if tupleType != "" && !validTupleTypeDepth(tupleType, depth) {
-			return nil, fmt.Errorf("netpbm: PAM TUPLTYPE %q incompatible with DEPTH %d", tupleType, depth)
+			return nil, false, fmt.Errorf("netpbm: PAM TUPLTYPE %q incompatible with DEPTH %d", tupleType, depth)
 		}
 
 	default:
-		return nil, fmt.Errorf("netpbm: unsupported magic %q", magic)
+		return nil, false, fmt.Errorf("netpbm: unsupported magic %q", magic)
 	}
 
 	if width > maxNetpbmDimension || height > maxNetpbmDimension {
-		return nil, fmt.Errorf("netpbm: invalid dimensions %dx%d", width, height)
+		return nil, false, fmt.Errorf("netpbm: invalid dimensions %dx%d", width, height)
 	}
-	// Reject before make: the shared guard keeps pixel and decoded-memory
-	// arithmetic overflow-safe and consistent with the other image decoders.
+	// Only depths with an alpha channel can be translucent.
+	opaque := depth == 1 || depth == 3
 	if err := validateImageAllocation(width, height, 4, int64(maxNetpbmDimension)*maxNetpbmDimension, 2<<30); err != nil {
-		return nil, fmt.Errorf("netpbm: image limits exceeded %dx%d: %w", width, height, err)
+		return nil, false, fmt.Errorf("netpbm: image limits exceeded %dx%d: %w", width, height, err)
 	}
 	if maxVal <= 0 || maxVal > 65535 {
-		return nil, fmt.Errorf("netpbm: invalid MAXVAL %d", maxVal)
+		return nil, false, fmt.Errorf("netpbm: invalid MAXVAL %d", maxVal)
 	}
 	if depth < 1 || depth > 4 {
-		return nil, fmt.Errorf("netpbm: unsupported depth %d", depth)
+		return nil, false, fmt.Errorf("netpbm: unsupported depth %d", depth)
 	}
 
-	// Maxval's trailing whitespace is already consumed; the raster starts
-	// there — 0x23 is picture data, not a comment line. Nothing to skip.
+	// Maxval's whitespace is consumed; the raster starts here (0x23 is data,
+	// not a comment).
 
 	totalPixels := width * height
 	// []uint32 backing keeps 4-byte alignment (1-aligned []byte would SIGBUS on ARM64).
@@ -275,11 +277,11 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 			for {
 				b, err := br.ReadByte()
 				if err != nil {
-					return nil, fmt.Errorf("netpbm: P1 read error: %w", err)
+					return nil, false, fmt.Errorf("netpbm: P1 read error: %w", err)
 				}
 				if b == '#' {
 					if err := skipNetpbmLine(br); err != nil {
-						return nil, fmt.Errorf("netpbm: P1 read error: %w", err)
+						return nil, false, fmt.Errorf("netpbm: P1 read error: %w", err)
 					}
 					continue
 				}
@@ -292,58 +294,58 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				} else if b == '0' { // white
 					dst[d], dst[d+1], dst[d+2], dst[d+3] = 255, 255, 255, 255
 				} else {
-					return nil, fmt.Errorf("netpbm: P1 invalid character %q", b)
+					return nil, false, fmt.Errorf("netpbm: P1 invalid character %q", b)
 				}
 				break
 			}
 		}
-		return img, nil
+		return img, opaque, nil
 
 	case "P2": // PGM ASCII
 		m := uint32(maxVal)
 		for i := range totalPixels {
 			tok, err := readNetpbmToken(br, tokBuf[:0])
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P2 read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P2 read error: %w", err)
 			}
 			v, err := parseUint(tok)
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P2 pixel parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P2 pixel parse error: %w", err)
 			}
 			g := scaleTo8(uint32(v), m)
 			d := i * 4
 			dst[d], dst[d+1], dst[d+2], dst[d+3] = g, g, g, 255
 		}
-		return img, nil
+		return img, opaque, nil
 
 	case "P3": // PPM ASCII
 		m := uint32(maxVal)
 		for i := range totalPixels {
 			rTok, err := readNetpbmToken(br, tokBuf[:0])
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 read error: %w", err)
 			}
 			rv, err := parseUint(rTok)
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
 			}
 
 			gTok, err := readNetpbmToken(br, tokBuf[:0])
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 read error: %w", err)
 			}
 			gv, err := parseUint(gTok)
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
 			}
 
 			bTok, err := readNetpbmToken(br, tokBuf[:0])
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 read error: %w", err)
 			}
 			bv, err := parseUint(bTok)
 			if err != nil {
-				return nil, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P3 pixel parse error: %w", err)
 			}
 
 			d := i * 4
@@ -352,14 +354,14 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 			dst[d+2] = scaleTo8(uint32(bv), m)
 			dst[d+3] = 255
 		}
-		return img, nil
+		return img, opaque, nil
 
 	case "P4": // PBM Raw (1 bit/px, MSB-first, row-padded)
 		rowBytes := (width + 7) / 8
 		rowBuf := make([]byte, rowBytes)
 		for y := range height {
 			if _, err := io.ReadFull(br, rowBuf); err != nil {
-				return nil, fmt.Errorf("netpbm: P4 read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: P4 read error: %w", err)
 			}
 			rowOff := y * width * 4
 			x := 0
@@ -377,7 +379,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				}
 			}
 		}
-		return img, nil
+		return img, opaque, nil
 
 	case "PF", "Pf": // PFM Float32 (Bottom-to-top scanlines)
 		isLittle := pfmScale < 0
@@ -398,7 +400,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 
 		for y := height - 1; y >= 0; y-- {
 			if _, err := io.ReadFull(br, rowBuf); err != nil {
-				return nil, fmt.Errorf("netpbm: PFM pixel read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: PFM pixel read error: %w", err)
 			}
 			rowOff := y * width * 4
 			if isLittle {
@@ -436,18 +438,18 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				dst[d+3] = 255
 			}
 		}
-		return img, nil
+		return img, opaque, nil
 
 	case "P5", "P6", "P7":
 		if maxVal == 255 && depth >= 1 && depth <= 4 {
 			if depth == 4 {
 				if _, err := io.ReadFull(br, dst); err != nil {
-					return nil, fmt.Errorf("netpbm: RGBA read error: %w", err)
+					return nil, false, fmt.Errorf("netpbm: RGBA read error: %w", err)
 				}
-				return img, nil
+				return img, opaque, nil
 			}
 			if _, err := io.ReadFull(br, dst[:totalPixels*depth]); err != nil {
-				return nil, fmt.Errorf("netpbm: pixel read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: pixel read error: %w", err)
 			}
 			// Backward expansion so stores never clobber unread sources.
 			// Groups of 4/4/8 pixels (depths 3/2/1) expand from one 64-bit
@@ -509,7 +511,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 					dst32[i-1] = g | (g << 8) | (g << 16) | 0xFF000000
 				}
 			}
-			return img, nil
+			return img, opaque, nil
 		}
 
 		bytesPerSample := 1
@@ -530,7 +532,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 					n = netpbmBlockSize
 				}
 				if _, err := io.ReadFull(br, scratch[:n*depth*2]); err != nil {
-					return nil, fmt.Errorf("netpbm: raw pixel read error: %w", err)
+					return nil, false, fmt.Errorf("netpbm: raw pixel read error: %w", err)
 				}
 				lim := n * depth * 2
 				ob := 0
@@ -568,7 +570,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 					}
 				}
 			}
-			return img, nil
+			return img, opaque, nil
 		}
 
 		for base := 0; base < totalPixels; base += netpbmBlockSize {
@@ -577,7 +579,7 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				n = netpbmBlockSize
 			}
 			if _, err := io.ReadFull(br, scratch[:n*depth*bytesPerSample]); err != nil {
-				return nil, fmt.Errorf("netpbm: raw pixel read error: %w", err)
+				return nil, false, fmt.Errorf("netpbm: raw pixel read error: %w", err)
 			}
 
 			for j := range n {
@@ -615,10 +617,10 @@ func decodeNetpbm(r io.Reader) (image.Image, error) {
 				}
 			}
 		}
-		return img, nil
+		return img, opaque, nil
 	}
 
-	return nil, fmt.Errorf("netpbm: unsupported format %s", magic)
+	return nil, false, fmt.Errorf("netpbm: unsupported format %s", magic)
 }
 
 func decodeNetpbmSurface(data []byte) (*vtui.ImageSurface, error) {
@@ -629,7 +631,7 @@ func decodeNetpbmSurface(data []byte) (*vtui.ImageSurface, error) {
 }
 
 func decodeNetpbmSurfaceStream(r io.Reader) (*vtui.ImageSurface, error) {
-	img, err := decodeNetpbm(r)
+	img, opaque, err := decodeNetpbm(r)
 	if err != nil {
 		return nil, err
 	}
@@ -642,6 +644,7 @@ func decodeNetpbmSurfaceStream(r io.Reader) (*vtui.ImageSurface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netpbm: %w", err)
 	}
+	surf.Opaque = opaque // formats without alpha skip the alpha scan
 	return surf, nil
 }
 

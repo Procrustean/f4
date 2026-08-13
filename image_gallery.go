@@ -1,28 +1,28 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/unxed/f4/imagedecoders"
+	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
 )
 
-// The grid of thumbnails behind F12. A tile is measured in cells and gives
-// its bottom row to the file name. The numbers are a compromise: small enough
-// that an ordinary terminal shows a directory as a grid, large enough that an
-// Exif thumbnail is still recognisable.
+// The F12 thumbnail grid. A tile is measured in cells and gives its bottom
+// row to the file name; sized to fit an ordinary terminal as a grid while an
+// Exif thumbnail stays recognisable.
 const (
 	imageTileCols = 18
 	imageTileRows = 9
 
-	// galleryThumbBudget bounds how many thumbnail decodes one frame may
-	// start. A screenful of tiles at once would flood the pipeline and push
-	// the viewer's own prefetch out of the queue; the nearest tiles get
-	// their turn first, the rest wait for the next frame.
+	// galleryThumbBudget bounds how many tile decodes one frame starts, so a
+	// screenful doesn't flood the pipeline; the nearest tiles go first.
 	galleryThumbBudget = 12
 )
 
@@ -32,9 +32,8 @@ var (
 	imageTilePickedAttr = vtui.SetRGBBoth(0, 0xFFFF00, 0x101010)
 )
 
-// imageGallery is the state of the grid: where the cursor is, which row of
-// tiles is the first one on screen, and the thumbnails that have arrived so
-// far. It knows nothing about files — the viewer owns the list of pictures.
+// imageGallery is the grid's state: cursor, top row, and arrived thumbnails.
+// It knows nothing about files — the viewer owns the list.
 type imageGallery struct {
 	cursor int
 	top    int
@@ -76,8 +75,7 @@ func (g *imageGallery) page() int {
 	return g.rows
 }
 
-// move walks the grid and stops at both ends rather than wrapping, so that it
-// stays obvious where the directory begins and where it ends.
+// move walks the grid, stopping at both ends rather than wrapping.
 func (g *imageGallery) move(delta, total int) {
 	if total <= 0 {
 		return
@@ -109,12 +107,10 @@ func (g *imageGallery) scrollTo(idx, total int) {
 	}
 }
 
-// ToggleGallery switches between one picture and the grid. The grid opens on
-// the picture that was on screen, and leaving it by anything but Enter leaves
-// that same picture on screen.
+// ToggleGallery switches between one picture and the grid, opening on the
+// picture that was on screen.
 func (iv *ImageView) ToggleGallery() {
-	// A grid and a slide show both want to own which picture is current,
-	// and there is nothing to divide that ownership with.
+	// A grid and a slide show can't both own the current picture.
 	iv.stopSlideShow()
 	iv.stopAnimIfIdle()
 	if iv.gal != nil {
@@ -160,8 +156,7 @@ func (iv *ImageView) SetSelection(picked map[string]bool) {
 	}
 }
 
-// SetSelected picks or unpicks one picture and passes the news on, so that the
-// panel underneath ends up with the same files selected.
+// SetSelected picks or unpicks one picture and forwards the change.
 func (iv *ImageView) SetSelected(path string, on bool) {
 	if path == "" {
 		return
@@ -179,10 +174,9 @@ func (iv *ImageView) SetSelected(path string, on bool) {
 	}
 }
 
-// requestVisibleThumbs asks for the thumbnails the grid can currently see,
-// closest to the cursor first, at most galleryThumbBudget per frame. Tiles
-// already asked for are skipped, so repeated frames walk the screen in rings
-// around the cursor instead of firing every missing tile at once.
+// requestVisibleThumbs asks for the visible thumbnails, closest to the cursor
+// first, at most galleryThumbBudget per frame; already-asked tiles are
+// skipped, so frames walk the screen in rings around the cursor.
 func (iv *ImageView) requestVisibleThumbs() {
 	g := iv.gal
 	if g == nil {
@@ -220,8 +214,8 @@ func (iv *ImageView) requestVisibleThumbs() {
 	}
 }
 
-// galleryRing is how many tile steps a slot is from the grid cursor; the
-// ring order is what makes a freshly opened grid fill around the cursor.
+// galleryRing is a slot's distance from the cursor; ring order fills a fresh
+// grid around it.
 func galleryRing(g *imageGallery, idx int) int {
 	cols := g.cols
 	if cols < 1 {
@@ -240,10 +234,7 @@ func galleryRing(g *imageGallery, idx int) int {
 	return dy
 }
 
-// requestThumb decodes one thumbnail off the drawing path. PreviewSync is
-// cheap on a picture that is already known and reads only the header on one
-// that is not, but cheap is not free, and a screenful of tiles would
-// otherwise mean a screenful of reads on every frame.
+// requestThumb decodes one thumbnail off the drawing path.
 func (iv *ImageView) requestThumb(path string) {
 	g := iv.gal
 	if g == nil || g.asked[path] {
@@ -289,8 +280,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 	g.move(0, total)
 	g.scrollTo(g.cursor, total)
 
-	// A frame's worth of decodes, nearest the cursor first; the rest of the
-	// screen fills in over the coming frames.
+	// A frame's worth of decodes, nearest the cursor first.
 	iv.requestVisibleThumbs()
 
 	cw, ch := cellSize(scr)
@@ -333,8 +323,7 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 
 	surface := iv.gal.thumbs[path]
 	if surface == nil || !surface.Valid() {
-		// No request here: the per-frame budget in requestVisibleThumbs
-		// decides which tiles are asked for and in what order.
+		// Not requested yet: the per-frame budget decides what is asked.
 		return
 	}
 
@@ -432,4 +421,40 @@ func (iv *ImageView) galleryKey(e *vtinput.InputEvent) bool {
 		return true
 	}
 	return false
+}
+
+// Built-ins decode whole; converters shrink while reading.
+func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) ImageResult {
+	if w < 1 {
+		w = (imageTileCols - 2) * imageViewFallbackCellW
+	}
+	if h < 1 {
+		h = (imageTileRows - 2) * imageViewFallbackCellH
+	}
+	decoders := imagedecoders.ImageDecodersFor(path)
+	if len(decoders) == 0 || decoders[0].Name != imagedecoders.ExternalImageDecoder {
+		return ImagePipe.LoadTileSync(ctx, v, path)
+	}
+	surf, decoder, err := loadImageScaled(ctx, v, path, w, h)
+	if err != nil {
+		return ImagePipe.LoadTileSync(ctx, v, path)
+	}
+	return ImageResult{Path: path, Surface: surf, Decoder: decoder}
+}
+
+// shrink-while-reading: never a full decode of RAW/AVIF for a tile.
+func loadImageScaled(ctx context.Context, v vfs.VFS, path string, w, h int) (*vtui.ImageSurface, string, error) {
+	data, err := ImagePipe.FileBytes(ctx, v, path)
+	if err != nil {
+		return nil, "", err
+	}
+	tool, ok := imagedecoders.ExternalImageToolFor(data)
+	if !ok {
+		return nil, "", fmt.Errorf("no external image converter on the PATH")
+	}
+	surf, err := imagedecoders.DecodeImageExternallyScaled(ctx, tool, data, w, h)
+	if err != nil {
+		return nil, "", err
+	}
+	return surf, tool.Label, nil
 }

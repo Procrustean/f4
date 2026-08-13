@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package main
+package imagedecoders
 
 import (
 	"bytes"
@@ -22,7 +22,7 @@ func TestAppleImageIODecoderProducesTopDownRGBA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	surface, err := decodeImageWithAppleImageIO(context.Background(), encoded.Bytes())
+	surface, err := decodeImageWithAppleImageIO(context.Background(), "", encoded.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}

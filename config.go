@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/internal/netproxy"
 	"github.com/unxed/vtui"
 )
@@ -330,7 +331,7 @@ var AppConfig = F4Config{
 	PathHintMaxVisible:       5,
 	PathHintPerCategory:      true,
 	SlideShowDelay:           defaultSlideShowDelay,
-	ImageExternalTimeout:     defaultImageExternalTimeout,
+	ImageExternalTimeout:     imagedecoders.DefaultImageExternalTimeout,
 	ImageDecoderPriority:     "",
 	ImageFullScreen:          false,
 	ImageShowOverlay:         false,
@@ -565,13 +566,14 @@ func LoadConfig() {
 	if AppConfig.SlideShowDelay <= 0 {
 		AppConfig.SlideShowDelay = defaultSlideShowDelay
 	}
-	AppConfig.ImageExternalTimeout = defaultImageExternalTimeout
+	AppConfig.ImageExternalTimeout = imagedecoders.DefaultImageExternalTimeout
 	fmt.Sscanf(ini.GetString("Images", "ExternalTimeout", "20"), "%d", &AppConfig.ImageExternalTimeout)
 	if AppConfig.ImageExternalTimeout <= 0 {
-		AppConfig.ImageExternalTimeout = defaultImageExternalTimeout
+		AppConfig.ImageExternalTimeout = imagedecoders.DefaultImageExternalTimeout
 	}
+	imagedecoders.ImageExternalTimeoutSeconds = AppConfig.ImageExternalTimeout
 	AppConfig.ImageDecoderPriority = ini.GetString("Images", "DecoderPriority", "")
-	SetImageDecoderPriorities(ParseImageDecoderPriorities(AppConfig.ImageDecoderPriority))
+	imagedecoders.SetImageDecoderPriorities(imagedecoders.ParseImageDecoderPriorities(AppConfig.ImageDecoderPriority))
 	AppConfig.ImageFullScreen = ini.GetString("Images", "FullScreen", "0") == "1"
 	AppConfig.ImageShowOverlay = ini.GetString("Images", "ShowOverlay", "0") == "1"
 	AppConfig.ImageBlockRenderer = 1

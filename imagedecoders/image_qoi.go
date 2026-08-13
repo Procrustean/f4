@@ -1,4 +1,4 @@
-package main
+package imagedecoders
 
 // QOI decoder; keeping it local avoids a dependency for a small format.
 
@@ -76,8 +76,7 @@ func decodeQOI(data []byte) (*vtui.ImageSurface, error) {
 			case tag&qoiTagMask == qoiOpIndex:
 				px = index[tag&0x3F]
 			case tag&qoiTagMask == qoiOpDiff:
-				// Each difference is two bits wide and biased by two, and
-				// it is meant to wrap around.
+				// Two-bit diffs biased by two; they wrap around.
 				px.r += ((tag >> 4) & 0x03) - 2
 				px.g += ((tag >> 2) & 0x03) - 2
 				px.b += (tag & 0x03) - 2

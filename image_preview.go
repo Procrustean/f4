@@ -1,9 +1,7 @@
 package main
 
-// A stand-in for a picture that has not been decoded yet. A camera stores a
-// small copy of the photograph inside the file, and reading a few tens of
-// kilobytes of the header is enough to put something on the screen while the
-// megapixels are still being turned into pixels.
+// A stand-in for a picture not yet decoded: the small copy a camera stores
+// inside a JPEG, read from the header while the megapixels still decode.
 
 import (
 	"bytes"
@@ -13,31 +11,27 @@ import (
 	"image/jpeg"
 	"io"
 
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 )
 
 const (
-	// imagePreviewHeadSize is how much of a file is read while looking for
-	// an embedded copy. Thumbnails live in the header; past it there is
-	// nothing to find.
+	// imagePreviewHeadSize is how much of the file is read for the embedded
+	// copy; thumbnails live in the header.
 	imagePreviewHeadSize = 256 << 10
 
-	// imagePreviewCacheLimit bounds how many thumbnails are remembered.
-	// They are tiny, so their number matters and their size does not.
+	// imagePreviewCacheLimit: thumbnails are tiny, so count matters, not size.
 	imagePreviewCacheLimit = 256
 
-	// imagePreviewDecoder is what the interface calls this stage.
-	imagePreviewDecoder = "exif-thumbnail"
+	imagePreviewDecoder = "exif-thumbnail" // what the interface calls this stage
 )
 
 // imageQuickPreview returns the small copy the file carries inside itself.
 func imageQuickPreview(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
-	// The extractor below understands an Exif APP1 segment in a JPEG. PNG,
-	// GIF and the other image formats cannot possibly yield such a preview,
-	// so avoid a pointless remote open plus a 256 KiB range read before the
-	// real decoder opens the file again.
-	switch imageExtension(path) {
+	// Only JPEG carries an Exif thumbnail; skip the pointless open and
+	// 256 KiB head read for other formats.
+	switch imagedecoders.ImageExtension(path) {
 	case "jpg", "jpeg", "jfif":
 	default:
 		return nil, "", fmt.Errorf("embedded preview is only supported for JPEG files")
@@ -199,8 +193,7 @@ func tiffThumbnail(tiff []byte) ([]byte, error) {
 	return thumb, nil
 }
 
-// tiffWalkIFD visits the entries of one directory, reporting the values that
-// fit into the entry itself. That is all a thumbnail is described by.
+// tiffWalkIFD reports each entry's inline value — all a thumbnail needs.
 func tiffWalkIFD(tiff []byte, order binary.ByteOrder, at int, fn func(tag uint16, value uint32)) error {
 	count, err := tiffEntryCount(tiff, order, at)
 	if err != nil {
@@ -223,8 +216,7 @@ func tiffNextIFD(tiff []byte, order binary.ByteOrder, at int) (int, error) {
 	return int(order.Uint32(tiff[end : end+4])), nil
 }
 
-// tiffEntryCount reads how many entries a directory has and makes sure the
-// whole of it, including the pointer to the next one, is really there.
+// tiffEntryCount reads a directory's entry count and bounds-checks it.
 func tiffEntryCount(tiff []byte, order binary.ByteOrder, at int) (int, error) {
 	if at < 0 || at+2 > len(tiff) {
 		return 0, fmt.Errorf("the directory lies outside the Exif block")

@@ -1,12 +1,14 @@
-package main
+package imagedecoders
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 	"testing"
 
 	"github.com/unxed/vtui"
@@ -81,7 +83,7 @@ func TestImageDecoderPriorityAndOverride(t *testing.T) {
 	called := ""
 	RegisterImageDecoder(ImageDecoder{
 		Name:       "test-high",
-		Priority:   100,
+		Priority:   1000,
 		Extensions: []string{"png"},
 		Decode: func(data []byte) (*vtui.ImageSurface, error) {
 			called = "test-high"
@@ -105,7 +107,7 @@ func TestImageDecoderPriorityAndOverride(t *testing.T) {
 	// Registering the same name again replaces it rather than duplicating.
 	RegisterImageDecoder(ImageDecoder{
 		Name:       "test-high",
-		Priority:   100,
+		Priority:   1000,
 		Extensions: []string{"png"},
 		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
 	})
@@ -138,15 +140,16 @@ func TestImageDecoderPrioritiesFromConfiguration(t *testing.T) {
 		Decode:     func([]byte) (*vtui.ImageSurface, error) { return nil, nil },
 	})
 
-	if list := ImageDecodersFor("a.png"); list[0].Name != "go-std" {
-		t.Fatalf("without an override go-std wins, got %q", list[0].Name)
+	// Without an override the low-priority decoder sits at the very bottom.
+	if list := ImageDecodersFor("a.png"); list[len(list)-1].Name != "test-low" {
+		t.Fatalf("without an override test-low must be last, got %q", list[len(list)-1].Name)
 	}
-	SetImageDecoderPriorities(map[string]int{"test-low": 99})
+	SetImageDecoderPriorities(map[string]int{"test-low": 1000})
 	if list := ImageDecodersFor("a.png"); list[0].Name != "test-low" {
 		t.Fatalf("the override must reorder the decoders, got %q", list[0].Name)
 	}
 	SetImageDecoderPriorities(nil)
-	if list := ImageDecodersFor("a.png"); list[0].Name != "go-std" {
+	if list := ImageDecodersFor("a.png"); list[0].Name == "test-low" {
 		t.Fatalf("clearing the overrides must restore the order, got %q", list[0].Name)
 	}
 }
@@ -158,7 +161,7 @@ func TestImageDecoderCandidatesSharePriorityOrder(t *testing.T) {
 		SetImageDecoderPriorities(nil)
 	})
 	RegisterImageDecoder(ImageDecoder{
-		Name:       externalImageDecoder,
+		Name:       ExternalImageDecoder,
 		Priority:   -10,
 		Extensions: []string{"png"},
 		Decode:     func([]byte) (*vtui.ImageSurface, error) { return nil, nil },
@@ -189,13 +192,13 @@ func TestImageDecoderCandidatesSharePriorityOrder(t *testing.T) {
 			t.Fatalf("claimed decoder priorities are not deterministic: %v", extension)
 		}
 	}
-	if claimed[len(claimed)-1].Name != externalImageDecoder {
+	if claimed[len(claimed)-1].Name != ExternalImageDecoder {
 		t.Fatalf("default external decoder must remain last resort: %v", claimed)
 	}
 
-	SetImageDecoderPriorities(map[string]int{externalImageDecoder: 100})
+	SetImageDecoderPriorities(map[string]int{ExternalImageDecoder: 1000})
 	overridden := imageDecoderCandidates("a.png")
-	if overridden[0].Name != externalImageDecoder || imageDecodersForExtension("a.png")[0].Name != externalImageDecoder {
+	if overridden[0].Name != ExternalImageDecoder || imageDecodersForExtension("a.png")[0].Name != ExternalImageDecoder {
 		t.Fatalf("external priority override diverged between automatic and claimed order: %v", overridden)
 	}
 }
@@ -211,8 +214,8 @@ func TestDecodeImageRejectsEmptyDecoderResult(t *testing.T) {
 		Decode:     func([]byte) (*vtui.ImageSurface, error) { return nil, nil },
 	})
 	_, _, err := decodeImagePreferred(nil, "a.png", nil, "test-empty")
-	if !errors.Is(err, errEmptyDecoderResult) {
-		t.Fatalf("error = %v, want errEmptyDecoderResult", err)
+	if !errors.Is(err, ErrEmptyDecoderResult) {
+		t.Fatalf("error = %v, want ErrEmptyDecoderResult", err)
 	}
 	if got := len(ImageDecodersFor("a.png")); got < 2 {
 		t.Fatalf("normalized registration unexpectedly changed decoder list: %d", got)
@@ -364,13 +367,144 @@ func TestDecodeBMPRejectsRubbish(t *testing.T) {
 	}
 }
 
+// icoFile wraps an embedded image (a PNG or a BMP payload) in a minimal ICO
+// container with a single entry.
+func icoFile(embedded []byte) []byte {
+	out := make([]byte, 0, 6+16+len(embedded))
+	out = append(out, 0, 0, 1, 0, 1, 0)          // reserved, icon, one entry
+	out = append(out, 16, 16, 0, 0, 1, 0, 32, 0) // 16x16, 1 plane, 32 bpp
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(embedded)))
+	out = binary.LittleEndian.AppendUint32(out, 22) // offset: dir + one entry
+	return append(out, embedded...)
+}
+
+// icoBMPEntry builds the BMP payload of an ICO entry: the 40-byte header
+// with the height doubled (XOR picture + AND mask), the bottom-up XOR rows
+// and the AND mask.
+func icoBMPEntry(width, height int, xor, and []byte) []byte {
+	info := make([]byte, bmpInfoHeaderSize)
+	le := binary.LittleEndian
+	le.PutUint32(info[0:4], bmpInfoHeaderSize)
+	le.PutUint32(info[4:8], uint32(int32(width)))
+	le.PutUint32(info[8:12], uint32(int32(height*2)))
+	le.PutUint16(info[12:14], 1)
+	le.PutUint16(info[14:16], 32)
+	out := make([]byte, 0, bmpInfoHeaderSize+len(xor)+len(and))
+	out = append(out, info...)
+	out = append(out, xor...)
+	return append(out, and...)
+}
+
+// A classic ICO entry: a bottom-up 32 bpp XOR row (BGRA) whose AND mask
+// makes the first pixel transparent. The decoder must honour the mask, which
+// is where an ICO's real shape comes from.
+func TestDecodeICOFromBMPEntry(t *testing.T) {
+	// One row, two pixels: red (BGRA 00 00 FF 00) and blue (FF 00 00 00).
+	xor := []byte{0, 0, 255, 0, 255, 0, 0, 0}
+	// Mask row, padded to four bytes: pixel 0 set (transparent), pixel 1 clear.
+	and := []byte{0x80, 0, 0, 0}
+	surf, err := decodeICO(icoFile(icoBMPEntry(2, 1, xor, and)))
+	if err != nil {
+		t.Fatalf("decoding failed: %v", err)
+	}
+	if surf.Width != 2 || surf.Height != 1 {
+		t.Fatalf("geometry = %dx%d, want 2x1", surf.Width, surf.Height)
+	}
+	r, g, b, a := surf.PixelAt(0, 0)
+	if r != 255 || g != 0 || b != 0 || a != 0 {
+		t.Errorf("first pixel = %d,%d,%d,%d, want transparent red 255,0,0,0", r, g, b, a)
+	}
+	r, g, b, a = surf.PixelAt(1, 0)
+	if r != 0 || g != 0 || b != 255 || a != 255 {
+		t.Errorf("second pixel = %d,%d,%d,%d, want opaque blue 0,0,255,255", r, g, b, a)
+	}
+	if surf.Opaque {
+		t.Error("an icon with a transparent pixel must not be marked opaque")
+	}
+}
+
+// Modern icons embed a PNG; the container must hand it to the PNG decoder.
+func TestDecodeICOFromPNGEntry(t *testing.T) {
+	surf, err := decodeICO(icoFile(makeTestPNG(t, 2, 2, color.RGBA{R: 5, G: 6, B: 7, A: 255})))
+	if err != nil {
+		t.Fatalf("decoding failed: %v", err)
+	}
+	if surf.Width != 2 || surf.Height != 2 {
+		t.Fatalf("geometry = %dx%d, want 2x2", surf.Width, surf.Height)
+	}
+	r, g, b, a := surf.PixelAt(1, 1)
+	if r != 5 || g != 6 || b != 7 || a != 255 {
+		t.Errorf("pixel = %d,%d,%d,%d, want 5,6,7,255", r, g, b, a)
+	}
+}
+
+func TestDecodeICORejectsRubbish(t *testing.T) {
+	if _, err := decodeICO([]byte("not an icon")); err == nil {
+		t.Error("a file that is not ICO must be reported as such")
+	}
+	if _, err := decodeICO([]byte{0, 0, 1, 0, 0, 0}); err == nil {
+		t.Error("an icon without entries must be reported as such")
+	}
+	if !IsImageFile("app.ico") {
+		t.Error("an .ico file must be viewable through the built-in BMP decoder")
+	}
+}
+
+// The F4 cycle offers the decoders that claim the extension, not the content
+// sniffers the automatic chain may fall back to for a mislabelled file: a
+// cycle that lands on go-bmp for a .jpg would pin a decoder that cannot read
+// it and look like F4 did nothing.
+func TestImageCycleOffersOnlyClaimingDecoders(t *testing.T) {
+	for _, d := range ImageCycleDecoders("a.jpg") {
+		claims := false
+		for _, e := range d.Extensions {
+			if e == "jpg" {
+				claims = true
+				break
+			}
+		}
+		if !claims {
+			t.Errorf("the cycle must not offer %q for a.jpg (it does not claim jpg)", d.Name)
+		}
+	}
+	if got := len(ImageDecoderChoices("a.jpg")); got < 1 {
+		t.Errorf("a jpg must still offer a cycle, got %d choices", got)
+	}
+}
+
+// The F4 cycle advances one stop per press and wraps at the end; a single
+// option has nothing to cycle to.
+func TestImageNextDecoderCycles(t *testing.T) {
+	opts := []ImageDecoderChoice{
+		{key: "a", label: "a"},
+		{key: "b", label: "b"},
+		{key: "c", label: "c"},
+	}
+	// From the automatic chain (no pin), the cycle moves past the current.
+	if got := ImageNextDecoder(opts, "", "a"); got != "b" {
+		t.Errorf("from a, want b, got %q", got)
+	}
+	// A pinned decoder advances one step.
+	if got := ImageNextDecoder(opts, "b", "b"); got != "c" {
+		t.Errorf("from b, want c, got %q", got)
+	}
+	// The cycle wraps around to the first stop.
+	if got := ImageNextDecoder(opts, "c", "c"); got != "a" {
+		t.Errorf("from c, want a, got %q", got)
+	}
+	// One option cannot cycle.
+	if got := ImageNextDecoder([]ImageDecoderChoice{{key: "a"}}, "", "a"); got != "" {
+		t.Errorf("a single option must not cycle, got %q", got)
+	}
+}
+
 func TestDecodeImageFallsBackWhenTheExtensionLies(t *testing.T) {
 	saved := imageDecoders
 	defer func() { imageDecoders = saved }()
 
 	RegisterImageDecoder(ImageDecoder{
 		Name:       "test-broken",
-		Priority:   100,
+		Priority:   10000,
 		Extensions: []string{"png"},
 		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
 	})
@@ -498,5 +632,36 @@ func TestSurfaceIsOpaqueHonorsStride(t *testing.T) {
 	surf := vtui.NewImageSurfaceFromPix(1, 2, 8, pix)
 	if !surfaceIsOpaque(surf) {
 		t.Error("padding bytes must not be treated as pixels")
+	}
+}
+
+// pngHeader builds a structurally complete PNG that claims the given canvas
+// but carries no pixel data. DecodeConfig reads only this far, so the
+// dimension guard can be tested without allocating a picture of that size.
+func pngHeader(w, h uint32) []byte {
+	out := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
+	ihdr[8], ihdr[9], ihdr[10], ihdr[11], ihdr[12] = 8, 6, 0, 0, 0 // RGBA
+	chunk := append([]byte("IHDR"), ihdr...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(ihdr)))
+	out = append(out, chunk...)
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(chunk)
+	out = binary.BigEndian.AppendUint32(out, crc.Sum32())
+	// IEND so the stream parses as a whole PNG even without IDAT.
+	out = binary.BigEndian.AppendUint32(out, 0)
+	out = append(out, "IEND"...)
+	return binary.BigEndian.AppendUint32(out, 0xAE426082)
+}
+
+// A tiny file that claims a huge canvas must be refused before the stdlib
+// decoders allocate: 20000x20000 is 400M pixels, past imageMaxPixels, but a
+// real file of that canvas would still be a few compressed bytes.
+func TestDecodeImageWithStdlibRejectsDecompressionBomb(t *testing.T) {
+	_, err := DecodeImageWithStdlib(pngHeader(20000, 20000))
+	if err == nil || !strings.Contains(err.Error(), "pixel limit") {
+		t.Fatalf("error = %v, want a pixel-limit refusal before allocation", err)
 	}
 }

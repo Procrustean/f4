@@ -1,9 +1,7 @@
 package main
 
-// The decoding pipeline: the one place that turns files into pixels. It
-// remembers what it has decoded, decodes one picture only once no matter how
-// many parts of the interface ask for it, and decodes in advance what is
-// likely to be asked for next.
+// The decoding pipeline: turns files into pixels, decodes each picture once,
+// caches it, and prefetches what is likely to be asked for next.
 
 import (
 	"context"
@@ -11,39 +9,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtui"
 )
 
 const (
-	// imageCacheLimit bounds the decoded pixels the pipeline keeps. Pictures
-	// are large and the cache exists to make going back and forth instant,
-	// not to hold a whole directory.
+	// imageCacheLimit bounds the decoded pixels kept; the cache makes going
+	// back and forth instant, not a whole directory.
 	imageCacheLimit = 192 << 20
 
-	// imageWorkers is how many pictures are decoded at the same time. One
-	// lane stays free for an on-screen request while prefetch fills the
-	// rest (see imageMaxPrefetch), so a step never queues behind a
-	// background decode.
+	// imageWorkers: one lane stays free for the on-screen picture while
+	// prefetch fills the rest.
 	imageWorkers = 3
 
-	// imageMaxPrefetch is how many background decodes may run at once. Two
-	// of the three lanes at most: the last one is the urgent lane that
-	// answers the picture on screen.
+	// imageMaxPrefetch: at most two of the three lanes run background decodes;
+	// the last is the urgent lane for the picture on screen.
 	imageMaxPrefetch = 2
 
-	// imageBytesCacheMaxFile: only files up to this size are remembered.
-	// A decoded picture's bytes are worth keeping for a pinned re-decode,
-	// but not a whole directory of originals.
+	// imageBytesCacheMaxFile: only files up to this size are remembered, for
+	// a pinned re-decode, not a whole directory of originals.
 	imageBytesCacheMaxFile = 32 << 20
 
 	// imageBytesCacheLimit bounds the file bytes the pipeline keeps around.
 	imageBytesCacheLimit = 64 << 20
 )
 
-// ImageResult is what a request for a picture eventually produces. A preview
-// is a provisional answer: the small copy the file carries inside itself,
-// handed over while the picture proper is still being decoded.
+// ImageResult is what a picture request produces. A preview is provisional:
+// the small copy the file carries, handed over while the picture decodes.
 type ImageResult struct {
 	Path    string
 	Surface *vtui.ImageSurface
@@ -67,9 +60,8 @@ type imageEntry struct {
 	bytes int64
 }
 
-// imageWaiter is somebody waiting for a picture. Requests made from the
-// interface are answered on the UI thread; a caller that already runs in the
-// background is answered where the decoding happened.
+// imageWaiter is somebody waiting for a picture. UI requests are answered on
+// the UI thread; a background caller is answered where the decode happened.
 type imageWaiter struct {
 	fn func(ImageResult)
 	ui bool
@@ -82,9 +74,8 @@ type imageJob struct {
 	ctx     context.Context
 	urgent  bool
 	started bool
-	// startedPrefetch is set when the job begins as a background decode,
-	// before an urgent waiter could join; it is what the prefetch lane cap
-	// counts.
+	// startedPrefetch is set when the job begins as a background decode (what
+	// the prefetch lane cap counts).
 	startedPrefetch bool
 	waiters         []imageWaiter
 }
@@ -156,9 +147,8 @@ func NewImagePipeline() *ImagePipeline {
 	return p
 }
 
-// previewWithCache is the default preview: a picture whose whole file is
-// already in the byte cache has its header cut out of it instead of opening
-// the file again.
+// previewWithCache cuts the preview out of cached bytes instead of reopening
+// the file.
 func (p *ImagePipeline) previewWithCache(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 	if data, ok := p.CachedBytes(v, path); ok && len(data) > 0 {
 		return imagePreviewFromHead(data)
@@ -166,15 +156,14 @@ func (p *ImagePipeline) previewWithCache(ctx context.Context, v vfs.VFS, path st
 	return imageQuickPreview(ctx, v, path)
 }
 
-// loadWithCache is the default decode: the file is read through the
-// pipeline's byte cache, so a picture decoded once is not transferred again
-// for a re-decode or a preview head.
+// loadWithCache decodes through the byte cache, so a picture decoded once is
+// not transferred again.
 func (p *ImagePipeline) loadWithCache(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 	data, err := p.FileBytes(ctx, v, path)
 	if err != nil {
 		return nil, "", err
 	}
-	return loadImageForBytes(ctx, path, data, "")
+	return imagedecoders.LoadImageForBytes(ctx, path, data, "")
 }
 
 // imageSource names the file system a path belongs to.
@@ -235,10 +224,8 @@ func (p *ImagePipeline) PreviewSync(ctx context.Context, v vfs.VFS, path string)
 }
 
 // PreviewPrefetch extracts the embedded thumbnails of the given pictures in
-// the background: the ring of neighbours beyond the ones being decoded whole.
-// A preview costs a header read instead of a full decode, so the step that
-// reaches those pictures has something to show at once. The list replaces
-// the previous one, exactly like Prefetch replaces the decode queue.
+// the background (a header read, not a full decode). The list replaces the
+// previous one, like Prefetch replaces the decode queue.
 func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	source := imageSource(v)
 	wanted := make(map[imageCacheKey]bool, len(paths))
@@ -308,10 +295,9 @@ func (p *ImagePipeline) dropPreview(key imageCacheKey) {
 	}
 }
 
-// Load asks for a picture. A picture that is already decoded is handed over
-// before Load returns, on the calling thread; otherwise the callback runs on
-// the UI thread once the picture is ready. Several requests for the same
-// picture share one decoding job.
+// Load asks for a picture. A cached one is handed over on the calling thread;
+// otherwise the callback runs on the UI thread when ready. Shared requests
+// share one decoding job.
 func (p *ImagePipeline) Load(v vfs.VFS, path string, done func(ImageResult)) {
 	if res, ok := p.Cached(v, path); ok {
 		if done != nil {
@@ -356,9 +342,8 @@ func (p *ImagePipeline) loadSync(ctx context.Context, v vfs.VFS, path string, ur
 	}
 }
 
-// Prefetch decodes pictures nobody has asked for yet. The list replaces the
-// previous one: a neighbour that is no longer near the picture on screen
-// gives up its place in the queue to the new neighbours.
+// Prefetch decodes pictures nobody asked for yet; the list replaces the
+// previous one, so a far neighbour gives up its queue slot.
 func (p *ImagePipeline) Prefetch(v vfs.VFS, paths []string) {
 	source := imageSource(v)
 	wanted := make(map[imageCacheKey]bool, len(paths))
@@ -449,9 +434,9 @@ func (p *ImagePipeline) request(v vfs.VFS, path string, urgent bool, w imageWait
 		}
 		if urgent {
 			job.urgent = true
-			// Before a worker starts, an on-screen request may take ownership
-			// of a queued prefetch. Once started, the worker context is fixed;
-			// changing it here would race with the worker's context snapshot.
+			// An on-screen request may take over a queued prefetch before it
+			// starts; after that the worker context is fixed (changing it
+			// would race the worker's snapshot).
 			if !job.started {
 				job.ctx = ctx
 			}
@@ -485,9 +470,8 @@ func (p *ImagePipeline) pump() {
 	}
 }
 
-// nextJob takes the most deserving job out of the queue: somebody is looking
-// at an urgent one right now, a prefetched one may still be needed later.
-// A prefetch is only started while the prefetch lanes have room, so an
+// nextJob takes the most deserving job from the queue: an urgent one now, a
+// prefetch later. A prefetch only starts while its lanes have room, so an
 // on-screen request always finds a free worker.
 func (p *ImagePipeline) nextJob() *imageJob {
 	best := -1
@@ -508,15 +492,15 @@ func (p *ImagePipeline) nextJob() *imageJob {
 }
 
 func (p *ImagePipeline) run(job *imageJob) {
-	// Mark the job started and snapshot its immutable owner context. A later
-	// urgent waiter may join, but cannot replace cancellation semantics.
+	// Mark started and snapshot the owner context; a later urgent waiter may
+	// join but cannot replace cancellation semantics.
 	p.mu.Lock()
 	job.started = true
 	ctx := job.ctx
 	p.mu.Unlock()
 
-	// A decode the reader stepped away from is wasted: not on screen, and
-	// its surface would push a live picture out of the cache.
+	// A decode the reader stepped away from is wasted: it would push a live
+	// picture out of the cache.
 	if err := ctx.Err(); err != nil {
 		p.done(job, ImageResult{Path: job.path, Err: err})
 		return
@@ -526,7 +510,7 @@ func (p *ImagePipeline) run(job *imageJob) {
 	surf, decoder, err := p.load(ctx, job.v, job.path)
 	res := ImageResult{Path: job.path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}
 	if err == nil && (surf == nil || !surf.Valid()) {
-		res.Err = fmt.Errorf("image pipeline: %w", errEmptyDecoderResult)
+		res.Err = fmt.Errorf("image pipeline: %w", imagedecoders.ErrEmptyDecoderResult)
 		res.Surface = nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -655,7 +639,7 @@ func (p *ImagePipeline) FileBytes(ctx context.Context, v vfs.VFS, path string) (
 	p.bytesJobs[key] = job
 	p.mu.Unlock()
 
-	data, err := imageReadFileBytes(ctx, v, path)
+	data, err := imagedecoders.ImageReadFileBytes(ctx, v, path)
 
 	p.mu.Lock()
 	if err == nil && job.generation == p.bytesGen && len(data) <= imageBytesCacheMaxFile {
@@ -696,7 +680,7 @@ func (p *ImagePipeline) storeBytes(key imageCacheKey, data []byte) {
 	}
 	p.bytesCache[key] = data
 	p.bytesSize += len(data)
-	// The picture on screen stays, exactly like the surface cache keeps it.
+	// The on-screen picture stays, like the surface cache keeps it.
 	for p.bytesSize > imageBytesCacheLimit && len(p.bytesOrder) > 1 {
 		p.dropBytes(p.bytesOrder[0])
 	}
@@ -727,9 +711,8 @@ func (p *ImagePipeline) touchBytes(key imageCacheKey) {
 	p.bytesOrder = append(p.bytesOrder, key)
 }
 
-// ImageNeighbourhood picks the pictures worth decoding before they are asked
-// for: the nearest ones on both sides of the current position, forward
-// first, because that is the way people usually go.
+// ImageNeighbourhood returns the pictures nearest the current position on
+// both sides, forward first.
 func ImageNeighbourhood(paths []string, index, radius int) []string {
 	if index < 0 || index >= len(paths) || radius <= 0 {
 		return nil

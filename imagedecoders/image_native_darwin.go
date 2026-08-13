@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package main
+package imagedecoders
 
 /*
 #cgo LDFLAGS: -framework CoreFoundation -framework CoreGraphics -framework ImageIO
@@ -126,7 +126,7 @@ import (
 
 const appleImageDecoder = "apple-imageio"
 
-func decodeImageWithAppleImageIO(ctx context.Context, data []byte) (*vtui.ImageSurface, error) {
+func decodeImageWithAppleImageIO(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("there is nothing to decode")
 	}

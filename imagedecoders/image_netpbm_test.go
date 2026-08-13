@@ -1,4 +1,4 @@
-package main
+package imagedecoders
 
 import (
 	"bytes"
@@ -44,7 +44,7 @@ func TestDecodeNetpbmRejectsGarbage(t *testing.T) {
 
 func decodePix(t *testing.T, data []byte) []byte {
 	t.Helper()
-	img, err := decodeNetpbm(bytes.NewReader(data))
+	img, _, err := decodeNetpbm(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("decodeNetpbm: %v", err)
 	}
@@ -137,12 +137,12 @@ func TestNetpbmP7TupleTypeValidation(t *testing.T) {
 	if !bytes.Equal(pix, want) {
 		t.Fatalf("P7 pix = % x, want % x", pix, want)
 	}
-	if _, err := decodeNetpbm(bytes.NewReader([]byte(
+	if _, _, err := decodeNetpbm(bytes.NewReader([]byte(
 		"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n\x01\x02\x03\x04\x05\x06"))); err == nil {
 		t.Error("TUPLTYPE RGB_ALPHA with DEPTH 3 must be rejected")
 	}
 	// Unknown tuple types pass through on depth.
-	if _, err := decodeNetpbm(bytes.NewReader([]byte(
+	if _, _, err := decodeNetpbm(bytes.NewReader([]byte(
 		"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE CUSTOM\nENDHDR\n\x01\x02\x03"))); err != nil {
 		t.Errorf("custom TUPLTYPE must be accepted: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestNetpbmLargeDimensions(t *testing.T) {
 	// Keep the default suite small: this validates a sizeable decoded surface
 	// without allocating hundreds of MiB just to exercise the header guard.
 	w, h := 1200, 1200
-	img, err := decodeNetpbm(io.MultiReader(
+	img, _, err := decodeNetpbm(io.MultiReader(
 		bytes.NewReader([]byte("P5\n1200 1200\n255\n")),
 		io.LimitReader(zeroReader{}, int64(w*h)),
 	))
@@ -232,7 +232,7 @@ func TestNetpbmRejectsOversizedDimensionsBeforeAllocation(t *testing.T) {
 		"P5\n16385 1\n255\n",
 		"P5\n20000 100\n255\n",
 	} {
-		if _, err := decodeNetpbm(bytes.NewReader([]byte(header))); err == nil {
+		if _, _, err := decodeNetpbm(bytes.NewReader([]byte(header))); err == nil {
 			t.Errorf("header %q was accepted despite the allocation limit", header)
 		}
 	}
@@ -272,9 +272,32 @@ func FuzzDecodeNetpbm(f *testing.F) {
 	f.Add([]byte("P1\n3 1\n101"))                                              // adjacent bits
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must never panic, even on truncated/corrupt headers.
-		_, _ = decodeNetpbm(bytes.NewReader(data))
+		_, _, _ = decodeNetpbm(bytes.NewReader(data))
 		_, _ = decodeNetpbmSurfaceStream(bytes.NewReader(data))
 	})
+}
+
+// TestNetpbmSurfaceOpaqueFlag: formats without an alpha channel must mark
+// the surface opaque so the pipeline skips the alpha scan; DEPTH 2/4 keep the
+// flag off and let the scan decide.
+func TestNetpbmSurfaceOpaqueFlag(t *testing.T) {
+	opaque := []byte("P6\n2 1\n255\n\x01\x02\x03\x04\x05\x06")
+	surf, err := decodeNetpbmSurface(opaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !surf.Opaque {
+		t.Error("P6 has no alpha channel and must be marked opaque")
+	}
+	withAlpha := []byte("P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" +
+		"\x01\x02\x03\xff\x04\x05\x06\xff")
+	surf, err = decodeNetpbmSurface(withAlpha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if surf.Opaque {
+		t.Error("a DEPTH 4 surface has an alpha channel and must stay unmarked")
+	}
 }
 
 // 8-bit fast path unrolls 64-bit groups (depths 1/2/3); 9 pixels exercise

@@ -6,13 +6,11 @@ import (
 	"github.com/unxed/vtui"
 )
 
-// defaultSlideShowDelay is how many seconds a picture stays on screen when
-// the configuration has nothing sensible to say about it.
+// defaultSlideShowDelay is the fallback seconds per picture.
 const defaultSlideShowDelay = 5
 
-// slideShowInterval is how long one picture is shown. A configured zero would
-// spin the terminal as fast as it can decode and a negative value would never
-// fire at all, so both fall back to the default.
+// slideShowInterval is how long one picture is shown; zero or negative falls
+// back to the default.
 func slideShowInterval() time.Duration {
 	seconds := AppConfig.SlideShowDelay
 	if seconds <= 0 {
@@ -22,21 +20,18 @@ func slideShowInterval() time.Duration {
 }
 
 // ToggleSlideShow starts or stops walking the pictures on a timer. The timer
-// lives in a goroutine of its own and does nothing but ask the UI thread to
-// take the next step: the index, the pipeline and the placement all belong to
-// that thread.
+// goroutine only asks the UI thread (which owns the index, pipeline and
+// placement) to take the next step.
 func (iv *ImageView) ToggleSlideShow() {
 	if iv.slideStop != nil {
 		iv.stopSlideShow()
 		return
 	}
 	if len(iv.siblings) < 2 {
-		// One picture is not a slide show.
-		return
+		return // one picture is not a slide show
 	}
 
-	// The grid and the show cannot both decide which picture is current, and
-	// the show is the one that was just asked for.
+	// The grid and the show can't both own the current picture.
 	iv.gal = nil
 
 	stop := make(chan struct{})
@@ -52,8 +47,7 @@ func (iv *ImageView) ToggleSlideShow() {
 				return
 			case <-ticker.C:
 				vtui.FrameManager.PostTask(func() {
-					// The reader may have stopped the show between the tick
-					// and this task reaching the UI thread.
+					// The reader may have stopped the show between tick and task.
 					if iv.slideStop == stop {
 						iv.slideStep()
 					}
@@ -63,9 +57,7 @@ func (iv *ImageView) ToggleSlideShow() {
 	}()
 }
 
-// stopSlideShow puts the timer away. Closing the channel is what the goroutine
-// is waiting for, so it wakes up at once rather than at the end of the
-// interval, and a viewer that is gone leaves nothing running behind it.
+// stopSlideShow closes the timer's channel, so the goroutine wakes at once.
 func (iv *ImageView) stopSlideShow() {
 	if iv.slideStop == nil {
 		return
@@ -74,10 +66,7 @@ func (iv *ImageView) stopSlideShow() {
 	iv.slideStop = nil
 }
 
-// slideStep shows the next picture and wraps around at the end. Step stops at
-// the ends of the directory on purpose, so that it stays obvious where it
-// begins and where it ends; a show that stopped on the last picture would
-// only be a slow way of pressing space.
+// slideStep shows the next picture, wrapping at the end (unlike Step).
 func (iv *ImageView) slideStep() {
 	total := len(iv.siblings)
 	if total == 0 {

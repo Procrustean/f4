@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -21,53 +22,40 @@ const (
 	// 20% per press: firm step between coarse 25% and a too-fine gradation.
 	imageViewZoomFactor = 1.2
 
-	// Terminal backends cannot always tell us how big a character cell is.
-	// The exact numbers only affect the aspect ratio, so a common default is
-	// good enough until the size can be queried.
+	// Fallback cell size when the terminal can't report one; it only affects
+	// aspect ratio.
 	imageViewFallbackCellW = 8
 	imageViewFallbackCellH = 16
 
-	// imageViewPrefetchRadius is how many pictures on each side are decoded
-	// before anybody asks to see them.
+	// How many pictures on each side are decoded before they are asked for.
 	imageViewPrefetchRadius = 2
 
-	// toast stays a moment.
-	imageViewToastDelay = 2 * time.Second
+	imageViewToastDelay = 2 * time.Second // toast stays a moment
 
-	// The toast leaves by sliding over the left edge. The window is meant
-	// to read as a dismiss, not a wait: 150ms is the fast step of the
-	// Material motion scale. The exit slide, the wall flash, and the
-	// loading band are all redrawn on the same tick.
+	// The toast slides out over the left edge; the slide, the wall flash and
+	// the loading band all redraw on one tick.
 	imageToastSlideDur  = 150 * time.Millisecond
 	imageToastSlideTick = 30 * time.Millisecond
 
-	// One full pass of the bright band across the loading toast's slab.
+	// One full pass of the bright band across the loading slab.
 	imageLoadingCycle = 900 * time.Millisecond
 
 	// How long the end-of-list toast keeps its inverted "wall" colours.
-	// 200ms is the pulse step of the Material motion scale: long enough
-	// for the eye to read the wall, short enough not to feel like a blink
-	// the user has to wait out.
 	imageToastFlashDur = 200 * time.Millisecond
 
-	// decode may run this long before the viewer admits it is working.
+	// Decode may run this long before the viewer admits it is working.
 	imageViewDecodeDelay = 500 * time.Millisecond
 
-	// The loading toast's palette: pure grey ramps only — a dark slab near
-	// #1E1E1E and near-white text #E3E3E3, both snapped onto the XTerm-256
-	// grayscale ramp (levels 3 and 23), so the 256-colour fallback shows
-	// the same shades as truecolor.
+	// Loading toast palette: pure greys snapped onto the XTerm-256 ramp, so
+	// the 256-colour fallback matches truecolor.
 	imageLoadingText = 0xE4E4E4
 
-	// The resting and brightest slab greys of the loading toast. The comet
-	// swings ~23% luminance (ramp levels 3..9). The brightest grey 0x58
-	// stays a 14-step gap below the text grey 0xE4, so no bright shade ever
-	// lands under a letter of its own brightness.
+	// Resting and brightest slab greys. The brightest (0x58) stays 14 steps
+	// below the text grey (0xE4), so no shade lands under a letter.
 	imageSlabDim    = 0x1C1C1C
 	imageSlabBright = 0x585858
 
-	// The comet's half-width in letters: the raised-cosine bright patch on
-	// the slab spans this many cells either side of its centre.
+	// The comet's half-width in cells.
 	imageCometHalfWidth = 3
 )
 
@@ -76,15 +64,11 @@ var imageViewBackAttr = vtui.SetRGBBoth(0, 0xC0C0C0, blockImageBack)
 // overlay: opaque dark slab keeps the info line legible.
 var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
 
-// toast: white on a dark slab. The picture lies over every cell background,
-// so the slab colour only shows where the picture does not reach; the light
-// glyphs are what keeps the message readable on top of the image.
+// toast: white on a dark slab; the light glyphs keep it readable on the image.
 var imageToastAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x333333)
 
-// A blocked step into the edge of the list flashes the toast and the OSD
-// pane together in the inverted "wall" colours: dark glyphs on a lit slab,
-// loud without a sound. 0xC0C0C0 is the XTerm-256 light grey (about 250),
-// so the flash survives the fallback.
+// A blocked step flashes the toast and the OSD in inverted "wall" colours:
+// dark glyphs on a lit slab. 0xC0C0C0 is the XTerm-256 light grey.
 var imageWallFlashAttr = vtui.SetRGBBoth(0, 0x101010, 0xC0C0C0)
 
 // ImageView shows a single picture full screen.
@@ -112,24 +96,20 @@ type ImageView struct {
 	zoom       float64 // the zoom currently on screen
 	panX, panY float64
 
-	// How far the picture can still be moved along each axis, as of the last
-	// frame: only drawing knows how large the window is. Zero means the
-	// picture fits and there is nothing to pan.
+	// How far the picture can still move per axis, as of the last frame. Zero
+	// means it fits and there is nothing to pan.
 	panMaxX, panMaxY float64
 
-	// The last line of geometry that was written to the log, so that a
-	// picture nobody is touching does not fill it.
+	// Last geometry line written to the log, so an idle picture doesn't fill it.
 	lastGeom string
 
-	// Orientation chosen by the reader. The decoded picture stays in
-	// surface; shown carries the turned and mirrored copy and is nil while
-	// the picture is seen exactly as it was decoded.
+	// Orientation chosen by the reader; surface holds the decoded picture,
+	// shown the turned/mirrored copy (nil when seen as decoded).
 	rotation     int
 	flipH, flipV bool
 	shown        *vtui.ImageSurface
 
-	// The last console size, kept so that entering or leaving the whole
-	// screen mode can lay the frame out again without waiting for a resize.
+	// Last console size, so full-screen toggles can relayout without a resize.
 	conW, conH int
 
 	overlay   bool
@@ -162,23 +142,18 @@ type ImageView struct {
 	// tempSlideStart: when the toast's exit began (zero = not exiting).
 	tempSlideStart time.Time
 
-	// animStop ends the single redraw ticker that keeps the toast's
-	// animations in motion — the exit slide, the wall flash, and the
-	// loading band; nil while nothing animates.
+	// animStop ends the ticker that drives the toast animations; nil when idle.
 	animStop chan struct{}
 
-	// loadRow reuses the loading toast's slab cells across frames, so a
-	// long decode does not allocate a row per redraw tick.
+	// loadRow reuses the loading slab's cells across frames, so a long decode
+	// doesn't allocate a row per tick.
 	loadRow []vtui.CharInfo
 
-	// decodeStart: toast once past imageViewDecodeDelay.
-	decodeStart time.Time
+	decodeStart  time.Time          // toast once past imageViewDecodeDelay
+	decodeCancel context.CancelFunc // stops an in-flight decode on moving on
 
-	// decodeCancel: stops an in-flight external decode on moving on.
-	decodeCancel context.CancelFunc
-
-	// block and blockTiles cache half-block cells, one per picture on screen
-	// and one per gallery tile, so resampling runs only on geometry moves.
+	// block / blockTiles cache half-block cells (one per picture, one per
+	// gallery tile), so resampling runs only on geometry moves.
 	block      *blockRender
 	blockTiles map[int]*blockRender
 
@@ -218,14 +193,11 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 	iv.index = -1
 	iv.topBar = NewTopBar(
 		func() string {
-			return " " + iv.titleName()
+			// Just the name and the resolution, one space apart; the
+			// workspace counter "[N]" draws over the empty corner.
+			return " " + iv.titleName() + " " + iv.displaySize()
 		},
-		func() string {
-			segs := iv.infoSegments()
-			// Blank tail for the workspace counter "[N]", drawn over the
-			// top-right corner after the bar.
-			return " " + strings.Join(segs, " │ ") + "   "
-		},
+		nil,
 	)
 	iv.topBar.SetVisible(true)
 	iv.SetCanFocus(true)
@@ -263,10 +235,8 @@ func (iv *ImageView) SetSiblings(paths []string, index int) {
 	iv.prefetch()
 }
 
-// prefetch has the neighbours decoded while nobody is looking at them yet.
-// The nearest ones are decoded whole, so the next step lands on a finished
-// picture; the ring beyond them only gets its embedded thumbnail, which
-// costs a header read instead of a full decode.
+// prefetch decodes the neighbours in advance: the nearest whole, the ring
+// beyond only their embedded thumbnail (a header read, not a full decode).
 func (iv *ImageView) prefetch() {
 	if iv.index < 0 || iv.index >= len(iv.siblings) {
 		return
@@ -278,10 +248,8 @@ func (iv *ImageView) prefetch() {
 	}
 }
 
-// Step walks the siblings. It stops at the ends rather than wrapping around,
-// so that it stays obvious where the directory begins and where it ends. The
-// toast says where: "[3/10]" when the walk lands on an edge, and the same
-// message flashing in inverted colours when the edge refused to move.
+// Step walks the siblings, stopping at the ends; the toast announces an edge,
+// flashing when it refused to move.
 func (iv *ImageView) Step(delta int) {
 	total := len(iv.siblings)
 	if total == 0 || iv.index < 0 {
@@ -296,8 +264,7 @@ func (iv *ImageView) Step(delta int) {
 	}
 	blocked := idx == iv.index
 	iv.GoTo(idx)
-	// Another shove at the same wall blinks the number that is already in
-	// the corner; a fresh edge or wall announces it.
+	// Another shove at the same wall blinks the number already in the corner.
 	if blocked && iv.tempMsg == fmt.Sprintf("[%d/%d]", idx+1, total) {
 		iv.reFlash()
 	} else if !iv.loading && (blocked || idx == 0 || idx == total-1) {
@@ -305,10 +272,8 @@ func (iv *ImageView) Step(delta int) {
 	}
 }
 
-// edgeToast says where the walk landed: "[3/10]" on an edge, flashing when
-// the edge refused to move. A decode at work or another message in the
-// corner keeps it quiet, so the position never hides the "decoding" label
-// or a report about the picture itself.
+// edgeToast announces the position on an edge, flashing when it refused to
+// move; a decode or message in progress keeps it quiet.
 func (iv *ImageView) edgeToast(idx int, blocked bool) {
 	if iv.loading || iv.tempMsg != "" {
 		return
@@ -341,13 +306,11 @@ func (iv *ImageView) Reload() {
 	iv.toast("re-decoded")
 }
 
-// open puts another picture on screen. One that is decoded already appears
-// at once; otherwise the previous picture stays until the new one arrives,
-// which is quieter than a flash of empty window.
+// open puts another picture on screen; a decoded one appears at once, else
+// the previous picture stays until the new one arrives.
 func (iv *ImageView) open(path string) {
 	if path != iv.path {
-		// The toast answers the picture it was said over; moving to
-		// another file drops it at once, slide-out animation included.
+		// The toast answers the picture it was said over; drop it at once.
 		iv.toastClear()
 	}
 	iv.cancelDecode()
@@ -367,7 +330,7 @@ func (iv *ImageView) open(path string) {
 	if iv.overlay {
 		iv.requestFileSize()
 	}
-	if iv.reqDecoder != "" && !imageChoiceValid(iv.reqDecoder) {
+	if iv.reqDecoder != "" && !imagedecoders.ImageChoiceValid(iv.reqDecoder) {
 		iv.reqDecoder = ""
 	}
 
@@ -410,11 +373,11 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 		var surf *vtui.ImageSurface
 		var decoder string
 		if err == nil {
-			surf, decoder, err = loadImageForBytes(ctx.Context, path, data, dec)
+			surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, dec)
 			pinned = err == nil
 			if err != nil {
 				start = time.Now()
-				surf, decoder, err = loadImageForBytes(ctx.Context, path, data, "")
+				surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, "")
 			}
 		}
 		res := ImageResult{Path: path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}
@@ -428,7 +391,7 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 }
 
 func (iv *ImageView) CycleDecoder() {
-	next := imageNextDecoder(imageDecoderChoices(iv.path), iv.reqDecoder, iv.decoder)
+	next := imagedecoders.ImageNextDecoder(imagedecoders.ImageDecoderChoices(iv.path), iv.reqDecoder, iv.decoder)
 	if next == "" {
 		return
 	}
@@ -476,10 +439,8 @@ func (iv *ImageView) baseScale(boxW, boxH int) float64 {
 	return float64(fitW) / float64(img.Width)
 }
 
-// ToggleActualSize switches between the window and the picture itself
-// deciding how large it is shown. The toast says what the new scale is:
-// the literal pixels are always a hundred percent, and the fitted
-// percentage saved on the way in comes back with the picture.
+// ToggleActualSize switches between window-fit and literal pixels; the toast
+// says the new scale.
 func (iv *ImageView) ToggleActualSize() {
 	iv.actual = !iv.actual
 	iv.zoom = 1
@@ -492,9 +453,7 @@ func (iv *ImageView) ToggleActualSize() {
 	}
 }
 
-// display is the picture the viewer works with: the turned and mirrored copy
-// when the reader has changed the orientation, the decoded surface when they
-// have not.
+// display is the turned/mirrored copy when orientation changed, else surface.
 func (iv *ImageView) display() *vtui.ImageSurface {
 	if iv.shown.Valid() {
 		return iv.shown
@@ -502,9 +461,8 @@ func (iv *ImageView) display() *vtui.ImageSurface {
 	return iv.surface
 }
 
-// rebuild bakes the current orientation into pixels. A backend can only ship
-// a rectangle of pixels and place it on a grid of cells, so a turn cannot be
-// expressed in the placement and has to be applied to the surface itself.
+// rebuild bakes the orientation into pixels; a backend can only ship a
+// rectangle, so a turn cannot be expressed in the placement.
 func (iv *ImageView) rebuild() {
 	if iv.rotation == 0 && !iv.flipH && !iv.flipV {
 		iv.shown = nil
@@ -515,10 +473,8 @@ func (iv *ImageView) rebuild() {
 
 // Rotate turns the picture clockwise by a multiple of ninety degrees.
 func (iv *ImageView) Rotate(delta int) {
-	// Mirroring is applied after the turn, and a mirror reverses the
-	// direction of a turn, so with exactly one axis mirrored the stored
-	// angle has to move the other way for the key to keep turning the
-	// picture the reader actually sees.
+	// A mirror reverses the turn direction, so with one axis mirrored the
+	// stored angle moves the other way.
 	if iv.flipH != iv.flipV {
 		delta = -delta
 	}
@@ -657,10 +613,8 @@ func cellSize(scr *vtui.ScreenBuf) (int, int) {
 	return cw, ch
 }
 
-// placementFor computes where and how the picture should appear. While it
-// fits, the placement is centred and shows the whole surface; once it is
-// zoomed past the window, the placement fills the window and the source
-// rectangle is cropped and panned instead.
+// placementFor computes where the picture goes: centred when it fits, cropped
+// and panned once zoomed past the window.
 func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, bool) {
 	if scr == nil {
 		return vtui.ImagePlacement{}, false
@@ -698,9 +652,8 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 
 	p := vtui.ImagePlacement{Surface: img}
 	if iv.overlay {
-		// A negative z index asks the terminal to keep the picture under the
-		// glyphs but still over the cell background, which is what makes the
-		// info panel readable without hiding the picture behind a box.
+		// Under the glyphs but over the cell background: keeps the info panel
+		// readable without hiding the picture behind a box.
 		p.ZIndex = -1
 	}
 
@@ -744,13 +697,8 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 	return p, true
 }
 
-// arrow is what the four arrow keys do. An axis the picture cannot be moved
-// along at all has no panning to offer, so the key walks the directory
-// instead; an axis that can be panned is panned, and the walking is left to
-// space, PgUp and PgDn. Panning to the edge and then jumping to the next
-// picture was the other candidate and was refused: it reads as a slip of the
-// finger. The letters w, a, s and d pan whatever happens, so a reader moving
-// a zoomed picture never has to think about which of the two an arrow means.
+// arrow is what the arrow keys do: pan an axis that can move, else walk the
+// directory. w/a/s/d always pan.
 func (iv *ImageView) arrow(dx, dy int) {
 	if dx != 0 && iv.panMaxX > 0 {
 		iv.Pan(dx, 0)
@@ -767,9 +715,8 @@ func (iv *ImageView) arrow(dx, dy int) {
 	iv.Step(1)
 }
 
-// titleName is what the title bar calls the picture: a leading * once it is
-// picked, so selection is visible without leaving the viewer. The colour says
-// it as well, but the mark survives a terminal nobody has set colours of.
+// titleName prefixes a * to the picked picture, so selection is visible
+// without leaving the viewer even without colours.
 func (iv *ImageView) titleName() string {
 	if iv.selected[iv.path] {
 		return "*" + iv.baseName()
@@ -777,11 +724,8 @@ func (iv *ImageView) titleName() string {
 	return iv.baseName()
 }
 
-// logGeometry records what the layout worked out to, once per change. It is
-// here because a strip of background nobody asked for is a question about
-// numbers — how many rows the frame has, how many the picture takes, how
-// large a cell is — and about how many pictures the graphics layer holds at
-// that moment, which is a different fault with the same symptom.
+// logGeometry records the layout once per change, for debugging a stray
+// background strip.
 func (iv *ImageView) logGeometry(scr *vtui.ScreenBuf, p vtui.ImagePlacement) {
 	img := iv.display()
 	if scr == nil || !img.Valid() {
@@ -813,9 +757,8 @@ func cellsFor(pixels, cellSize, limit int) int {
 	return n
 }
 
-// fitPlacement fits a surface inside a cell box of cw x ch pixel cells and
-// centres it there. The block renderer passes 1x2 (one pixel per column, two
-// per row) so its cells and the graphics backend's agree on what fits.
+// fitPlacement fits and centres a surface in a cw x ch cell box. The block
+// renderer passes 1x2 so its cells and the backend's agree on what fits.
 func fitPlacement(surface *vtui.ImageSurface, cw, ch, col, row, boxCols, boxRows int) (vtui.ImagePlacement, bool) {
 	if !surface.Valid() || boxCols <= 0 || boxRows <= 0 {
 		return vtui.ImagePlacement{}, false
@@ -831,10 +774,8 @@ func fitPlacement(surface *vtui.ImageSurface, cw, ch, col, row, boxCols, boxRows
 	return p, true
 }
 
-// SetFullScreen gives the rows of the title and key bars to the picture. The
-// key bar is drawn by the frame manager rather than by the frame, and
-// ScreenObject.Show makes an object visible whether it wants to be or not, so
-// hiding it cannot be done locally and has to be asked for centrally.
+// SetFullScreen gives the title/key-bar rows to the picture. The key bar is
+// drawn centrally, so hiding it has to be asked for there.
 func (iv *ImageView) SetFullScreen(on bool) {
 	if iv.full == on {
 		return
@@ -884,8 +825,7 @@ func (iv *ImageView) CycleRenderer() {
 }
 
 // requestFileSize asks the file system how big the file is. Stat can be a
-// network round trip on a remote file system, so it happens off the drawing
-// path, once, and only for a reader who has actually opened the overlay.
+// network round trip, so it runs off the drawing path, once, for the overlay.
 func (iv *ImageView) requestFileSize() {
 	if iv.sizeKnown || iv.vfs == nil {
 		return
@@ -907,8 +847,7 @@ func (iv *ImageView) requestFileSize() {
 	})
 }
 
-// imageOrientationLabel names a turn and a mirroring, and says nothing at all
-// about a picture that is seen exactly as it was decoded.
+// imageOrientationLabel names a turn and mirroring, or nothing.
 func imageOrientationLabel(rotation int, flipH, flipV bool) string {
 	var parts []string
 	if rotation != 0 {
@@ -954,8 +893,7 @@ func (iv *ImageView) positionLabel() string {
 	return ""
 }
 
-// decoderLabel is "go-std 15 ms" in the OSD and titles; a converter shows
-// up as plain "im" or "magick".
+// decoderLabel is "go-std 15 ms" in the OSD and titles.
 func (iv *ImageView) decoderLabel() string {
 	return decoderWithTime(iv.decoder, iv.decodeDur)
 }
@@ -982,16 +920,6 @@ func (iv *ImageView) stateLabel() string {
 		state += ", slideshow"
 	}
 	return state
-}
-
-// infoSegments is the top bar's right half; GetTitle spells it with 3 spaces.
-func (iv *ImageView) infoSegments() []string {
-	parts := []string{iv.displaySize(), fmt.Sprintf("%d%%", iv.scalePercent())}
-	if rel := iv.positionLabel(); rel != "" {
-		parts = append(parts, rel)
-	}
-	parts = append(parts, iv.stateLabel())
-	return parts
 }
 
 // overlayLines is what the info panel has to say about the picture.
@@ -1033,8 +961,7 @@ func (iv *ImageView) toast(msg string) {
 	iv.tempFlashUntil = time.Time{}
 }
 
-// toastClear drops the toast at once, exit animation included: the moment
-// another picture is asked for, whatever the old toast said is stale.
+// toastClear drops the toast at once, exit animation included.
 func (iv *ImageView) toastClear() {
 	iv.tempMsg = ""
 	iv.tempSlideStart = time.Time{}
@@ -1042,18 +969,14 @@ func (iv *ImageView) toastClear() {
 	iv.stopAnimIfIdle()
 }
 
-// flashToast is toast plus a short-lived "wall" flash: used when a step
-// into the first or the last picture could not move anywhere. The redraw
-// ticker restores the resting colours once the flash has run out.
+// flashToast is toast plus a short "wall" flash when a step hits the edge.
 func (iv *ImageView) flashToast(msg string) {
 	iv.toast(msg)
 	iv.tempFlashUntil = time.Now().Add(imageToastFlashDur)
 	iv.ensureAnim()
 }
 
-// reFlash restarts the wall flash without touching the message, for a
-// shove at the same wall while its number is still on screen. The redraw
-// ticker restores the resting colours once the flash has run out.
+// reFlash restarts the wall flash without touching the message.
 func (iv *ImageView) reFlash() {
 	iv.tempFlashUntil = time.Now().Add(imageToastFlashDur)
 	iv.ensureAnim()
@@ -1073,9 +996,8 @@ func (iv *ImageView) tempSliding() bool {
 	return !iv.tempSlideStart.IsZero() && time.Since(iv.tempSlideStart) < imageToastSlideDur
 }
 
-// ensureAnim starts the single redraw ticker that keeps the toast's
-// animations in motion — the exit slide, the wall flash, and the loading
-// band all ride on the same tick. Idempotent.
+// ensureAnim starts the redraw ticker that drives the toast animations.
+// Idempotent.
 func (iv *ImageView) ensureAnim() {
 	if iv.animStop != nil {
 		return
@@ -1140,9 +1062,7 @@ func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
 	scr.Write(x1+iv.tempSlideOffset(width), y2, vtui.StringToCharInfo(text, attr))
 }
 
-// tempSlideOffset is how far the toast has slid left, eased so the motion
-// gathers gently and lets go of the edge softly. At the end every slab cell
-// has left the screen and Write clips whatever sticks out of the left edge.
+// tempSlideOffset is how far the toast has slid left, eased (smoothstep).
 func (iv *ImageView) tempSlideOffset(width int) int {
 	if !iv.tempSliding() {
 		return 0
@@ -1152,14 +1072,9 @@ func (iv *ImageView) tempSlideOffset(width int) int {
 	return -int(p * float64(width))
 }
 
-// loadingToastShade is one cell of the loading toast's slab. A comet — a
-// soft bright patch — crosses the row once per cycle, while the whole pass
-// ramps up from nothing and back down into nothing: it comes out of
-// nowhere, travels, and fades away with no hard edge, so no restart is ever
-// visible. The letters stay at their fixed light grey throughout: the
-// brightest slab cell (0x58) is a 14-step gap below the text grey (0xE4)
-// on the 256 ramp, so no bright shade ever lands under a letter of its own
-// brightness. phase is the pass position, [0,1).
+// loadingToastShade is one cell of the loading slab. A soft bright comet
+// crosses the row once per cycle, ramping from nothing and back so no
+// restart is visible. phase is the pass position, [0,1).
 func loadingToastShade(x, width int, phase float64) uint32 {
 	if width <= 0 {
 		return imageSlabDim
@@ -1188,17 +1103,15 @@ func (iv *ImageView) loadingToastOn() bool {
 	return iv.loading && !iv.tempActive() && time.Since(iv.decodeStart) > imageViewDecodeDelay
 }
 
-// drawLoadingToast shows that the decoder is still at work: the seconds
-// already spent, over a slab a bright band keeps crossing, so a long decode
-// reads as progress, not silence.
+// drawLoadingToast shows the decode is still at work: seconds spent over a
+// slab a bright band keeps crossing, so a long decode reads as progress.
 func (iv *ImageView) drawLoadingToast(scr *vtui.ScreenBuf) {
 	x1, _, x2, y2 := iv.GetPosition()
 	limit := x2 - x1 - 1
 	if limit < 1 {
 		limit = 1
 	}
-	// One clock read drives both the counter and the band phase, so the
-	// comet always sits where the seconds say it is.
+	// One clock read drives both the counter and the band phase.
 	dur := time.Since(iv.decodeStart)
 	text := " decoding " + formatImageDuration(dur) + " "
 	text = runewidth.Truncate(text, limit, "…")
@@ -1210,10 +1123,7 @@ func (iv *ImageView) drawLoadingToast(scr *vtui.ScreenBuf) {
 }
 
 // buildLoadingRow renders one loading-toast frame into row, reusing its
-// backing array so a steady decode allocates nothing per frame. The slab
-// comes up in its resting grey; only the comet's own cells get the bright
-// pass shade, which is exactly what loadingToastShade leaves outside the
-// band anyway, so every cell matches the per-cell pass.
+// backing array so a steady decode allocates nothing per frame.
 func buildLoadingRow(row []vtui.CharInfo, text string, phase float64) []vtui.CharInfo {
 	base := vtui.SetRGBBoth(0, imageLoadingText, imageSlabDim)
 	for _, r := range text {
@@ -1256,9 +1166,8 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 		return
 	}
 
-	// One slab under all the lines, with a row of air above it: the panel
-	// reads as a pane, not as separate stickers. While the wall flash
-	// lasts, the pane inverts with the toast.
+	// One slab under all the lines reads as a pane; it inverts with the toast
+	// while the wall flash lasts.
 	attr := imageOverlayAttr
 	if iv.flashing() {
 		attr = imageWallFlashAttr
@@ -1324,9 +1233,7 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	}
 }
 
-// toastUpdate advances the toast's life once per frame: a message still in
-// its window, or one sliding out, stays; a finished exit is dropped and
-// the redraw ticker stopped. Show draws what is left after this.
+// toastUpdate advances the toast's life once per frame; Show draws what's left.
 func (iv *ImageView) toastUpdate() {
 	if iv.tempMsg == "" {
 		iv.stopAnimIfIdle()
@@ -1336,8 +1243,7 @@ func (iv *ImageView) toastUpdate() {
 		return // still within its window, or still sliding out
 	}
 	if iv.tempSlideStart.IsZero() {
-		// The window is over: the exit begins, and the ticker keeps the
-		// slide in motion until the toast has left the screen.
+		// Window over: begin the exit; the ticker keeps the slide moving.
 		iv.tempSlideStart = time.Now()
 		iv.ensureAnim()
 		return
@@ -1386,9 +1292,8 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 		return false
 	}
 
-	// Shift+F4: round-robin the renderer, but only while a picture is
-	// actually being viewed; in the gallery the key is swallowed without
-	// an effect so that it does not fall through to the F4 decoder cycle.
+	// Shift+F4 round-robins the renderer (swallowed in the gallery so it
+	// doesn't fall through to the F4 decoder cycle).
 	shift := (e.ControlKeyState & vtinput.ShiftPressed) != 0
 	if shift && e.VirtualKeyCode == vtinput.VK_F4 {
 		if iv.gal == nil {
@@ -1498,8 +1403,7 @@ func (iv *ImageView) HandleCommand(cmd int, args any) bool {
 }
 
 func (iv *ImageView) Close() {
-	// The whole screen mode is a state of the manager, not of the frame, so
-	// leaving the viewer has to hand the bars back.
+	// Full screen is a manager state, so leaving the viewer hands the bars back.
 	iv.full = false
 	iv.cancelDecode()
 	iv.stopSlideShow()
@@ -1525,8 +1429,7 @@ func (iv *ImageView) GetKeyLabels() *vtui.KeySet {
 
 func (iv *ImageView) GetType() vtui.FrameType { return vtui.TypeUser + 7 }
 
-// GetTitle is the window title while the viewer is on screen, the same data
-// as the top bar in plain spacing.
+// GetTitle is the full window title (name, size, scale, position, state).
 func (iv *ImageView) GetTitle() string {
 	parts := []string{iv.titleName(), iv.displaySize(), fmt.Sprintf("%d%%", iv.scalePercent())}
 	if rel := iv.positionLabel(); rel != "" {
