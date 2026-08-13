@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mattn/go-runewidth"
@@ -21,6 +22,11 @@ const (
 
 	// 20% per press: firm step between coarse 25% and a too-fine gradation.
 	imageViewZoomFactor = 1.2
+
+	// imageViewSizedHeadroom: the on-screen decode is done at this many times
+	// the window size, so zooming this far needs no re-decode; beyond it the
+	// full picture is fetched.
+	imageViewSizedHeadroom = 2.0
 
 	// Fallback cell size when the terminal can't report one; it only affects
 	// aspect ratio.
@@ -96,6 +102,10 @@ type ImageView struct {
 	zoom       float64 // the zoom currently on screen
 	panX, panY float64
 
+	// sized records that the on-screen surface is a screen-sized decode, not
+	// the full picture; zooming past imageViewSizedHeadroom fetches the rest.
+	sized bool
+
 	// How far the picture can still move per axis, as of the last frame. Zero
 	// means it fits and there is nothing to pan.
 	panMaxX, panMaxY float64
@@ -152,6 +162,9 @@ type ImageView struct {
 	decodeStart  time.Time          // toast once past imageViewDecodeDelay
 	decodeCancel context.CancelFunc // stops an in-flight decode on moving on
 
+	// decodePct: how far the WIC decoder has got; shown on the toast.
+	decodePct *atomic.Int32
+
 	// block / blockTiles cache half-block cells (one per picture, one per
 	// gallery tile), so resampling runs only on geometry moves.
 	block      *blockRender
@@ -187,6 +200,7 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 		overlay:   AppConfig.ImageShowOverlay,
 		decodeDur: res.DecodeDur,
 		block:     &blockRender{},
+		decodePct: &atomic.Int32{},
 	}
 	iv.gfxKey = fmt.Sprintf("f4.imageview:%p", iv)
 
@@ -212,8 +226,9 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 	}
 	if res.Preview {
 		gen := iv.loadGen
-		ImagePipe.Load(v, path, func(full ImageResult) {
-			iv.accept(gen, full)
+		vtui.RunAsync(func(ctx *vtui.TaskContext) {
+			sized := iv.loadSized(ctx.Context, v, path)
+			ctx.RunOnUI(func() { iv.accept(gen, sized) })
 		})
 	}
 	return iv, nil
@@ -317,7 +332,11 @@ func (iv *ImageView) open(path string) {
 	iv.path = path
 	iv.zoom = 1
 	iv.panX, iv.panY = 0, 0
+	iv.sized = false
 	iv.rotation, iv.flipH, iv.flipV = 0, false, false
+	if iv.decodePct != nil {
+		iv.decodePct.Store(0)
+	}
 	iv.fileSize, iv.sizeKnown = 0, false
 	iv.fileTime, iv.timeKnown = time.Time{}, false
 	iv.shown = nil
@@ -355,12 +374,22 @@ func (iv *ImageView) startDecode() {
 func (iv *ImageView) openAutomatic(gen uint64, path string) {
 	v := iv.vfs
 	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
-		if res, ok := ImagePipe.PreviewSync(ctx.Context, v, path); ok {
+		dctx := iv.progressContext(ctx.Context)
+		if res, ok := ImagePipe.PreviewSync(dctx, v, path); ok {
 			ctx.RunOnUI(func() { iv.accept(gen, res) })
 		}
-		res := ImagePipe.LoadSync(ctx.Context, v, path)
+		res := iv.loadSized(dctx, v, path)
 		ctx.RunOnUI(func() { iv.accept(gen, res) })
 	}).Cancel
+}
+
+// progressContext attaches the decode-progress sink to a decode context, so
+// a WIC decoder running in the pipeline can report how far it has got.
+func (iv *ImageView) progressContext(ctx context.Context) context.Context {
+	if iv.decodePct == nil {
+		iv.decodePct = new(atomic.Int32)
+	}
+	return imagedecoders.WithDecodeProgress(ctx, iv.decodePct)
 }
 
 // Pin: named decoder only; a non-reader falls back, dropping the pin.
@@ -368,6 +397,7 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 	v := iv.vfs
 	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		start := time.Now()
+		dctx := iv.progressContext(ctx.Context)
 		pinned := false
 		var surf *vtui.ImageSurface
 		var decoder string
@@ -376,7 +406,7 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 		// a video must not be pulled into memory just to hand over its path.
 		// The pin sticks only when it names this decoder.
 		if d, ok := imagedecoders.PathDecoderFor(path); ok {
-			surf, decoder, err = imagedecoders.DecodeImageFromPath(ctx.Context, path, d)
+			surf, decoder, err = imagedecoders.DecodeImageFromPath(dctx, path, d)
 			switch {
 			case err == nil && (dec == "" || dec == d.Name):
 				pinned = true
@@ -391,15 +421,15 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 		if surf == nil && err == nil {
 			// Read the bytes and let the pinned decoder (automatic chain as
 			// fallback) have them.
-			data, derr := ImagePipe.FileBytes(ctx.Context, v, path)
+			data, derr := ImagePipe.FileBytes(dctx, v, path)
 			if derr != nil {
 				err = derr
 			} else {
-				surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, dec)
+				surf, decoder, err = imagedecoders.LoadImageForBytes(dctx, path, data, dec)
 				pinned = err == nil
 				if err != nil {
 					start = time.Now()
-					surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, "")
+					surf, decoder, err = imagedecoders.LoadImageForBytes(dctx, path, data, "")
 				}
 			}
 		}
@@ -468,6 +498,9 @@ func (iv *ImageView) ToggleActualSize() {
 	iv.actual = !iv.actual
 	iv.zoom = 1
 	iv.panX, iv.panY = 0, 0
+	if iv.actual && iv.sized {
+		iv.requestFull()
+	}
 	if iv.actual {
 		iv.fitPct = iv.scalePercent()
 		iv.toast("scale: 100%")
@@ -529,6 +562,7 @@ func (iv *ImageView) SetImage(res ImageResult) {
 	iv.surface = res.Surface
 	iv.decoder = res.Decoder
 	iv.preview = res.Preview
+	iv.sized = res.Sized
 	iv.decodeDur = res.DecodeDur
 	iv.rebuild()
 	if prev.Valid() && prev.Width > 0 && prev.Height > 0 {
@@ -541,6 +575,59 @@ func (iv *ImageView) SetImage(res ImageResult) {
 		iv.zoomFocusY *= sc
 		iv.anchorPending = true
 	}
+}
+
+// requestFull replaces a screen-sized decode with the full picture; it runs
+// once, guarded by iv.sized, and is answered on the UI thread via accept.
+func (iv *ImageView) requestFull() {
+	if !iv.sized {
+		return
+	}
+	iv.sized = false
+	gen := iv.loadGen
+	v, path := iv.vfs, iv.path
+	vtui.RunAsync(func(ctx *vtui.TaskContext) {
+		res := ImagePipe.LoadSync(ctx.Context, v, path)
+		ctx.RunOnUI(func() { iv.accept(gen, res) })
+	})
+}
+
+// sizedDecodeTarget is how large the on-screen decode may be: the terminal
+// times imageViewSizedHeadroom, so a modest zoom stays sharp without
+// re-decoding.
+func (iv *ImageView) sizedDecodeTarget() (int, int) {
+	scr := vtui.FrameManager.Screen()
+	if scr == nil {
+		return 0, 0
+	}
+	cw, ch := cellSize(scr)
+	w, h := scr.Width()*cw, scr.Height()*ch
+	if w <= 0 || h <= 0 {
+		return 0, 0
+	}
+	return w * int(imageViewSizedHeadroom), h * int(imageViewSizedHeadroom)
+}
+
+// loadSized decodes the picture at the screen size when a decoder can shrink
+// while reading; otherwise it is the ordinary full decode. A video or a
+// shell-rendered format goes through the pipeline's guarded load unchanged.
+func (iv *ImageView) loadSized(ctx context.Context, v vfs.VFS, path string) ImageResult {
+	w, h := iv.sizedDecodeTarget()
+	if w <= 0 || h <= 0 || imagedecoders.IsVideoFile(path) {
+		return ImagePipe.LoadSync(ctx, v, path)
+	}
+	if _, ok := imagedecoders.PathDecoderFor(path); ok {
+		return ImagePipe.LoadSync(ctx, v, path)
+	}
+	data, err := ImagePipe.FileBytes(ctx, v, path)
+	if err != nil {
+		return ImageResult{Path: path, Err: err}
+	}
+	surf, decoder, sized, err := imagedecoders.LoadImageForBytesSize(ctx, path, data, "", w, h)
+	if err != nil {
+		return ImagePipe.LoadSync(ctx, v, path)
+	}
+	return ImageResult{Path: path, Surface: surf, Decoder: decoder, Sized: sized}
 }
 
 func (iv *ImageView) SetPosition(x1, y1, x2, y2 int) {
@@ -575,6 +662,9 @@ func (iv *ImageView) SetZoom(z float64) {
 		iv.anchorPending = true
 	}
 	iv.zoom = z
+	if iv.sized && iv.zoom > imageViewSizedHeadroom {
+		iv.requestFull()
+	}
 	iv.toast(fmt.Sprintf("scale: %d%%", int(iv.zoom*100+0.5)))
 }
 
@@ -1134,9 +1224,15 @@ func (iv *ImageView) drawLoadingToast(scr *vtui.ScreenBuf) {
 	if limit < 1 {
 		limit = 1
 	}
-	// One clock read drives both the counter and the band phase.
+	// One clock read drives both the counter and the band phase. A decoder
+	// that reports progress (WIC) puts its percentage here instead.
 	dur := time.Since(iv.decodeStart)
 	text := " decoding " + formatImageDuration(dur) + " "
+	if iv.decodePct != nil {
+		if pct := int(iv.decodePct.Load()); pct > 0 {
+			text = fmt.Sprintf(" decoding %d%% ", pct)
+		}
+	}
 	text = runewidth.Truncate(text, limit, "…")
 	// Phase counts from decodeStart (pinned when loading began), never from
 	// the frame clock, so the band cannot sit frozen at its first shape.

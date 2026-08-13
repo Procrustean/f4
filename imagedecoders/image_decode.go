@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	_ "image/gif"
 	_ "image/jpeg"
@@ -31,6 +32,10 @@ type ImageDecoder struct {
 	// DecodeCtx: cancellable decoders also get the path; some (the Windows
 	// shell) can only render from a real file.
 	DecodeCtx func(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, error)
+
+	// DecodeSize is an optional cheap downscale (the WIC scaler); the gallery
+	// uses it for tiles so a large picture never decodes whole.
+	DecodeSize func(ctx context.Context, path string, data []byte, w, h int) (*vtui.ImageSurface, error)
 
 	// FromPath marks a decoder that renders the file itself (the Windows
 	// shell), so the pipeline hands it the path without pulling the bytes in,
@@ -357,6 +362,31 @@ func DecodeImageContext(ctx context.Context, path string, data []byte) (*vtui.Im
 	return nil, "", lastErr
 }
 
+// DecodeImageContextSize is DecodeImageContext with an aspect-fit size hint;
+// the sized flag tells the caller whether a downscaling decoder was used.
+func DecodeImageContextSize(ctx context.Context, path string, data []byte, w, h int) (*vtui.ImageSurface, string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	decoders := imageDecoderCandidates(path)
+	if len(decoders) == 0 {
+		return nil, "", false, fmt.Errorf("no image decoder for %q", path)
+	}
+
+	var lastErr error
+	for _, d := range decoders {
+		surf, name, sized, err := decodeImageSize(d, ctx, path, data, w, h)
+		if err == nil {
+			return surf, name, sized, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no image decoder for %q", path)
+	}
+	return nil, "", false, lastErr
+}
+
 func decoderDisplayName(d ImageDecoder, data []byte) string {
 	if d.Label != nil {
 		if label := d.Label(data); label != "" {
@@ -369,9 +399,27 @@ func decoderDisplayName(d ImageDecoder, data []byte) string {
 var ErrEmptyDecoderResult = errors.New("empty decoder result")
 
 func decodeImage(d ImageDecoder, ctx context.Context, path string, data []byte) (*vtui.ImageSurface, string, error) {
-	surf, err := d.decode(ctx, path, data)
+	surf, name, _, err := decodeImageSize(d, ctx, path, data, 0, 0)
+	return surf, name, err
+}
+
+// decodeImageSize is decodeImage with a size hint: a decoder with a DecodeSize
+// path (the WIC scaler) shrinks while reading; the rest decode whole. The
+// sized flag reports which path ran.
+func decodeImageSize(d ImageDecoder, ctx context.Context, path string, data []byte, w, h int) (*vtui.ImageSurface, string, bool, error) {
+	var (
+		surf  *vtui.ImageSurface
+		err   error
+		sized bool
+	)
+	if w > 0 && h > 0 && d.DecodeSize != nil {
+		surf, err = d.DecodeSize(ctx, path, data, w, h)
+		sized = true
+	} else {
+		surf, err = d.decode(ctx, path, data)
+	}
 	surf, err = finishDecode(d, surf, err)
-	return surf, decoderDisplayName(d, data), err
+	return surf, decoderDisplayName(d, data), sized, err
 }
 
 // finishDecode rejects a decoder's empty answer and marks opaque surfaces so
@@ -575,6 +623,28 @@ func ImageDecoderRegistered(name string) bool {
 	return false
 }
 
+// Decode progress: the viewer shows a percentage while the toast is up. The
+// sink is an atomic counter carried through the context, so no decode
+// signature changes.
+type decodeProgressKey struct{}
+
+// WithDecodeProgress attaches a progress sink to a decode context; the WIC
+// decoder reports into it while copying pixels.
+func WithDecodeProgress(ctx context.Context, pct *atomic.Int32) context.Context {
+	if ctx == nil || pct == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, decodeProgressKey{}, pct)
+}
+
+func decodeProgressFrom(ctx context.Context) *atomic.Int32 {
+	if ctx == nil {
+		return nil
+	}
+	pct, _ := ctx.Value(decodeProgressKey{}).(*atomic.Int32)
+	return pct
+}
+
 // ApplyImageOrientation turns a decoded picture the way its EXIF orientation
 // prescribes. 1 (and unknown) returns the source untouched; 5-8 swap sides.
 // The result is a fresh, tightly packed surface.
@@ -617,6 +687,17 @@ func ApplyImageOrientation(src *vtui.ImageSurface, orient int) *vtui.ImageSurfac
 		}
 	}
 	return dst
+}
+
+// LoadImageForBytesSize decodes with an aspect-fit size hint; a decoder that
+// can shrink while reading (WIC) honours it, and the sized flag reports that
+// the result is not the full picture. A pinned decoder ignores the hint.
+func LoadImageForBytesSize(ctx context.Context, path string, data []byte, choice string, w, h int) (*vtui.ImageSurface, string, bool, error) {
+	if choice != "" {
+		surf, name, err := LoadImageForBytes(ctx, path, data, choice)
+		return surf, name, false, err
+	}
+	return DecodeImageContextSize(ctx, path, data, w, h)
 }
 
 func LoadImageForBytes(ctx context.Context, path string, data []byte, choice string) (*vtui.ImageSurface, string, error) {

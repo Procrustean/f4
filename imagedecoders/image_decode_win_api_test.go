@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -315,6 +316,22 @@ func TestWICReadsOrientationTag(t *testing.T) {
 	procPropVariantClear.Call(uintptr(unsafe.Pointer(&pv)))
 	if vt != vtUI2 || val != 6 {
 		t.Fatalf("orientation = vt=%#x val=%d, want vt=0x12 val=6", vt, val)
+	}
+}
+
+func TestWICDecodesWithProgress(t *testing.T) {
+	data := makeTestPNG(t, 40, 20, color.RGBA{R: 200, G: 100, B: 50, A: 255})
+	var pct atomic.Int32
+	ctx := WithDecodeProgress(context.Background(), &pct)
+	surf, err := decodeImageWIC(ctx, "a.png", data)
+	if err != nil {
+		t.Fatalf("WIC decode failed: %v", err)
+	}
+	if surf.Width != 40 || surf.Height != 20 {
+		t.Fatalf("geometry = %dx%d, want 40x20", surf.Width, surf.Height)
+	}
+	if got := pct.Load(); got != 100 {
+		t.Errorf("progress = %d%%, want 100%%", got)
 	}
 }
 

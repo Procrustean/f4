@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -255,6 +257,68 @@ func TestGalleryThumbnailBudgetNotExceededOnScreen(t *testing.T) {
 	}
 }
 
+// TestGalleryVideoTileNeverReadsBytesWhole locks in the video-tile guard:
+// a gallery tile for a video must go straight through the pipeline's guarded
+// load (shell renders the frame from the path) instead of handing the whole
+// container to a size decoder or converter, which is how the "too large"
+// refusal surfaced.
+func TestGalleryVideoTileNeverReadsBytesWhole(t *testing.T) {
+	// A size decoder that would eagerly claim mp4 if the guard slipped.
+	imagedecoders.RegisterImageDecoder(imagedecoders.ImageDecoder{
+		Name:       "test-video-size",
+		Priority:   5000,
+		Extensions: []string{"mp4"},
+		Decode: func(data []byte) (*vtui.ImageSurface, error) {
+			return imageTestSurface(1, 1), nil
+		},
+		DecodeSize: func(ctx context.Context, path string, data []byte, w, h int) (*vtui.ImageSurface, error) {
+			return imageTestSurface(w, h), nil
+		},
+	})
+	defer imagedecoders.UnregisterImageDecoder("test-video-size")
+	registerVideoPathDecoder(t, func(context.Context, string, []byte) (*vtui.ImageSurface, error) {
+		return imageTestSurface(2, 2), nil
+	})
+
+	v := &byteCacheVFS{data: make([]byte, 4096)}
+	p := NewImagePipeline()
+	p.dispatch = func(fn func()) { fn() } // answer on the calling thread
+	oldPipe := ImagePipe
+	ImagePipe = p
+	defer func() { ImagePipe = oldPipe }()
+
+	res := loadGalleryTile(context.Background(), v, "clip.mp4", 32, 32)
+	if res.Err != nil {
+		t.Fatalf("the video tile failed: %v", res.Err)
+	}
+	if v.opens != 0 || v.readAts != 0 {
+		t.Errorf("a video tile must never be read whole: %d opens, %d read-ats", v.opens, v.readAts)
+	}
+}
+
+// TestGalleryTileFallbackDownscales locks in the fallback-tile downscale: a
+// full decode for a tile is shrunk to tile size once, so the grid's draws
+// filter tiny pixels instead of the whole picture every frame.
+func TestGalleryTileFallbackDownscales(t *testing.T) {
+	v := &byteCacheVFS{data: make([]byte, 4096)}
+	p := newTestPipeline(func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		return imageTestSurface(64, 64), "stub", nil
+	})
+	oldPipe := ImagePipe
+	ImagePipe = p
+	defer func() { ImagePipe = oldPipe }()
+
+	res := loadGalleryTile(context.Background(), v, "a.png", 32, 32)
+	if res.Err != nil {
+		t.Fatalf("the tile failed: %v", res.Err)
+	}
+	if res.Surface == nil || res.Surface.Width != 32 || res.Surface.Height != 32 {
+		t.Fatalf("the tile must be shrunk to 32x32, got %dx%d", res.Surface.Width, res.Surface.Height)
+	}
+	if res.Decoder != "stub" {
+		t.Errorf("the decoder name must survive the downscale, got %q", res.Decoder)
+	}
+}
 func TestPanelSelectionByName(t *testing.T) {
 	fp := &FileSystemPanel{
 		entries: []*fileEntry{

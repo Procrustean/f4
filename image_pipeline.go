@@ -44,6 +44,10 @@ type ImageResult struct {
 	Preview bool
 	Err     error
 
+	// Sized records that the surface is a screen-sized decode, not the full
+	// picture, so the viewer knows to fetch the rest on a deep zoom.
+	Sized bool
+
 	// DecodeDur is decode time incl. file read; the info panel reports it.
 	DecodeDur time.Duration
 }

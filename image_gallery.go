@@ -423,7 +423,9 @@ func (iv *ImageView) galleryKey(e *vtinput.InputEvent) bool {
 	return false
 }
 
-// Built-ins decode whole; converters shrink while reading.
+// loadGalleryTile decodes one thumbnail off the drawing path: a decoder that
+// can shrink while reading (WIC) or a converter serves the tile without a
+// full decode; everything else decodes whole.
 func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) ImageResult {
 	if w < 1 {
 		w = (imageTileCols - 2) * imageViewFallbackCellW
@@ -432,17 +434,38 @@ func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) Imag
 		h = (imageTileRows - 2) * imageViewFallbackCellH
 	}
 	decoders := imagedecoders.ImageDecodersFor(path)
-	if len(decoders) == 0 || decoders[0].Name != imagedecoders.ExternalImageDecoder {
+	// A video renders only from a real path; never hand its bytes to a size
+	// decoder or converter, which would read the whole container. The
+	// pipeline's guarded load serves the frame and skips quietly.
+	if len(decoders) == 0 || imagedecoders.IsVideoFile(path) {
 		return ImagePipe.LoadTileSync(ctx, v, path)
 	}
-	surf, decoder, err := loadImageScaled(ctx, v, path, w, h)
-	if err != nil {
-		return ImagePipe.LoadTileSync(ctx, v, path)
+	if d := decoders[0]; d.DecodeSize != nil {
+		if data, err := ImagePipe.FileBytes(ctx, v, path); err == nil {
+			if surf, err := d.DecodeSize(ctx, path, data, w, h); err == nil && surf != nil && surf.Valid() {
+				return ImageResult{Path: path, Surface: surf, Decoder: d.Name}
+			}
+		}
 	}
-	return ImageResult{Path: path, Surface: surf, Decoder: decoder}
+	if decoders[0].Name == imagedecoders.ExternalImageDecoder {
+		surf, decoder, err := loadImageScaled(ctx, v, path, w, h)
+		if err != nil {
+			return ImagePipe.LoadTileSync(ctx, v, path)
+		}
+		return ImageResult{Path: path, Surface: surf, Decoder: decoder}
+	}
+	res := ImagePipe.LoadTileSync(ctx, v, path)
+	// A full decode for a tile happens once: downscale it for the grid.
+	if res.Surface.Valid() && (res.Surface.Width > w || res.Surface.Height > h) {
+		if tile := vtui.ScaleSurface(res.Surface, w, h); tile != nil {
+			return ImageResult{Path: path, Surface: tile, Decoder: res.Decoder}
+		}
+	}
+	return res
 }
 
-// shrink-while-reading: never a full decode of RAW/AVIF for a tile.
+// loadImageScaled lets a converter shrink RAW/AVIF while reading: never a
+// full decode for a tile.
 func loadImageScaled(ctx context.Context, v vfs.VFS, path string, w, h int) (*vtui.ImageSurface, string, error) {
 	data, err := ImagePipe.FileBytes(ctx, v, path)
 	if err != nil {

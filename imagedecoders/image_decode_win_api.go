@@ -629,7 +629,7 @@ func decodeSingleFrame(ctx context.Context, factory, decoder uintptr, tw, th int
 	if surf == nil {
 		return nil, fmt.Errorf("unsupported geometry %dx%d", w, h)
 	}
-	if err := wicCopyPixels(ctx, src, int(w), int(h), surf, nil); err != nil {
+	if err := wicCopyPixels(ctx, src, int(w), int(h), surf, decodeProgressFrom(ctx)); err != nil {
 		return nil, err
 	}
 	if swap {
@@ -977,7 +977,8 @@ func init() {
 		Name:       "wic",
 		Priority:   100,
 		Extensions: wicImageExtensions,
-		DecodeCtx: decodeImageWIC,
+		DecodeCtx:  decodeImageWIC,
+		DecodeSize: decodeImageWICSize,
 	})
 	// "shell" is the registry key; the interface shows "Shell"
 	// (IShellItemImageFactory). FromPath: the shell renders the real file
