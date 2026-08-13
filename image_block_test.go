@@ -433,6 +433,79 @@ func BenchmarkBlockRedrawStatic(b *testing.B) {
 	}
 }
 
+// TestBlockVerticalPanMatchesFreshRender locks in the hMemo path: a
+// vertical-only pan must reuse the horizontal pass without corrupting the
+// vertical pass output, so the cells equal what a fresh renderer produces.
+// The placement is zoomed past blockWorkMaxZoom so the working copy stands
+// aside and this fallback path is what runs.
+func TestBlockVerticalPanMatchesFreshRender(t *testing.T) {
+	surf := newBenchSurface(96, 96)
+	scr := newBlockTestScreen(t)
+	r := &blockRender{}
+	for sy := 0; sy < 48; sy += 7 {
+		p := vtui.ImagePlacement{Surface: surf, Cols: 24, Rows: 8,
+			SrcX: 0, SrcY: sy, SrcW: 20, SrcH: 10}
+		r.draw(scr, p, blockImageBack)
+		assertFreshDraw(t, r, scr, p)
+	}
+}
+
+// assertFreshDraw compares one draw with a fresh renderer's, cell by cell.
+func assertFreshDraw(t *testing.T, r *blockRender, scr *vtui.ScreenBuf, p vtui.ImagePlacement) {
+	t.Helper()
+	fresh := &blockRender{}
+	freshScr := newBlockTestScreen(t)
+	fresh.draw(freshScr, p, blockImageBack)
+	for y := 0; y < p.Rows; y++ {
+		for x := 0; x < p.Cols; x++ {
+			if got, want := scr.GetCell(x, y), freshScr.GetCell(x, y); got != want {
+				t.Fatalf("cell %d,%d: %+v != fresh %+v (SrcX=%d SrcY=%d)", x, y, got, want, p.SrcX, p.SrcY)
+			}
+		}
+	}
+}
+
+// TestBlockWorkCopyMatchesFreshWhenAligned: when the pan lands on the working
+// copy's grid (every second source pixel here, one destination column being
+// two source pixels), the cut equals a fresh render cell by cell.
+func TestBlockWorkCopyMatchesFreshWhenAligned(t *testing.T) {
+	surf := newBenchSurface(96, 96)
+	r := &blockRender{}
+	scr := newBlockTestScreen(t)
+	for sx := 0; sx <= 40; sx += 2 {
+		p := vtui.ImagePlacement{Surface: surf, Cols: 24, Rows: 8,
+			SrcX: sx, SrcY: 0, SrcW: 48, SrcH: 24}
+		r.draw(scr, p, blockImageBack)
+		assertFreshDraw(t, r, scr, p)
+	}
+}
+
+// TestBlockWorkCopySnapsPansToGrid locks in the working copy's approximation:
+// a pan that stays inside one work cell (half a destination column) leaves
+// the output untouched, because the cut snaps to the copy's grid.
+func TestBlockWorkCopySnapsPansToGrid(t *testing.T) {
+	surf := newBenchSurface(96, 96)
+	r := &blockRender{}
+	scr := newBlockTestScreen(t)
+	drawAt := func(sx int) []vtui.CharInfo {
+		r.draw(scr, vtui.ImagePlacement{Surface: surf, Cols: 24, Rows: 8,
+			SrcX: sx, SrcY: 0, SrcW: 48, SrcH: 24}, blockImageBack)
+		out := make([]vtui.CharInfo, 24*8)
+		for y := 0; y < 8; y++ {
+			for x := 0; x < 24; x++ {
+				out[y*24+x] = scr.GetCell(x, y)
+			}
+		}
+		return out
+	}
+	a, b := drawAt(1), drawAt(2) // both round to the same work column
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("pan within a work cell changed cell %d: %+v != %+v", i, a[i], b[i])
+		}
+	}
+}
+
 // countingWriter counts payload bytes written through the ANSI renderer.
 type countingWriter struct{ n int }
 
