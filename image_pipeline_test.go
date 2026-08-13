@@ -395,6 +395,46 @@ func TestImagePipelineLoadSyncHonoursCancellation(t *testing.T) {
 	}
 }
 
+// registerVideoPathDecoder registers a path-rendering mp4 decoder whose
+// DecodeCtx is fn. Its priority sits above the Windows shell (1000), so the
+// fake chain is what the video guards see on every platform.
+func registerVideoPathDecoder(t *testing.T, fn func(context.Context, string, []byte) (*vtui.ImageSurface, error)) {
+	t.Helper()
+	imagedecoders.RegisterImageDecoder(imagedecoders.ImageDecoder{
+		Name:       "test-video-path",
+		Priority:   4000,
+		Extensions: []string{"mp4"},
+		FromPath:   true,
+		DecodeCtx:  fn,
+	})
+	t.Cleanup(func() { imagedecoders.UnregisterImageDecoder("test-video-path") })
+}
+
+// TestImagePipelineVideoNeverReadsBytesWhole locks in the video-preview
+// fix: when the only decoder for a video renders from a real path (the
+// Windows shell) and that decode fails — a virtual file system has no path
+// to render — the pipeline must not fall back to reading the whole file,
+// which is how the "too large" refusal surfaced.
+func TestImagePipelineVideoNeverReadsBytesWhole(t *testing.T) {
+	registerVideoPathDecoder(t, func(context.Context, string, []byte) (*vtui.ImageSurface, error) {
+		return nil, errors.New("no real path to render")
+	})
+
+	v := &byteCacheVFS{data: make([]byte, 4096)}
+	p := newTestPipeline(nil)
+
+	surf, _, err := p.loadWithCache(context.Background(), v, "clip.mp4")
+	if !errors.Is(err, imagedecoders.ErrVideoPreviewUnavailable) {
+		t.Fatalf("the failing path decode must be the quiet video refusal, got %v", err)
+	}
+	if surf != nil {
+		t.Error("no surface may come out of a failed decode")
+	}
+	if v.opens != 0 || v.readAts != 0 {
+		t.Errorf("a video must never be read whole for a frame: %d opens, %d read-ats", v.opens, v.readAts)
+	}
+}
+
 func TestImageNeighbourhood(t *testing.T) {
 	paths := []string{"0", "1", "2", "3", "4"}
 

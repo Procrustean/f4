@@ -733,7 +733,14 @@ func (q *QuickViewPanel) refreshCache(key quickViewSelectionKey, path string, it
 	}
 	q.cancelScan()
 
-	if imagedecoders.IsImageFile(path) {
+	// A video container is previewed through the Windows shell decoder, which
+	// renders its single frame from the real file without reading the bytes.
+	// Past VideoPreviewMaxSize the frame is not worth it (and an unknown,
+	// size <= 0, video is not worth the attempt on a virtual file system), so
+	// the file gets the ordinary text/hex preview instead of a "too large"
+	// refusal.
+	skipVideoPreview := imagedecoders.IsVideoFile(path) && (item.Size <= 0 || item.Size > imagedecoders.VideoPreviewMaxSize)
+	if imagedecoders.IsImageFile(path) && !skipVideoPreview {
 		q.cacheImage = true
 		gen := q.imageLoadGen
 		source := q.src.vfs

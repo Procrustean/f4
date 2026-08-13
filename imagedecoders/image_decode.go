@@ -28,9 +28,14 @@ type ImageDecoder struct {
 	Extensions []string
 	Decode     func(data []byte) (*vtui.ImageSurface, error)
 
-	// DecodeCtx: process-leaving decoders can be cancelled mid-decode; the
-	// path lets a decoder render a real file itself.
+	// DecodeCtx: cancellable decoders also get the path; some (the Windows
+	// shell) can only render from a real file.
 	DecodeCtx func(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, error)
+
+	// FromPath marks a decoder that renders the file itself (the Windows
+	// shell), so the pipeline hands it the path without pulling the bytes in,
+	// which keeps a video larger than the byte cap decodable.
+	FromPath bool
 
 	// Label names the external tool in the interface.
 	Label func(data []byte) string
@@ -221,6 +226,11 @@ func imageDecoderCandidates(path string) []ImageDecoder {
 	if len(claimed) == 0 {
 		return nil
 	}
+	// A video belongs to the shell alone: only path-rendering decoders can
+	// read a movie, so the rest are dropped.
+	if IsVideoFile(path) {
+		return pathDecodersOnly(claimed)
+	}
 	seen := make(map[string]struct{}, len(claimed))
 	var external ImageDecoder
 	hasExternal := false
@@ -269,6 +279,53 @@ func ImageDecodersFor(path string) []ImageDecoder {
 
 func IsImageFile(path string) bool {
 	return len(ImageDecodersFor(path)) > 0
+}
+
+// VideoFileExtensions are the containers the shell decoder pulls a single
+// frame from. They are video, not pictures: a preview must not read a whole
+// (possibly multi-gigabyte) movie into memory.
+var VideoFileExtensions = []string{
+	"mp4", "mkv", "avi", "webm", "mov", "wmv", "flv", "m4v",
+	"mpg", "mpeg", "3gp", "ts", "mts", "m2ts",
+}
+
+// VideoPreviewMaxSize bounds how large a video may be for its preview. The
+// shell renders from the real file, so the cap only guards against stalling
+// on a gigantic container. Past it, the preview is skipped quietly.
+const VideoPreviewMaxSize int64 = 1 << 30
+
+// IsVideoFile reports whether the path names a video container. The viewer
+// can still open one (the shell shows a single frame), but the QuickView and
+// the gallery skip them.
+func IsVideoFile(path string) bool {
+	ext := ImageExtension(path)
+	for _, e := range VideoFileExtensions {
+		if e == ext {
+			return true
+		}
+	}
+	return false
+}
+
+// PathDecoderFor returns the first decoder that claims the extension and
+// renders the file itself (the shell), so the pipeline can skip the read.
+func PathDecoderFor(path string) (ImageDecoder, bool) {
+	for _, d := range imageDecodersForExtension(path) {
+		if d.FromPath {
+			return d, true
+		}
+	}
+	return ImageDecoder{}, false
+}
+
+// ErrVideoPreviewUnavailable is the quiet refusal for a video whose frame
+// cannot be rendered (a virtual file system has no real path for the shell).
+var ErrVideoPreviewUnavailable = errors.New("video preview unavailable")
+
+// DecodeImageFromPath runs one path-rendering decoder (the shell) over the
+// real file; no bytes are read into memory.
+func DecodeImageFromPath(ctx context.Context, path string, d ImageDecoder) (*vtui.ImageSurface, string, error) {
+	return decodeImage(d, ctx, path, nil)
 }
 
 // Extension-claiming decoders first, the rest as fallbacks; a name nobody
@@ -452,9 +509,25 @@ func ImageDecoderChoices(path string) []ImageDecoderChoice {
 
 // ImageCycleDecoders is what the F4 cycle offers: the extension claimants in
 // priority order (sniffing fallbacks would only land the cycle on a decoder
-// that cannot read the picture).
+// that cannot read the picture). A video offers only its path decoder.
 func ImageCycleDecoders(path string) []ImageDecoder {
-	return imageDecodersForExtension(path)
+	decoders := imageDecodersForExtension(path)
+	if !IsVideoFile(path) {
+		return decoders
+	}
+	return pathDecodersOnly(decoders)
+}
+
+// pathDecodersOnly keeps the decoders that render the file itself; the rest
+// cannot read a container (a video) from its bytes.
+func pathDecodersOnly(decoders []ImageDecoder) []ImageDecoder {
+	out := make([]ImageDecoder, 0, len(decoders))
+	for _, d := range decoders {
+		if d.FromPath {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func ImageNextDecoder(opts []ImageDecoderChoice, req, current string) string {
@@ -500,6 +573,50 @@ func ImageDecoderRegistered(name string) bool {
 		}
 	}
 	return false
+}
+
+// ApplyImageOrientation turns a decoded picture the way its EXIF orientation
+// prescribes. 1 (and unknown) returns the source untouched; 5-8 swap sides.
+// The result is a fresh, tightly packed surface.
+func ApplyImageOrientation(src *vtui.ImageSurface, orient int) *vtui.ImageSurface {
+	if src == nil || !src.Valid() || orient < 2 || orient > 8 {
+		return src
+	}
+	w, h := src.Width, src.Height
+	dstW, dstH := w, h
+	if orient >= 5 {
+		dstW, dstH = h, w
+	}
+	dst := vtui.NewImageSurface(dstW, dstH)
+	if dst == nil {
+		return src
+	}
+	dst.Opaque = src.Opaque
+	for y := 0; y < h; y++ {
+		srow := y * src.Stride
+		for x := 0; x < w; x++ {
+			var sx, sy int
+			switch orient {
+			case 2:
+				sx, sy = w-1-x, y
+			case 3:
+				sx, sy = w-1-x, h-1-y
+			case 4:
+				sx, sy = x, h-1-y
+			case 5: // transpose
+				sx, sy = y, x
+			case 6: // 90 CW
+				sx, sy = h-1-y, x
+			case 7: // transverse
+				sx, sy = h-1-y, w-1-x
+			case 8: // 270 CW
+				sx, sy = y, w-1-x
+			}
+			d := sy*dst.Stride + sx*4
+			copy(dst.Pix[d:d+4], src.Pix[srow+x*4:srow+x*4+4])
+		}
+	}
+	return dst
 }
 
 func LoadImageForBytes(ctx context.Context, path string, data []byte, choice string) (*vtui.ImageSurface, string, error) {

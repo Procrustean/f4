@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/unxed/f4/imagedecoders"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
@@ -132,6 +134,76 @@ func TestQuickView_TextFilePreview(t *testing.T) {
 	}
 	if !strings.Contains(q.cacheLines[0], "first line") {
 		t.Errorf("first cached line %q should contain 'first line'", q.cacheLines[0])
+	}
+}
+
+// TestQuickView_VideoPreviewRespectsSizeLimit verifies the video preview
+// gate: a video file within VideoPreviewMaxSize keeps its image preview, one
+// past the limit falls back to the ordinary text/hex preview instead of
+// attempting a read that would be refused as too large. A registered
+// path-rendering mp4 decoder makes the test behave on every platform, like
+// the Windows shell does on Windows.
+func TestQuickView_VideoPreviewRespectsSizeLimit(t *testing.T) {
+	scr := vtui.NewSilentScreenBuf()
+	scr.AllocBuf(80, 25)
+	vtui.FrameManager.Init(scr)
+	vtui.SetDefaultPalette()
+
+	registerVideoPathDecoder(t, func(context.Context, string, []byte) (*vtui.ImageSurface, error) {
+		return vtui.NewImageSurface(2, 2), nil
+	})
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "clip.mp4"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	small := NewFileSystemPanel(0, 0, 40, 20, vfs.NewOSVFS(tmp))
+	small.entries = []*fileEntry{
+		{VFSItem: vfs.VFSItem{Name: "..", IsDir: true}},
+		{VFSItem: vfs.VFSItem{Name: "clip.mp4", Size: 1024}},
+	}
+	small.cursorIdx = 1
+	small.Refresh()
+
+	q := NewQuickViewPanel(small)
+	q.SetPosition(0, 0, 39, 19)
+	q.Show(scr) // triggers refreshCache
+	if !q.cacheImage {
+		t.Error("a small video must keep its image preview")
+	}
+
+	huge := NewFileSystemPanel(0, 0, 40, 20, vfs.NewOSVFS(tmp))
+	huge.entries = []*fileEntry{
+		{VFSItem: vfs.VFSItem{Name: "..", IsDir: true}},
+		{VFSItem: vfs.VFSItem{Name: "clip.mp4", Size: imagedecoders.VideoPreviewMaxSize + 1}},
+	}
+	huge.cursorIdx = 1
+	huge.Refresh()
+
+	q2 := NewQuickViewPanel(huge)
+	q2.SetPosition(0, 0, 39, 19)
+	q2.Show(scr)
+	if q2.cacheImage {
+		t.Error("a video past VideoPreviewMaxSize must not be previewed as an image")
+	}
+
+	// An unknown-size video (a virtual file system may report 0) is not
+	// worth attempting either: the shell could not render it from a real
+	// path, and reading it whole would trip the too-large refusal.
+	unknown := NewFileSystemPanel(0, 0, 40, 20, vfs.NewOSVFS(tmp))
+	unknown.entries = []*fileEntry{
+		{VFSItem: vfs.VFSItem{Name: "..", IsDir: true}},
+		{VFSItem: vfs.VFSItem{Name: "clip.mp4", Size: 0}},
+	}
+	unknown.cursorIdx = 1
+	unknown.Refresh()
+
+	q3 := NewQuickViewPanel(unknown)
+	q3.SetPosition(0, 0, 39, 19)
+	q3.Show(scr)
+	if q3.cacheImage {
+		t.Error("a video of unknown size must not be previewed as an image")
 	}
 }
 

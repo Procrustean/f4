@@ -1253,8 +1253,12 @@ func tryOpenImageViewer(pf *PanelsFrame, v vfs.VFS, path string) bool {
 		iv, err := NewImageView(ctx.Context, v, path)
 		ctx.RunOnUI(func() {
 			if err != nil {
-				vtui.DebugLog("IMAGE: failed to open %s: %v", path, err)
-				vtui.ShowMessage(" Error ", fmt.Sprintf("Failed to open image:\n%v", err), []string{"&Ok"})
+				// The extension said "image" but no decoder could read it: a
+				// mislabelled file, a video the shell cannot render, a
+				// corrupt container. Hand it to the ordinary viewer so the
+				// bytes stay viewable instead of an error dialog.
+				vtui.DebugLog("IMAGE: %s is not decodable, falling back to the viewer: %v", path, err)
+				openTextViewerInternal(pf, v, path)
 				return
 			}
 			iv.SetSiblings(siblings, index)
@@ -1305,6 +1309,14 @@ func openViewerInternal(pf *PanelsFrame, v vfs.VFS, path string) {
 	if tryOpenImageViewer(pf, v, path) {
 		return
 	}
+	openTextViewerInternal(pf, v, path)
+}
+
+// openTextViewerInternal opens the ordinary text/hex viewer: the local fast
+// path for a real file, and the progress-gated path for a remote one. It is
+// also the fallback the picture viewer lands on when a file that merely
+// looks like an image cannot be decoded by any decoder.
+func openTextViewerInternal(pf *PanelsFrame, v vfs.VFS, path string) {
 	if isLocalOSVFS(v) {
 		vtui.RunAsync(func(ctx *vtui.TaskContext) {
 			if v != nil {

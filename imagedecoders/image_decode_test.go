@@ -2,6 +2,7 @@ package imagedecoders
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -48,6 +49,101 @@ func TestImageExtensionDetection(t *testing.T) {
 	}
 }
 
+func TestIsVideoFile(t *testing.T) {
+	for _, path := range []string{"clip.mp4", "CLIP.MKV", "a/b/movie.avi", "webm.webm", "c:\\v\\x.mov", "film.ts", "3gp.3gp"} {
+		if !IsVideoFile(path) {
+			t.Errorf("%q: expected a video file, got false", path)
+		}
+	}
+	for _, path := range []string{"photo.jpg", "shot.png", "icon.ico", "vector.svg", "notes.txt", "noextension"} {
+		if IsVideoFile(path) {
+			t.Errorf("%q: expected a non-video file, got true", path)
+		}
+	}
+}
+
+// A video file must be served by its path-rendering decoder (the shell)
+// alone: no WIC, stdlib or external fallback may claim a movie, in the
+// automatic chain or in the F4 cycle.
+func TestVideoFilesOnlyUsePathRenderingDecoders(t *testing.T) {
+	saved := imageDecoders
+	imageDecoders = nil
+	t.Cleanup(func() { imageDecoders = saved })
+
+	RegisterImageDecoder(ImageDecoder{
+		Name:       "test-vid-path",
+		Priority:   100,
+		Extensions: []string{"mp4"},
+		FromPath:   true,
+		DecodeCtx: func(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, error) {
+			return nil, nil
+		},
+	})
+	RegisterImageDecoder(ImageDecoder{
+		Name:       "test-vid-bytes",
+		Priority:   50,
+		Extensions: []string{"mp4"},
+		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
+	})
+	RegisterImageDecoder(ImageDecoder{
+		Name:       "test-png",
+		Priority:   10,
+		Extensions: []string{"png"},
+		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
+	})
+
+	cands := imageDecoderCandidates("clip.mp4")
+	if len(cands) != 1 || cands[0].Name != "test-vid-path" {
+		t.Fatalf("video candidates = %v, want only the path-rendering decoder", cands)
+	}
+	cycle := ImageCycleDecoders("clip.mp4")
+	if len(cycle) != 1 || cycle[0].Name != "test-vid-path" {
+		t.Fatalf("video cycle = %v, want only the path-rendering decoder", cycle)
+	}
+	// A picture keeps its full chain: the claimed decoder plus the fallbacks.
+	if got := imageDecoderCandidates("a.png"); len(got) < 2 {
+		t.Fatalf("a picture's chain shrank to %v", got)
+	}
+}
+
+// PathDecoderFor must pick a decoder marked FromPath when one claims the
+// extension, and nothing for a format nobody renders from its path.
+func TestPathDecoderFor(t *testing.T) {
+	saved := imageDecoders
+	t.Cleanup(func() { imageDecoders = saved })
+
+	RegisterImageDecoder(ImageDecoder{
+		Name:       "test-path",
+		Priority:   50,
+		Extensions: []string{"xyz"},
+		FromPath:   true,
+		DecodeCtx: func(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, error) {
+			return vtui.NewImageSurface(2, 2), nil
+		},
+	})
+	RegisterImageDecoder(ImageDecoder{
+		Name:       "test-bytes",
+		Priority:   100,
+		Extensions: []string{"abc"},
+		Decode:     func(data []byte) (*vtui.ImageSurface, error) { return nil, nil },
+	})
+
+	d, ok := PathDecoderFor("a.xyz")
+	if !ok || d.Name != "test-path" {
+		t.Fatalf("PathDecoderFor(a.xyz) = %q %v, want test-path", d.Name, ok)
+	}
+	surf, name, err := DecodeImageFromPath(context.Background(), "a.xyz", d)
+	if err != nil || name != "test-path" || surf == nil || surf.Width != 2 {
+		t.Fatalf("DecodeImageFromPath = %q %v %v", name, surf, err)
+	}
+	if _, ok := PathDecoderFor("a.abc"); ok {
+		t.Error("a byte-rendering decoder must not be picked as a path decoder")
+	}
+	if _, ok := PathDecoderFor("a.png"); ok {
+		t.Error("a format with no path decoder must not resolve to one")
+	}
+}
+
 func TestDecodeImagePNG(t *testing.T) {
 	data := makeTestPNG(t, 5, 3, color.RGBA{R: 10, G: 20, B: 30, A: 255})
 
@@ -55,7 +151,8 @@ func TestDecodeImagePNG(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decoding failed: %v", err)
 	}
-	if name != "go-std" {
+	// WIC wins on Windows, the stdlib everywhere else.
+	if name != "go-std" && name != "wic" {
 		t.Errorf("unexpected decoder %q", name)
 	}
 	if surf.Width != 5 || surf.Height != 3 {
@@ -514,7 +611,10 @@ func TestDecodeImageFallsBackWhenTheExtensionLies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the fallback decoder should have succeeded: %v", err)
 	}
-	if name != "go-std" || surf.Width != 2 {
+	if name == "test-broken" {
+		t.Errorf("the broken decoder must not win: %q", name)
+	}
+	if surf.Width != 2 {
 		t.Errorf("got %q %v", name, surf)
 	}
 }
@@ -632,6 +732,66 @@ func TestSurfaceIsOpaqueHonorsStride(t *testing.T) {
 	surf := vtui.NewImageSurfaceFromPix(1, 2, 8, pix)
 	if !surfaceIsOpaque(surf) {
 		t.Error("padding bytes must not be treated as pixels")
+	}
+}
+
+// orientedSurface builds a 3x2 surface whose pixel values encode their
+// coordinates, so a reorientation is easy to verify point by point.
+func orientedSurface() *vtui.ImageSurface {
+	surf := vtui.NewImageSurface(3, 2)
+	for y := 0; y < 2; y++ {
+		for x := 0; x < 3; x++ {
+			o := y*surf.Stride + x*4
+			surf.Pix[o], surf.Pix[o+1], surf.Pix[o+2], surf.Pix[o+3] = byte(10+x), byte(20+y), 0, 255
+		}
+	}
+	return surf
+}
+
+func TestApplyImageOrientation(t *testing.T) {
+	src := orientedSurface()
+	src.Opaque = true
+
+	// Orientation 1 (and anything out of range) must return the surface itself.
+	if got := ApplyImageOrientation(src, 1); got != src {
+		t.Fatal("orientation 1 must leave the surface untouched")
+	}
+	if got := ApplyImageOrientation(src, 0); got != src {
+		t.Fatal("orientation 0 must leave the surface untouched")
+	}
+
+	// Each orientation maps (x,y) onto (sx,sy); 5-8 swap the sides.
+	cases := []struct {
+		orient int
+		w, h   int
+		sx, sy func(x, y int) int
+	}{
+		{2, 3, 2, func(x, y int) int { return 2 - x }, func(x, y int) int { return y }},
+		{3, 3, 2, func(x, y int) int { return 2 - x }, func(x, y int) int { return 1 - y }},
+		{4, 3, 2, func(x, y int) int { return x }, func(x, y int) int { return 1 - y }},
+		{5, 2, 3, func(x, y int) int { return y }, func(x, y int) int { return x }},
+		{6, 2, 3, func(x, y int) int { return 1 - y }, func(x, y int) int { return x }},
+		{7, 2, 3, func(x, y int) int { return 1 - y }, func(x, y int) int { return 2 - x }},
+		{8, 2, 3, func(x, y int) int { return y }, func(x, y int) int { return 2 - x }},
+	}
+	for _, tc := range cases {
+		r := ApplyImageOrientation(src, tc.orient)
+		if r.Width != tc.w || r.Height != tc.h {
+			t.Errorf("orientation %d geometry = %dx%d, want %dx%d", tc.orient, r.Width, r.Height, tc.w, tc.h)
+			continue
+		}
+		if !r.Opaque {
+			t.Errorf("orientation %d lost the opaque flag", tc.orient)
+		}
+		for y := 0; y < 2; y++ {
+			for x := 0; x < 3; x++ {
+				rr, gg, _, aa := r.PixelAt(tc.sx(x, y), tc.sy(x, y))
+				r0, g0, _, a0 := src.PixelAt(x, y)
+				if rr != r0 || gg != g0 || aa != a0 {
+					t.Errorf("orientation %d: (%d,%d) -> got %d,%d,%d want %d,%d,%d", tc.orient, x, y, rr, gg, aa, r0, g0, a0)
+				}
+			}
+		}
 	}
 }
 

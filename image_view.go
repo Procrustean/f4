@@ -368,16 +368,39 @@ func (iv *ImageView) openPinned(gen uint64, path, dec string) {
 	v := iv.vfs
 	iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 		start := time.Now()
-		data, err := ImagePipe.FileBytes(ctx.Context, v, path)
 		pinned := false
 		var surf *vtui.ImageSurface
 		var decoder string
-		if err == nil {
-			surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, dec)
-			pinned = err == nil
-			if err != nil {
-				start = time.Now()
-				surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, "")
+		var err error
+		// A path-rendering decoder (the shell) reads the real file itself;
+		// a video must not be pulled into memory just to hand over its path.
+		// The pin sticks only when it names this decoder.
+		if d, ok := imagedecoders.PathDecoderFor(path); ok {
+			surf, decoder, err = imagedecoders.DecodeImageFromPath(ctx.Context, path, d)
+			switch {
+			case err == nil && (dec == "" || dec == d.Name):
+				pinned = true
+			case err == nil:
+				surf, decoder, err = nil, "", nil // honour a different pin below
+			case imagedecoders.IsVideoFile(path):
+				err = imagedecoders.ErrVideoPreviewUnavailable // no real path
+			default:
+				surf, decoder, err = nil, "", nil // fall through to the bytes
+			}
+		}
+		if surf == nil && err == nil {
+			// Read the bytes and let the pinned decoder (automatic chain as
+			// fallback) have them.
+			data, derr := ImagePipe.FileBytes(ctx.Context, v, path)
+			if derr != nil {
+				err = derr
+			} else {
+				surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, dec)
+				pinned = err == nil
+				if err != nil {
+					start = time.Now()
+					surf, decoder, err = imagedecoders.LoadImageForBytes(ctx.Context, path, data, "")
+				}
 			}
 		}
 		res := ImageResult{Path: path, Surface: surf, Decoder: decoder, Err: err, DecodeDur: time.Since(start)}

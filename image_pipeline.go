@@ -159,6 +159,20 @@ func (p *ImagePipeline) previewWithCache(ctx context.Context, v vfs.VFS, path st
 // loadWithCache decodes through the byte cache, so a picture decoded once is
 // not transferred again.
 func (p *ImagePipeline) loadWithCache(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+	// A path-rendering decoder (the shell) needs no bytes; reading a video
+	// into memory to hand over its path would trip the byte cap. The shell
+	// resolves a real local file; anything else falls through to the bytes.
+	if d, ok := imagedecoders.PathDecoderFor(path); ok {
+		if surf, name, err := imagedecoders.DecodeImageFromPath(ctx, path, d); err == nil {
+			return surf, name, nil
+		}
+		// The shell failed (a virtual FS has no real path). Don't read a
+		// video whole for a frame — that's how the "too large" refusal
+		// surfaced — just skip its preview quietly.
+		if imagedecoders.IsVideoFile(path) {
+			return nil, "", imagedecoders.ErrVideoPreviewUnavailable
+		}
+	}
 	data, err := p.FileBytes(ctx, v, path)
 	if err != nil {
 		return nil, "", err
