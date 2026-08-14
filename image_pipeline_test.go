@@ -81,7 +81,7 @@ func TestImagePipelineEvictsTheOldest(t *testing.T) {
 		return imageTestSurface(100, 100), "stub", nil
 	})
 	// Room for two pictures of forty thousand bytes each.
-	p.limit = 90000
+	p.surfaceCache.limit = 90000
 
 	for _, name := range []string{"a", "b", "c"} {
 		if res := p.LoadSync(context.Background(), nil, name); res.Err != nil {
@@ -105,7 +105,7 @@ func TestImagePipelineKeepsTheNewestPictureHoweverLarge(t *testing.T) {
 	p := newTestPipeline(func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 		return imageTestSurface(100, 100), "stub", nil
 	})
-	p.limit = 1
+	p.surfaceCache.limit = 1
 
 	if res := p.LoadSync(context.Background(), nil, "a"); res.Err != nil {
 		t.Fatalf("decoding failed: %v", res.Err)
@@ -233,7 +233,7 @@ func TestImagePipelinePreviewPrefetch(t *testing.T) {
 	if running != 0 {
 		t.Errorf("%d preview jobs are still running", running)
 	}
-	if _, ok := p.previews[imageCacheKey{Path: "far1"}]; !ok {
+	if _, ok := p.previews.peek(imageCacheKey{Path: "far1"}); !ok {
 		t.Error("the extracted thumbnail must be remembered")
 	}
 }

@@ -101,12 +101,7 @@ type imageLoader func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageS
 
 // ImagePipeline decodes pictures in the background and caches the results.
 type ImagePipeline struct {
-	mu    sync.Mutex
-	cache map[imageCacheKey]*imageEntry
-	lru   []imageCacheKey
-	bytes int64
-	limit int64
-
+	mu      sync.Mutex
 	jobs    map[imageCacheKey]*imageJob
 	queue   []*imageJob
 	busy    int
@@ -116,17 +111,18 @@ type ImagePipeline struct {
 	// pass imageMaxPrefetch.
 	busyPrefetch int
 
-	previews     map[imageCacheKey]ImageResult
-	previewOrder []imageCacheKey
+	// surfaceCache holds decoded pixels, bounded by bytes.
+	surfaceCache *imageLRU[imageCacheKey, *imageEntry]
+	// previews holds embedded thumbnails, bounded by count.
+	previews *imageLRU[imageCacheKey, ImageResult]
 	// previewJobs are cancellable thumbnail extractions.
 	previewJobs map[imageCacheKey]*imagePreviewJob
 
 	// bytesCache shares one transfer between preview and full decode.
-	bytesCache map[imageCacheKey][]byte
+	bytesCache *imageLRU[imageCacheKey, []byte]
 	bytesJobs  map[imageCacheKey]*imageBytesJob
 	bytesGen   uint64
-	bytesOrder []imageCacheKey
-	bytesSize  int
+	clearGen   uint64
 
 	load     imageLoader
 	preview  imageLoader
@@ -138,13 +134,13 @@ var ImagePipe = NewImagePipeline()
 
 func NewImagePipeline() *ImagePipeline {
 	p := &ImagePipeline{
-		cache:     make(map[imageCacheKey]*imageEntry),
-		jobs:      make(map[imageCacheKey]*imageJob),
-		limit:     imageCacheLimit,
-		workers:   imageWorkers,
-		previews:  make(map[imageCacheKey]ImageResult),
-		bytesJobs: make(map[imageCacheKey]*imageBytesJob),
-		dispatch:  func(fn func()) { vtui.FrameManager.PostTask(fn) },
+		jobs:         make(map[imageCacheKey]*imageJob),
+		workers:      imageWorkers,
+		surfaceCache: newImageLRU[imageCacheKey, *imageEntry](imageCacheLimit, func(e *imageEntry) int64 { return e.bytes }),
+		previews:     newImageLRU[imageCacheKey, ImageResult](imagePreviewCacheLimit, nil),
+		bytesCache:   newImageLRU[imageCacheKey, []byte](imageBytesCacheLimit, func(d []byte) int64 { return int64(len(d)) }),
+		bytesJobs:    make(map[imageCacheKey]*imageBytesJob),
+		dispatch:     func(fn func()) { vtui.FrameManager.PostTask(fn) },
 	}
 	p.load = p.loadWithCache
 	p.preview = p.previewWithCache
@@ -203,11 +199,10 @@ func (p *ImagePipeline) Cached(v vfs.VFS, path string) (ImageResult, bool) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	entry, ok := p.cache[key]
+	entry, ok := p.surfaceCache.get(key)
 	if !ok {
 		return ImageResult{}, false
 	}
-	p.touch(key)
 	return entry.res, true
 }
 
@@ -223,7 +218,7 @@ func (p *ImagePipeline) PreviewSync(ctx context.Context, v vfs.VFS, path string)
 	key := imageCacheKey{Source: imageSource(v), Path: path}
 
 	p.mu.Lock()
-	res, ok := p.previews[key]
+	res, ok := p.previews.get(key)
 	p.mu.Unlock()
 	if ok {
 		return res, true
@@ -236,7 +231,7 @@ func (p *ImagePipeline) PreviewSync(ctx context.Context, v vfs.VFS, path string)
 	res = ImageResult{Path: path, Surface: surf, Decoder: decoder, Preview: true}
 
 	p.mu.Lock()
-	p.storePreview(key, res)
+	p.previews.put(key, res)
 	p.mu.Unlock()
 	return res, true
 }
@@ -264,10 +259,13 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	p.mu.Unlock()
 
 	for _, path := range paths {
+		if imagedec.IsVideoFile(path) {
+			continue
+		}
 		key := imageCacheKey{Source: source, Path: path}
 		p.mu.Lock()
-		_, cached := p.cache[key]
-		_, have := p.previews[key]
+		_, cached := p.surfaceCache.peek(key)
+		_, have := p.previews.peek(key)
 		if cached || have || p.previewJobs[key] != nil {
 			p.mu.Unlock()
 			continue
@@ -285,31 +283,6 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 			}
 			p.mu.Unlock()
 		}(job, ctx, key, path)
-	}
-}
-
-// storePreview keeps a thumbnail around. The caller holds the lock.
-func (p *ImagePipeline) storePreview(key imageCacheKey, res ImageResult) {
-	if _, ok := p.previews[key]; !ok {
-		p.previewOrder = append(p.previewOrder, key)
-	}
-	p.previews[key] = res
-	for len(p.previewOrder) > imagePreviewCacheLimit {
-		delete(p.previews, p.previewOrder[0])
-		p.previewOrder = p.previewOrder[1:]
-	}
-}
-
-func (p *ImagePipeline) dropPreview(key imageCacheKey) {
-	if _, ok := p.previews[key]; !ok {
-		return
-	}
-	delete(p.previews, key)
-	for i, k := range p.previewOrder {
-		if k == key {
-			p.previewOrder = append(p.previewOrder[:i], p.previewOrder[i+1:]...)
-			break
-		}
 	}
 }
 
@@ -366,7 +339,9 @@ func (p *ImagePipeline) Prefetch(v vfs.VFS, paths []string) {
 	source := imageSource(v)
 	wanted := make(map[imageCacheKey]bool, len(paths))
 	for _, path := range paths {
-		wanted[imageCacheKey{Source: source, Path: path}] = true
+		if !imagedec.IsVideoFile(path) {
+			wanted[imageCacheKey{Source: source, Path: path}] = true
+		}
 	}
 
 	p.mu.Lock()
@@ -383,9 +358,12 @@ func (p *ImagePipeline) Prefetch(v vfs.VFS, paths []string) {
 	p.mu.Unlock()
 
 	for _, path := range paths {
+		if imagedec.IsVideoFile(path) {
+			continue
+		}
 		key := imageCacheKey{Source: source, Path: path}
 		p.mu.Lock()
-		_, cached := p.cache[key]
+		_, cached := p.surfaceCache.peek(key)
 		p.mu.Unlock()
 		if cached {
 			continue
@@ -400,9 +378,9 @@ func (p *ImagePipeline) Invalidate(v vfs.VFS, path string) {
 	defer p.mu.Unlock()
 	p.bytesGen++
 	key := imageCacheKey{Source: imageSource(v), Path: path}
-	p.drop(key)
-	p.dropPreview(key)
-	p.dropBytes(key)
+	p.surfaceCache.delete(key)
+	p.previews.delete(key)
+	p.bytesCache.delete(key)
 	delete(p.bytesJobs, key)
 	if job := p.previewJobs[key]; job != nil {
 		job.cancel()
@@ -415,6 +393,7 @@ func (p *ImagePipeline) Clear() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.bytesGen++
+	p.clearGen++
 	for key := range p.bytesJobs {
 		delete(p.bytesJobs, key)
 	}
@@ -422,21 +401,16 @@ func (p *ImagePipeline) Clear() {
 		job.cancel()
 		delete(p.previewJobs, key)
 	}
-	p.cache = make(map[imageCacheKey]*imageEntry)
-	p.lru = nil
-	p.bytes = 0
-	p.previews = make(map[imageCacheKey]ImageResult)
-	p.previewOrder = nil
-	p.bytesCache = nil
-	p.bytesOrder = nil
-	p.bytesSize = 0
+	p.surfaceCache.clear()
+	p.previews.clear()
+	p.bytesCache.clear()
 }
 
 // CacheStats reports how much the pipeline is holding on to.
 func (p *ImagePipeline) CacheStats() (int, int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.cache), p.bytes
+	return p.surfaceCache.len(), p.surfaceCache.total()
 }
 
 func (p *ImagePipeline) request(v vfs.VFS, path string, urgent bool, w imageWaiter, ctx context.Context) {
@@ -515,6 +489,7 @@ func (p *ImagePipeline) run(job *imageJob) {
 	p.mu.Lock()
 	job.started = true
 	ctx := job.ctx
+	gen := p.clearGen
 	p.mu.Unlock()
 
 	// A decode the reader stepped away from is wasted: it would push a live
@@ -544,7 +519,7 @@ func (p *ImagePipeline) run(job *imageJob) {
 	if job.startedPrefetch {
 		p.busyPrefetch--
 	}
-	if err == nil && surf != nil && surf.Valid() {
+	if err == nil && surf != nil && surf.Valid() && p.clearGen == gen {
 		p.store(job.key, res)
 	}
 	waiters := job.waiters
@@ -595,42 +570,7 @@ func (p *ImagePipeline) dispatchWaiters(waiters []imageWaiter, res ImageResult) 
 // looked at for the longest. The caller holds the lock.
 func (p *ImagePipeline) store(key imageCacheKey, res ImageResult) {
 	bytes := int64(res.Surface.Width) * int64(res.Surface.Height) * 4
-	p.drop(key)
-	p.cache[key] = &imageEntry{res: res, bytes: bytes}
-	p.lru = append(p.lru, key)
-	p.bytes += bytes
-
-	// The newest picture is the one on screen, so it stays even when it
-	// alone is larger than the whole budget.
-	for p.bytes > p.limit && len(p.lru) > 1 {
-		p.drop(p.lru[0])
-	}
-}
-
-func (p *ImagePipeline) drop(key imageCacheKey) {
-	entry, ok := p.cache[key]
-	if !ok {
-		return
-	}
-	delete(p.cache, key)
-	p.bytes -= entry.bytes
-	for i, k := range p.lru {
-		if k == key {
-			p.lru = append(p.lru[:i], p.lru[i+1:]...)
-			break
-		}
-	}
-}
-
-// touch moves a picture to the young end of the eviction order.
-func (p *ImagePipeline) touch(key imageCacheKey) {
-	for i, k := range p.lru {
-		if k == key {
-			p.lru = append(p.lru[:i], p.lru[i+1:]...)
-			break
-		}
-	}
-	p.lru = append(p.lru, key)
+	p.surfaceCache.put(key, &imageEntry{res: res, bytes: bytes})
 }
 
 // FileBytes shares recent reads and joins concurrent misses.
@@ -639,8 +579,7 @@ func (p *ImagePipeline) FileBytes(ctx context.Context, v vfs.VFS, path string) (
 	key := imageCacheKey{Source: imageSource(v), Path: path}
 
 	p.mu.Lock()
-	if data, ok := p.bytesCache[key]; ok {
-		p.touchBytes(key)
+	if data, ok := p.bytesCache.get(key); ok {
 		p.mu.Unlock()
 		return data, nil
 	}
@@ -661,7 +600,7 @@ func (p *ImagePipeline) FileBytes(ctx context.Context, v vfs.VFS, path string) (
 
 	p.mu.Lock()
 	if err == nil && job.generation == p.bytesGen && len(data) <= imageBytesCacheMaxFile {
-		p.storeBytes(key, data)
+		p.bytesCache.put(key, data)
 	}
 	job.data, job.err = data, err
 	if p.bytesJobs[key] == job {
@@ -677,56 +616,11 @@ func (p *ImagePipeline) CachedBytes(v vfs.VFS, path string) ([]byte, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := imageCacheKey{Source: imageSource(v), Path: path}
-	data, ok := p.bytesCache[key]
+	data, ok := p.bytesCache.get(key)
 	if !ok {
 		return nil, false
 	}
-	p.touchBytes(key)
 	return data, true
-}
-
-// storeBytes remembers file bytes, evicting the least recently used files.
-// The caller holds the lock.
-func (p *ImagePipeline) storeBytes(key imageCacheKey, data []byte) {
-	if p.bytesCache == nil {
-		p.bytesCache = make(map[imageCacheKey][]byte)
-	}
-	if old, ok := p.bytesCache[key]; ok {
-		p.bytesSize -= len(old)
-	} else {
-		p.bytesOrder = append(p.bytesOrder, key)
-	}
-	p.bytesCache[key] = data
-	p.bytesSize += len(data)
-	// The on-screen picture stays, like the surface cache keeps it.
-	for p.bytesSize > imageBytesCacheLimit && len(p.bytesOrder) > 1 {
-		p.dropBytes(p.bytesOrder[0])
-	}
-}
-
-func (p *ImagePipeline) dropBytes(key imageCacheKey) {
-	data, ok := p.bytesCache[key]
-	if !ok {
-		return
-	}
-	delete(p.bytesCache, key)
-	p.bytesSize -= len(data)
-	for i, k := range p.bytesOrder {
-		if k == key {
-			p.bytesOrder = append(p.bytesOrder[:i], p.bytesOrder[i+1:]...)
-			break
-		}
-	}
-}
-
-func (p *ImagePipeline) touchBytes(key imageCacheKey) {
-	for i, k := range p.bytesOrder {
-		if k == key {
-			p.bytesOrder = append(p.bytesOrder[:i], p.bytesOrder[i+1:]...)
-			break
-		}
-	}
-	p.bytesOrder = append(p.bytesOrder, key)
 }
 
 // ImageNeighbourhood returns the pictures nearest the current position on
