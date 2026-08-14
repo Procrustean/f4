@@ -15,6 +15,13 @@ import (
 
 func newImageTestScreen(t *testing.T) *vtui.ScreenBuf {
 	t.Helper()
+	// The layout tests assume the viewer sits on the first row, so pin the
+	// workspace tab mode to "no tabs"; the tests that care about the tab row
+	// set their own mode.
+	wasMode := vtui.FrameManager.WorkspaceTabMode
+	vtui.FrameManager.WorkspaceTabMode = vtui.WorkspaceTabsNever
+	t.Cleanup(func() { vtui.FrameManager.WorkspaceTabMode = wasMode })
+
 	scr := vtui.NewScreenBuf()
 	scr.Writer = io.Discard
 	scr.AllocBuf(80, 25)
@@ -43,17 +50,6 @@ func restoreBars(t *testing.T) {
 	t.Cleanup(func() { vtui.FrameManager.HideBars = was })
 }
 
-// screenRow reads a stretch of one row back out of the screen.
-func screenRow(scr *vtui.ScreenBuf, y, x1, x2 int) string {
-	var b strings.Builder
-	for x := x1; x <= x2; x++ {
-		if r := rune(scr.GetCell(x, y).Char); r != 0 {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 func TestImageViewFitsAndCentres(t *testing.T) {
 	scr := newImageTestScreen(t)
 	iv := newTestImageView(t, 100, 100)
@@ -62,13 +58,13 @@ func TestImageViewFitsAndCentres(t *testing.T) {
 	if !ok {
 		t.Fatal("layout failed")
 	}
-	// The window has 23 available rows (h=25, minus topbar and bottom border).
-	// Available cells: 80x23, cell size 8x16 -> 640x368 pixels.
-	// A square image fits to 368x368, which is 46x23 cells, centred horizontally.
-	if p.Cols != 46 || p.Rows != 23 {
+	// The window has 24 available rows (h=25, minus the key bar).
+	// Available cells: 80x24, cell size 8x16 -> 640x384 pixels.
+	// A square image fits to 384x384, which is 48x24 cells, centred horizontally.
+	if p.Cols != 48 || p.Rows != 24 {
 		t.Errorf("wrong size %dx%d cells", p.Cols, p.Rows)
 	}
-	if p.Col != 17 || p.Row != 1 {
+	if p.Col != 16 || p.Row != 0 {
 		t.Errorf("wrong origin %d,%d", p.Col, p.Row)
 	}
 	if p.SrcW != 0 || p.SrcH != 0 {
@@ -161,8 +157,17 @@ func TestImageViewKeys(t *testing.T) {
 	if !press('d', 0) || iv.panX <= 0 {
 		t.Error("d must pan")
 	}
-	if press('~', 0) {
+	if press('z', 0) {
 		t.Error("unrelated keys must be left to the rest of the UI")
+	}
+	if !press('~', 0) {
+		t.Error("tilde must be handled")
+	}
+	if !press('ё', 0) {
+		t.Error("the grave key on a Russian layout must be handled")
+	}
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_OEM_3}) {
+		t.Error("the physical key left of 1 must be handled")
 	}
 	if !press(0, vtinput.VK_ESCAPE) || !iv.IsDone() {
 		t.Error("escape must close the viewer")
@@ -249,7 +254,7 @@ func TestImageViewWalksItsSiblings(t *testing.T) {
 	}
 }
 
-func TestImageViewArrowsWalkWhenThereIsNothingToPan(t *testing.T) {
+func TestImageViewRegularArrowsAlwaysWalk(t *testing.T) {
 	withStubPipeline(t, 20, 10)
 
 	iv := newTestImageView(t, 100, 100)
@@ -261,12 +266,13 @@ func TestImageViewArrowsWalkWhenThereIsNothingToPan(t *testing.T) {
 		}
 	}
 
+	// The enhanced arrows are the regular cluster ones: they walk the
+	// directory even when the picture is zoomed and could be panned.
+	iv.SetZoom(4)
 	press := func(vk uint16) bool {
-		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vk})
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vk,
+			ControlKeyState: vtinput.EnhancedKey})
 	}
-
-	// Nothing has been drawn yet and the picture fits anyway, so the pan
-	// range is zero and the arrows walk the directory.
 	if !press(vtinput.VK_RIGHT) || iv.index != 2 {
 		t.Fatalf("the right arrow should have stepped forward, index is %d", iv.index)
 	}
@@ -277,11 +283,11 @@ func TestImageViewArrowsWalkWhenThereIsNothingToPan(t *testing.T) {
 		t.Fatalf("the down arrow should have stepped forward, index is %d", iv.index)
 	}
 	if iv.panX != 0 || iv.panY != 0 {
-		t.Errorf("nothing should have been panned: %v %v", iv.panX, iv.panY)
+		t.Errorf("walking must not pan: %v %v", iv.panX, iv.panY)
 	}
 }
 
-func TestImageViewArrowsPanAZoomedPicture(t *testing.T) {
+func TestImageViewNumpadArrowsPan(t *testing.T) {
 	withStubPipeline(t, 400, 400)
 	scr := newImageTestScreen(t)
 
@@ -299,14 +305,321 @@ func TestImageViewArrowsPanAZoomedPicture(t *testing.T) {
 		t.Fatalf("a zoomed picture must have room to pan, got %v", iv.panMaxX)
 	}
 
+	// The plain arrows are the numpad ones (the console leaves them
+	// unenhanced): they pan, they never walk.
 	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_RIGHT}) {
-		t.Fatal("the right arrow must be handled")
+		t.Fatal("a plain right arrow must be handled")
 	}
 	if iv.panX <= 0 {
-		t.Error("a zoomed picture must be panned, not walked past")
+		t.Error("a numpad arrow must pan, not walk past")
 	}
 	if iv.path != "test.png" || iv.index != 0 {
 		t.Errorf("the list must not have moved: %q %d", iv.path, iv.index)
+	}
+
+	// The explicit numpad codes (NumLock on) pan the same way.
+	iv.panX, iv.panY = 0, 0
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_NUMPAD6}) {
+		t.Fatal("numpad 6 must be handled")
+	}
+	if iv.panX <= 0 {
+		t.Error("numpad 6 must pan right")
+	}
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_NUMPAD2}) {
+		t.Fatal("numpad 2 must be handled")
+	}
+	if iv.panY <= 0 {
+		t.Error("numpad 2 must pan down")
+	}
+	if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_NUMPAD4}) {
+		t.Fatal("numpad 4 must be handled")
+	}
+	if iv.panX != 0 {
+		t.Error("numpad 4 must pan back to the left edge")
+	}
+}
+
+func TestImageViewJKWalk(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	press := func(e *vtinput.InputEvent) bool {
+		return iv.ProcessKey(e)
+	}
+
+	// j and k on the English layout.
+	if !press(&vtinput.InputEvent{KeyDown: true, Char: 'j'}) || iv.index != 2 {
+		t.Fatalf("j must step forward, index is %d", iv.index)
+	}
+	if !press(&vtinput.InputEvent{KeyDown: true, Char: 'K'}) || iv.index != 1 {
+		t.Fatalf("k must step back, index is %d", iv.index)
+	}
+	// The same physical keys on the Russian layout: о and л.
+	if !press(&vtinput.InputEvent{KeyDown: true, Char: 'о'}) || iv.index != 2 {
+		t.Fatalf("the Russian о (physical j) must step forward, index is %d", iv.index)
+	}
+	if !press(&vtinput.InputEvent{KeyDown: true, Char: 'Л'}) || iv.index != 1 {
+		t.Fatalf("the Russian Л (physical k) must step back, index is %d", iv.index)
+	}
+	// The physical codes, as the console and gogpu carry them.
+	if !press(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_J}) || iv.index != 2 {
+		t.Fatalf("VK_J must step forward, index is %d", iv.index)
+	}
+	if !press(&vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_K}) || iv.index != 1 {
+		t.Fatalf("VK_K must step back, index is %d", iv.index)
+	}
+	if iv.panX != 0 || iv.panY != 0 {
+		t.Errorf("j/k must walk, not pan: %v %v", iv.panX, iv.panY)
+	}
+}
+
+func TestImageViewToggleCompare(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	press := func() bool {
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: '~'})
+	}
+
+	// The first press anchors the comparison and steps to the next picture.
+	if !press() || iv.path != "c.png" {
+		t.Fatalf("~ must step to the next picture, got %q", iv.path)
+	}
+	// Every later press flips between the two sides: three presses from the
+	// next picture land back on the anchor.
+	for i := 0; i < 3; i++ {
+		press()
+	}
+	if iv.path != "b.png" {
+		t.Fatalf("~ must toggle back to the anchor, got %q", iv.path)
+	}
+	if !press() || iv.path != "c.png" {
+		t.Errorf("~ must flip to the next side again, got %q", iv.path)
+	}
+
+	// Moving the list elsewhere restarts the comparison there.
+	iv.GoTo(0)
+	if !press() || iv.path != "b.png" {
+		t.Errorf("after navigating away, ~ must compare from the new picture, got %q", iv.path)
+	}
+}
+
+func TestImageViewToggleCompareAtTheEndOfTheList(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "c.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 2)
+	for _, name := range []string{"a.png", "b.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	press := func() bool {
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: '~'})
+	}
+
+	// The last picture has no next: the comparison partner is the previous
+	// one, and the toggle still flips back and forth.
+	if !press() || iv.path != "b.png" {
+		t.Fatalf("~ must step back from the end, got %q", iv.path)
+	}
+	if !press() || iv.path != "c.png" {
+		t.Errorf("~ must flip back to the end, got %q", iv.path)
+	}
+}
+
+func TestImageViewNavigationCarriesZoomAndPan(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	iv.SetZoom(4)
+	iv.Pan(1, 1)
+	iv.Step(1)
+
+	if iv.path != "c.png" || iv.index != 2 {
+		t.Fatalf("a step forward went to %d, %q", iv.index, iv.path)
+	}
+	if iv.zoom != 4 {
+		t.Errorf("the zoom must follow the reader, got %v", iv.zoom)
+	}
+	if iv.panX == 0 || iv.panY == 0 {
+		t.Errorf("the pan must follow the reader, got %v %v", iv.panX, iv.panY)
+	}
+
+	iv.Step(-1)
+	if iv.path != "b.png" || iv.zoom != 4 {
+		t.Errorf("stepping back must keep the zoom too, got %q zoom %v", iv.path, iv.zoom)
+	}
+}
+
+func TestImageViewCarryFractionAcrossSizes(t *testing.T) {
+	// The pan follows the reader as a share of its range: the bottom of one
+	// picture lands on the bottom of the next, whatever its size or shape.
+	sizes := map[string][2]int{
+		"a.png": {400, 400},
+		"b.png": {200, 400}, // portrait: half the width
+		"c.png": {400, 800}, // taller
+	}
+	old := ImagePipe
+	t.Cleanup(func() { ImagePipe = old })
+	ImagePipe = newTestPipeline(func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		sz, ok := sizes[path]
+		if !ok {
+			sz = [2]int{400, 400}
+		}
+		return imageTestSurface(sz[0], sz[1]), "stub", nil
+	})
+	ImagePipe.preview = func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		return nil, "", errors.New("no thumbnail")
+	}
+
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 400, 400)
+	iv.path = "a.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 0)
+	for name := range sizes {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	iv.SetZoom(4)
+	if _, ok := iv.placementFor(scr); !ok {
+		t.Fatal("layout failed for a")
+	}
+	// To the very bottom of the first picture.
+	iv.panX, iv.panY = 0, iv.panMaxY
+	if _, ok := iv.placementFor(scr); !ok {
+		t.Fatal("layout failed for a, panned")
+	}
+
+	iv.Step(1) // to the portrait b
+	if _, ok := iv.placementFor(scr); !ok {
+		t.Fatal("layout failed for b")
+	}
+	if iv.panY != iv.panMaxY {
+		t.Errorf("the bottom of a must land on the bottom of b: pan %v of %v", iv.panY, iv.panMaxY)
+	}
+
+	iv.Step(1) // to the taller c
+	if _, ok := iv.placementFor(scr); !ok {
+		t.Fatal("layout failed for c")
+	}
+	if iv.panY != iv.panMaxY {
+		t.Errorf("the bottom must stay the bottom for a taller picture: pan %v of %v", iv.panY, iv.panMaxY)
+	}
+}
+
+func TestImageViewCompareCarriesTheZoom(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	iv.SetZoom(4)
+	iv.Pan(1, 1)
+
+	press := func() bool {
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: '~'})
+	}
+	if !press() || iv.path != "c.png" {
+		t.Fatalf("~ must step to the next picture, got %q", iv.path)
+	}
+	if iv.zoom != 4 || iv.panX == 0 || iv.panY == 0 {
+		t.Errorf("the next side must show at the same zoom and pan, got zoom %v pan %v %v", iv.zoom, iv.panX, iv.panY)
+	}
+
+	if !press() || iv.path != "b.png" {
+		t.Fatalf("~ must flip back to the anchor, got %q", iv.path)
+	}
+	if iv.zoom != 4 {
+		t.Errorf("the anchor side must keep the zoom too, got %v", iv.zoom)
+	}
+}
+
+func TestImageViewActualSizeRidesAlong(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "b.png"
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png"}, 1)
+	for _, name := range []string{"a.png", "c.png"} {
+		if res := ImagePipe.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+
+	iv.ToggleActualSize()
+	iv.Step(1)
+	if iv.path != "c.png" {
+		t.Fatalf("a step forward went to %q", iv.path)
+	}
+	if !iv.actual {
+		t.Error("the 1:1 mode must ride along to the next picture")
+	}
+}
+
+func TestImageViewDoubleClickTogglesActualSize(t *testing.T) {
+	iv := newTestImageView(t, 100, 100)
+
+	press := func() bool {
+		return iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: '*'})
+	}
+	if !press() || !iv.actual {
+		t.Fatal("* must switch to the actual size")
+	}
+	if !press() || iv.actual {
+		t.Fatal("* must switch back to the fitted size")
+	}
+
+	// A double left click behaves exactly like the * key.
+	if !iv.ProcessMouse(&vtinput.InputEvent{
+		Type: vtinput.MouseEventType, KeyDown: true,
+		ButtonState:     vtinput.FromLeft1stButtonPressed,
+		MouseEventFlags: vtinput.DoubleClick,
+	}) || !iv.actual {
+		t.Error("a double click must switch to the actual size")
+	}
+	if iv.ProcessMouse(&vtinput.InputEvent{
+		Type: vtinput.MouseEventType, KeyDown: true,
+		ButtonState: vtinput.FromLeft1stButtonPressed,
+	}) {
+		t.Error("a single click must be left alone")
+	}
+	if iv.ProcessMouse(&vtinput.InputEvent{Type: vtinput.KeyEventType}) {
+		t.Error("non-mouse events must be left to the key path")
 	}
 }
 
@@ -370,6 +683,17 @@ func TestImageViewTitleMarksAPickedPicture(t *testing.T) {
 	iv.SetSelected(iv.path, false)
 	if iv.titleName() != "test.png" {
 		t.Error("unpicking must take the mark away again")
+	}
+}
+
+// TestImageViewWindowTitleIsNameAndResolution checks that the window title
+// (and with it the workspace tab) stays short: just the name and the size in
+// parentheses, "photo.jpg (1920x1080)".
+func TestImageViewWindowTitleIsNameAndResolution(t *testing.T) {
+	iv := newTestImageView(t, 640, 480)
+	iv.path = "image.jpg"
+	if got := iv.GetTitle(); got != "image.jpg (640x480)" {
+		t.Errorf("window title is %q", got)
 	}
 }
 
@@ -490,9 +814,9 @@ func TestImageViewActualSize(t *testing.T) {
 	scr := newImageTestScreen(t)
 	iv := newTestImageView(t, 100, 100)
 
-	// Fitted, a square picture fills the 23 rows of the window.
+	// Fitted, a square picture fills the 24 rows of the window.
 	p, _ := iv.placementFor(scr)
-	if p.Rows != 23 {
+	if p.Rows != 24 {
 		t.Fatalf("fitted size: %dx%d cells", p.Cols, p.Rows)
 	}
 
@@ -514,10 +838,10 @@ func TestImageViewActualSize(t *testing.T) {
 	}
 
 	iv.ToggleActualSize()
-	if p, _ = iv.placementFor(scr); p.Rows != 23 {
+	if p, _ = iv.placementFor(scr); p.Rows != 24 {
 		t.Errorf("switching back must fit the window again: %dx%d", p.Cols, p.Rows)
 	}
-	if iv.tempMsg != "scale: 368%" {
+	if iv.tempMsg != "scale: 384%" {
 		t.Errorf("back to the fitted scale, got %q", iv.tempMsg)
 	}
 }
@@ -537,6 +861,50 @@ func TestImageViewFullscreenTakesTheBarRows(t *testing.T) {
 	}
 	if p.Row != 0 || p.Rows != 25 {
 		t.Errorf("without the bars the picture starts at row 0 and fills 25: %d, %d rows", p.Row, p.Rows)
+	}
+}
+
+// TestImageViewLeavesRoomForWorkspaceTabs checks that the viewer drops by one
+// row when the workspace tab strip reserves the top row: the picture starts
+// below the tabs in normal mode, and in full screen it leaves the tab row
+// alone instead of covering it.
+func TestImageViewLeavesRoomForWorkspaceTabs(t *testing.T) {
+	restoreBars(t)
+	scr := newImageTestScreen(t)
+
+	// "Always" and "when multiple" both reserve one top row, so the layout is
+	// the same; the second workspace the viewer itself creates is what brings
+	// the strip up in the "when multiple" mode.
+	wasMode := vtui.FrameManager.WorkspaceTabMode
+	vtui.FrameManager.WorkspaceTabMode = vtui.WorkspaceTabsAlways
+	t.Cleanup(func() { vtui.FrameManager.WorkspaceTabMode = wasMode })
+
+	iv := newTestImageView(t, 100, 100)
+	if got := vtui.FrameManager.WorkspaceTopInset(); got != 1 {
+		t.Fatalf("test setup: expected one reserved top row, got %d", got)
+	}
+
+	// Normal mode: the viewer starts below the tabs and the picture begins one
+	// row down.
+	if _, y1, _, _ := iv.GetPosition(); y1 != 1 {
+		t.Errorf("the viewer must start below the tab row, got y1=%d", y1)
+	}
+	p, ok := iv.placementFor(scr)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if p.Row != 1 || p.Rows != 23 {
+		t.Errorf("without full screen the picture must start at row 1 and get 23 rows, got row %d, %d rows", p.Row, p.Rows)
+	}
+
+	// Full screen: the picture still leaves the tab row alone.
+	iv.SetFullScreen(true)
+	p, ok = iv.placementFor(scr)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if p.Row != 1 || p.Rows != 24 {
+		t.Errorf("in full screen the picture must start at row 1 and get 24 rows, got row %d, %d rows", p.Row, p.Rows)
 	}
 }
 
@@ -562,8 +930,8 @@ func TestImageViewFullScreenIsAToggle(t *testing.T) {
 	scr := newImageTestScreen(t)
 	iv := newTestImageView(t, 100, 100)
 	p, ok := iv.placementFor(scr)
-	if !ok || p.Rows != 23 {
-		t.Fatalf("with both bars the picture gets 23 rows, got %+v", p)
+	if !ok || p.Rows != 24 {
+		t.Fatalf("with the key bar hidden the picture gets 24 rows, got %+v", p)
 	}
 	e := &vtinput.InputEvent{KeyDown: true, VirtualKeyCode: vtinput.VK_F}
 	e.ControlKeyState |= vtinput.LeftCtrlPressed
@@ -591,12 +959,12 @@ func TestImageViewOverlayLines(t *testing.T) {
 	iv.fileSize, iv.sizeKnown = 4096, true
 	iv.fileTime, iv.timeKnown = time.Date(2024, 5, 17, 9, 30, 0, 0, time.Local), true
 	lines := iv.overlayLines()
-	if len(lines) != 5 || lines[0] != "photo.png" || lines[1] != "320 x 200" || lines[4] != "png" || !strings.Contains(lines[2], "4.0") || lines[3] != "2024-05-17 09:30" {
+	if len(lines) != 5 || lines[0] != "photo.png" || lines[1] != "320x200" || lines[4] != "png" || !strings.Contains(lines[2], "4.0") || lines[3] != "2024-05-17 09:30" {
 		t.Errorf("the panel says %v", lines)
 	}
 	iv.Rotate(90)
 	lines = iv.overlayLines()
-	if lines[1] != "200 x 320" || len(lines) != 6 || !strings.Contains(lines[5], "90") {
+	if lines[1] != "200x320" || len(lines) != 6 || !strings.Contains(lines[5], "90") {
 		t.Errorf("turned picture panel: %v", lines)
 	}
 	if got := newTestImageView(t, 8, 8).overlayLines()[2]; got != "unknown size" {
@@ -620,10 +988,10 @@ func TestImageViewOverlayGoesOverPicture(t *testing.T) {
 	scr.Graphics().BeginFrame()
 	iv.Show(scr)
 	scr.Graphics().EndFrame()
-	if row := screenRow(scr, 2, 0, 20); !strings.Contains(row, "photo.png") {
+	if row := ScreenRow(scr, 1, 0, 20); !strings.Contains(row, "photo.png") {
 		t.Errorf("overlay first line is %q", row)
 	}
-	if row := screenRow(scr, 3, 0, 20); !strings.Contains(row, "100 x 100") {
+	if row := ScreenRow(scr, 2, 0, 20); !strings.Contains(row, "100x100") {
 		t.Errorf("overlay second line is %q", row)
 	}
 }
@@ -638,13 +1006,13 @@ func TestImageViewOverlayWidthIsCapped(t *testing.T) {
 	scr.Graphics().BeginFrame()
 	iv.Show(scr)
 	scr.Graphics().EndFrame()
-	row := screenRow(scr, 2, 0, 79)
+	row := ScreenRow(scr, 1, 0, 79)
 	if !strings.Contains(row, "…") || strings.Contains(row, "anywhere.png") {
 		t.Errorf("truncated overlay row is %q", row)
 	}
 	slab := 0
 	for x := 0; x < 80; x++ {
-		if scr.GetCell(x, 2).Attributes == imageOverlayAttr {
+		if scr.GetCell(x, 1).Attributes == imageOverlayAttr {
 			slab++
 		}
 	}
@@ -659,7 +1027,7 @@ func TestImageViewOverlayWidthIsCapped(t *testing.T) {
 	scr.Graphics().EndFrame()
 	flashed := 0
 	for x := 0; x < 80; x++ {
-		if scr.GetCell(x, 2).Attributes == imageWallFlashAttr {
+		if scr.GetCell(x, 1).Attributes == imageWallFlashAttr {
 			flashed++
 		}
 	}
@@ -792,7 +1160,7 @@ func TestImageViewLoadingToastNamesTheWait(t *testing.T) {
 	scr.Graphics().BeginFrame()
 	iv.Show(scr)
 	scr.Graphics().EndFrame()
-	row := screenRow(scr, 23, 0, 79)
+	row := ScreenRow(scr, 23, 0, 79)
 	if !strings.Contains(row, "decoding") {
 		t.Errorf("the loading toast must name what it is waiting for, got %q", row)
 	}
@@ -974,5 +1342,148 @@ func TestPanelImageSiblings(t *testing.T) {
 	fp.cursorIdx = 3
 	if _, index := fp.ImageSiblings(); index != -1 {
 		t.Errorf("expected no position, got %d", index)
+	}
+}
+
+func TestImageViewRotationKeys(t *testing.T) {
+	iv := newTestImageView(t, 40, 20)
+
+	turn := func(char rune) {
+		t.Helper()
+		if !iv.ProcessKey(&vtinput.InputEvent{KeyDown: true, Char: char}) {
+			t.Fatalf("%q was not handled", char)
+		}
+	}
+	mirror := func(char rune) {
+		t.Helper()
+		e := &vtinput.InputEvent{KeyDown: true, Char: char}
+		e.ControlKeyState |= vtinput.LeftAltPressed
+		if !iv.ProcessKey(e) {
+			t.Fatalf("Alt+%q was not handled", char)
+		}
+	}
+
+	turn('>')
+	if iv.rotation != 90 {
+		t.Fatalf("one turn forward gave %d", iv.rotation)
+	}
+	if iv.display().Width != 20 || iv.display().Height != 40 {
+		t.Errorf("the turned picture is %dx%d", iv.display().Width, iv.display().Height)
+	}
+
+	turn('.')
+	if iv.rotation != 180 {
+		t.Errorf("the dot must turn like the angle bracket, got %d", iv.rotation)
+	}
+	turn('<')
+	turn(',')
+	if iv.rotation != 0 {
+		t.Errorf("turning back twice gave %d", iv.rotation)
+	}
+	if iv.shown != nil || iv.display() != iv.surface {
+		t.Error("an unturned picture must be shown as it was decoded, without a copy")
+	}
+
+	mirror('>')
+	if !iv.flipH || iv.flipV {
+		t.Errorf("Alt+> mirrors across the vertical axis, got %v %v", iv.flipH, iv.flipV)
+	}
+	mirror('<')
+	if !iv.flipV {
+		t.Error("Alt+< mirrors across the horizontal axis")
+	}
+	if iv.rotation != 0 {
+		t.Errorf("mirroring must not turn the picture, got %d", iv.rotation)
+	}
+	if iv.display().Width != 40 || iv.display().Height != 20 {
+		t.Errorf("mirroring must keep the size, got %dx%d", iv.display().Width, iv.display().Height)
+	}
+}
+
+func TestImageViewTurnFollowsTheMirror(t *testing.T) {
+	iv := newTestImageView(t, 40, 20)
+
+	// One mirrored axis reverses the direction of a turn, so the stored
+	// angle has to move backwards for the picture on screen to move
+	// forwards.
+	iv.Flip(true, false)
+	iv.Rotate(90)
+	if iv.rotation != 270 {
+		t.Errorf("with one axis mirrored a clockwise key must store 270, got %d", iv.rotation)
+	}
+
+	// Both axes together are a half turn, which commutes, so the angle goes
+	// forward again.
+	iv.Flip(false, true)
+	iv.Rotate(90)
+	if iv.rotation != 0 {
+		t.Errorf("with both axes mirrored the angle must go forward, got %d", iv.rotation)
+	}
+}
+
+func TestImageViewRotationChangesThePlacement(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 200, 100)
+
+	wide, ok := iv.placementFor(scr)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if wide.Surface != iv.surface {
+		t.Error("an unturned picture is sent as it was decoded")
+	}
+
+	iv.Rotate(90)
+	tall, ok := iv.placementFor(scr)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if tall.Surface != iv.shown {
+		t.Error("the turned copy is what has to reach the terminal")
+	}
+	if tall.Cols >= wide.Cols || tall.Rows <= wide.Rows {
+		t.Errorf("a turned landscape picture must stand up: %dx%d cells against %dx%d",
+			tall.Cols, tall.Rows, wide.Cols, wide.Rows)
+	}
+}
+
+func TestImageViewRotationSurvivesTheSharperPicture(t *testing.T) {
+	iv := newTestImageView(t, 40, 20)
+	iv.Rotate(90)
+
+	// The full resolution decode replaces the thumbnail of the same file,
+	// which must not undo what the reader has done to the orientation.
+	iv.SetImage(ImageResult{Surface: vtui.NewImageSurface(80, 40), Decoder: "stub"})
+	if iv.rotation != 90 {
+		t.Fatalf("the thumbnail and the picture share an orientation, got %d", iv.rotation)
+	}
+	if iv.display().Width != 40 || iv.display().Height != 80 {
+		t.Errorf("the sharper picture arrived unturned: %dx%d", iv.display().Width, iv.display().Height)
+	}
+}
+
+func TestImageViewOrientationResetsOnTheNextPicture(t *testing.T) {
+	withStubPipeline(t, 20, 10)
+
+	iv := newTestImageView(t, 100, 100)
+	iv.path = "a.png"
+	iv.SetSiblings([]string{"a.png", "b.png"}, 0)
+	if res := ImagePipe.LoadSync(context.Background(), nil, "b.png"); res.Err != nil {
+		t.Fatalf("b.png: %v", res.Err)
+	}
+
+	iv.Rotate(90)
+	iv.Flip(true, false)
+	iv.Step(1)
+
+	if iv.path != "b.png" {
+		t.Fatalf("the step went to %q", iv.path)
+	}
+	if iv.rotation != 0 || iv.flipH || iv.flipV || iv.shown != nil {
+		t.Errorf("the next picture must arrive as it was decoded: %d %v %v",
+			iv.rotation, iv.flipH, iv.flipV)
+	}
+	if iv.display().Width != 20 || iv.display().Height != 10 {
+		t.Errorf("the picture on screen is %dx%d", iv.display().Width, iv.display().Height)
 	}
 }

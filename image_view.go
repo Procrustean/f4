@@ -80,7 +80,6 @@ var imageWallFlashAttr = vtui.SetRGBBoth(0, 0x101010, 0xC0C0C0)
 // ImageView shows a single picture full screen.
 type ImageView struct {
 	vtui.BaseFrame
-	topBar *TopBar
 
 	vfs     vfs.VFS
 	path    string
@@ -90,6 +89,11 @@ type ImageView struct {
 
 	siblings []string
 	index    int
+
+	// compareIdx anchors the ~ comparison; a flag, not a sentinel index,
+	// marks the unset state because zero is a valid sibling position.
+	compareActive bool
+	compareIdx    int
 
 	preview    bool
 	loading    bool
@@ -109,6 +113,12 @@ type ImageView struct {
 	// How far the picture can still move per axis, as of the last frame. Zero
 	// means it fits and there is nothing to pan.
 	panMaxX, panMaxY float64
+
+	// carryFrac keeps the pan as a share of its range across a picture
+	// change; the share lands only once a different surface arrives.
+	carryFracX, carryFracY float64
+	carryPending           bool
+	carrySurface           *vtui.ImageSurface
 
 	// Last geometry line written to the log, so an idle picture doesn't fill it.
 	lastGeom string
@@ -205,41 +215,22 @@ func NewImageView(ctx context.Context, v vfs.VFS, path string) (*ImageView, erro
 	iv.gfxKey = fmt.Sprintf("f4.imageview:%p", iv)
 
 	iv.index = -1
-	iv.topBar = NewTopBar(
-		func() string {
-			// Just the name and the resolution, one space apart; the
-			// workspace counter "[N]" draws over the empty corner.
-			return " " + iv.titleName() + " " + iv.displaySize()
-		},
-		nil,
-	)
-	iv.topBar.SetVisible(true)
 	iv.SetCanFocus(true)
 	iv.SetFocus(true)
 
-	// What is on screen is a stand-in; ask for the real thing.
-	if res.Preview {
-		iv.startDecode()
-	}
 	if iv.overlay {
 		iv.requestFileSize()
 	}
+	// The thumbnail is a stand-in; decode the full picture in the background.
 	if res.Preview {
+		iv.startDecode()
 		gen := iv.loadGen
-		vtui.RunAsync(func(ctx *vtui.TaskContext) {
+		iv.decodeCancel = vtui.RunAsync(func(ctx *vtui.TaskContext) {
 			sized := iv.loadSized(ctx.Context, v, path)
 			ctx.RunOnUI(func() { iv.accept(gen, sized) })
-		})
+		}).Cancel
 	}
 	return iv, nil
-}
-
-// barHeight is how many rows the title bar takes from the picture.
-func (iv *ImageView) barHeight() int {
-	if iv.full {
-		return 0
-	}
-	return 1
 }
 
 // SetSiblings tells the viewer which pictures stand next to this one, in the
@@ -313,6 +304,50 @@ func (iv *ImageView) GoTo(idx int) {
 	}
 }
 
+// ToggleCompare flips between the picture on screen and the one next to it,
+// so two similar files can be compared with one key. The first press anchors
+// the comparison and steps to the neighbour; every later press flips back and
+// forth between the two sides. Moving the list elsewhere restarts the
+// comparison at the picture in view.
+func (iv *ImageView) ToggleCompare() {
+	total := len(iv.siblings)
+	if total < 2 || iv.index < 0 {
+		iv.toast("no next picture")
+		return
+	}
+	if !iv.compareActive || !iv.comparing(iv.index) {
+		iv.compareActive = true
+		iv.compareIdx = iv.index
+	}
+	if other := iv.comparePartner(); other >= 0 {
+		iv.GoTo(other)
+	}
+}
+
+// comparing reports whether idx is one of the two sides of the comparison:
+// the anchor or the picture right after it.
+func (iv *ImageView) comparing(idx int) bool {
+	if idx == iv.compareIdx {
+		return true
+	}
+	return idx == iv.compareIdx+1 && iv.compareIdx+1 < len(iv.siblings)
+}
+
+// comparePartner is the other side of the comparison: the next picture from
+// the anchor, or the previous one when the anchor is the last in the list.
+func (iv *ImageView) comparePartner() int {
+	if iv.index != iv.compareIdx {
+		return iv.compareIdx
+	}
+	if iv.compareIdx+1 < len(iv.siblings) {
+		return iv.compareIdx + 1
+	}
+	if iv.compareIdx > 0 {
+		return iv.compareIdx - 1
+	}
+	return -1
+}
+
 // Reload decodes the file again, for a picture that has changed since it was
 // put on screen.
 func (iv *ImageView) Reload() {
@@ -327,11 +362,19 @@ func (iv *ImageView) open(path string) {
 	if path != iv.path {
 		// The toast answers the picture it was said over; drop it at once.
 		iv.toastClear()
+		// Remember where the reader stands, as a share of the pan range, so
+		// the next picture opens on the same relative spot.
+		iv.carryFracX = panFrac(iv.panX, iv.panMaxX)
+		iv.carryFracY = panFrac(iv.panY, iv.panMaxY)
+		iv.carryPending = true
+		iv.carrySurface = iv.display()
 	}
 	iv.cancelDecode()
 	iv.path = path
-	iv.zoom = 1
-	iv.panX, iv.panY = 0, 0
+	// The zoom and the pan belong to the viewing session, not to the file:
+	// they follow the reader from one picture to the next, so the same
+	// magnification and region stay put when comparing neighbouring files.
+	// The 1:1 mode rides along the same way.
 	iv.sized = false
 	iv.rotation, iv.flipH, iv.flipV = 0, false, false
 	if iv.decodePct != nil {
@@ -473,6 +516,12 @@ func (iv *ImageView) accept(gen uint64, res ImageResult) {
 	}
 	iv.SetImage(res)
 	iv.loading = res.Preview
+	// A zoom or the 1:1 mode carried over from the previous picture can ask
+	// for more than the screen-sized decode that just arrived; fetch the
+	// full picture now, exactly as SetZoom and ToggleActualSize would.
+	if iv.sized && (iv.actual || iv.zoom > imageViewSizedHeadroom) {
+		iv.requestFull()
+	}
 	if !res.Preview && res.Decoder != "" && res.DecodeDur > imageViewDecodeDelay && !iv.tempActive() {
 		iv.toast(decoderWithTime(res.Decoder, res.DecodeDur))
 	}
@@ -498,6 +547,8 @@ func (iv *ImageView) ToggleActualSize() {
 	iv.actual = !iv.actual
 	iv.zoom = 1
 	iv.panX, iv.panY = 0, 0
+	iv.carryPending = false
+	iv.carrySurface = nil
 	if iv.actual && iv.sized {
 		iv.requestFull()
 	}
@@ -536,6 +587,8 @@ func (iv *ImageView) Rotate(delta int) {
 	}
 	iv.rotation = ((iv.rotation+delta)%360 + 360) % 360
 	iv.panX, iv.panY = 0, 0
+	iv.carryPending = false
+	iv.carrySurface = nil
 	iv.rebuild()
 	iv.toast("rotated")
 }
@@ -549,6 +602,8 @@ func (iv *ImageView) Flip(horizontal, vertical bool) {
 		iv.flipV = !iv.flipV
 	}
 	iv.panX, iv.panY = 0, 0
+	iv.carryPending = false
+	iv.carrySurface = nil
 	iv.rebuild()
 	iv.toast("mirrored")
 }
@@ -565,7 +620,7 @@ func (iv *ImageView) SetImage(res ImageResult) {
 	iv.sized = res.Sized
 	iv.decodeDur = res.DecodeDur
 	iv.rebuild()
-	if prev.Valid() && prev.Width > 0 && prev.Height > 0 {
+	if prev.Valid() && prev.Width > 0 && prev.Height > 0 && !iv.carryPending {
 		if !iv.anchorPending {
 			iv.zoomFocusX = iv.panX + float64(iv.visW)/2
 			iv.zoomFocusY = iv.panY + float64(iv.visH)/2
@@ -630,22 +685,18 @@ func (iv *ImageView) loadSized(ctx context.Context, v vfs.VFS, path string) Imag
 	return ImageResult{Path: path, Surface: surf, Decoder: decoder, Sized: sized}
 }
 
-func (iv *ImageView) SetPosition(x1, y1, x2, y2 int) {
-	iv.ScreenObject.SetPosition(x1, y1, x2, y2)
-	if iv.topBar != nil {
-		iv.topBar.SetPosition(x1, y1, x2, y1)
-	}
-}
-
 // ResizeConsole lays the viewer out over the console. In the whole screen
 // mode the row that normally belongs to the key bar is taken by the picture.
+// The workspace tab row, when the mode reserves one, is never taken: the
+// picture drops by one row so it sits below the tabs, in full screen as well.
 func (iv *ImageView) ResizeConsole(w, h int) {
 	iv.conW, iv.conH = w, h
+	top := vtui.FrameManager.WorkspaceTopInset()
 	bottom := h - 2
 	if iv.full {
 		bottom = h - 1
 	}
-	iv.SetPosition(0, 0, w-1, bottom)
+	iv.SetPosition(0, top, w-1, bottom)
 }
 
 // SetZoom: 1 means fit; one press, one redraw (terminal too slow to animate).
@@ -690,6 +741,22 @@ func (iv *ImageView) Pan(dx, dy int) {
 	if iv.panY < 0 {
 		iv.panY = 0
 	}
+}
+
+// panFrac is the pan as a share of its range, clamped to [0,1]; a zero range
+// means the picture fits and the share is zero.
+func panFrac(v, max float64) float64 {
+	if max <= 0 {
+		return 0
+	}
+	f := v / max
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
 }
 
 func (iv *ImageView) clampPan(visW, visH int) {
@@ -745,7 +812,7 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 	}
 
 	x1, y1, x2, y2 := iv.GetPosition()
-	top := y1 + iv.barHeight()
+	top := y1
 	cols := x2 - x1 + 1
 	rows := y2 - top + 1
 	if cols <= 0 || rows <= 0 {
@@ -775,6 +842,8 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 		iv.panMaxX, iv.panMaxY = 0, 0
 		iv.visW, iv.visH = img.Width, img.Height
 		iv.anchorPending = false
+		iv.carryPending = false
+		iv.carrySurface = nil
 		p.Cols, p.Rows = cellsFor(dispW, cw, cols), cellsFor(dispH, ch, rows)
 		p.Col = x1 + (cols-p.Cols)/2
 		p.Row = top + (rows-p.Rows)/2
@@ -786,7 +855,14 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 	iv.panMaxX = max(0, float64(img.Width-visW))
 	iv.panMaxY = max(0, float64(img.Height-visH))
 	iv.visW, iv.visH = visW, visH
-	if iv.anchorPending {
+	if iv.carryPending && img != iv.carrySurface {
+		// A new picture landed while the reader panned the old one: keep the
+		// relative spot, not the pixel offset, so the view matches.
+		iv.panX = iv.carryFracX * float64(max(0, img.Width-visW))
+		iv.panY = iv.carryFracY * float64(max(0, img.Height-visH))
+		iv.carryPending = false
+		iv.carrySurface = nil
+	} else if iv.anchorPending {
 		iv.panX = iv.zoomFocusX - float64(visW)/2
 		iv.panY = iv.zoomFocusY - float64(visH)/2
 		iv.anchorPending = false
@@ -810,22 +886,20 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 	return p, true
 }
 
-// arrow is what the arrow keys do: pan an axis that can move, else walk the
-// directory. w/a/s/d always pan.
-func (iv *ImageView) arrow(dx, dy int) {
-	if dx != 0 && iv.panMaxX > 0 {
-		iv.Pan(dx, 0)
-		return
+// panKey pans the picture with a numpad navigation key: the plain arrow
+// codes the numpad sends with NumLock off, and the explicit numpad codes
+// with NumLock on. w/a/s/d pan the same way.
+func (iv *ImageView) panKey(vk uint16) {
+	switch vk {
+	case vtinput.VK_LEFT, vtinput.VK_NUMPAD4:
+		iv.Pan(-1, 0)
+	case vtinput.VK_RIGHT, vtinput.VK_NUMPAD6:
+		iv.Pan(1, 0)
+	case vtinput.VK_UP, vtinput.VK_NUMPAD8:
+		iv.Pan(0, -1)
+	case vtinput.VK_DOWN, vtinput.VK_NUMPAD2:
+		iv.Pan(0, 1)
 	}
-	if dy != 0 && iv.panMaxY > 0 {
-		iv.Pan(0, dy)
-		return
-	}
-	if dx < 0 || dy < 0 {
-		iv.Step(-1)
-		return
-	}
-	iv.Step(1)
 }
 
 // titleName prefixes a * to the picked picture, so selection is visible
@@ -847,8 +921,8 @@ func (iv *ImageView) logGeometry(scr *vtui.ScreenBuf, p vtui.ImagePlacement) {
 	x1, y1, x2, y2 := iv.GetPosition()
 	cw, ch := scr.Graphics().CellSize()
 	line := fmt.Sprintf(
-		"console=%dx%d frame=%d,%d..%d,%d bar=%d cell=%dx%d img=%dx%d scale=%.4f place=%d,%d %dx%d src=%d,%d %dx%d z=%d layer=%d",
-		iv.conW, iv.conH, x1, y1, x2, y2, iv.barHeight(), cw, ch,
+		"console=%dx%d frame=%d,%d..%d,%d inset=%d cell=%dx%d img=%dx%d scale=%.4f place=%d,%d %dx%d src=%d,%d %dx%d z=%d layer=%d",
+		iv.conW, iv.conH, x1, y1, x2, y2, vtui.FrameManager.WorkspaceTopInset(), cw, ch,
 		img.Width, img.Height, iv.lastScale,
 		p.Col, p.Row, p.Cols, p.Rows, p.SrcX, p.SrcY, p.SrcW, p.SrcH, p.ZIndex,
 		scr.Graphics().Len())
@@ -983,10 +1057,10 @@ func (iv *ImageView) baseName() string {
 	return filepath.Base(iv.path)
 }
 
-// displaySize is the picture dimensions, "1442 x 2160".
+// displaySize is the picture dimensions, "1442x2160".
 func (iv *ImageView) displaySize() string {
 	img := iv.display()
-	return fmt.Sprintf("%d x %d", img.Width, img.Height)
+	return fmt.Sprintf("%dx%d", img.Width, img.Height)
 }
 
 // scalePercent is how much of the picture fits the window, rounded.
@@ -996,14 +1070,6 @@ func (iv *ImageView) scalePercent() int {
 		scale = iv.zoom
 	}
 	return int(scale*100 + 0.5)
-}
-
-// positionLabel is "4/683" when the viewer shares its folder with other files.
-func (iv *ImageView) positionLabel() string {
-	if iv.index >= 0 && len(iv.siblings) > 1 {
-		return fmt.Sprintf("%d/%d", iv.index+1, len(iv.siblings))
-	}
-	return ""
 }
 
 // decoderLabel is "go-std 15 ms" in the OSD and titles.
@@ -1016,23 +1082,6 @@ func decoderWithTime(decoder string, dur time.Duration) string {
 		return decoder
 	}
 	return decoder + " " + formatImageDuration(dur)
-}
-
-// stateLabel adds the picture's status; ", slideshow" always goes last.
-func (iv *ImageView) stateLabel() string {
-	state := iv.decoderLabel()
-	switch {
-	case iv.err != nil:
-		state = "error: " + iv.err.Error()
-	case iv.loading:
-		state += ", decoding"
-	case iv.preview:
-		state += ", preview"
-	}
-	if iv.slideStop != nil {
-		state += ", slideshow"
-	}
-	return state
 }
 
 // overlayLines is what the info panel has to say about the picture.
@@ -1265,7 +1314,7 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 		return
 	}
 	x1, y1, x2, y2 := iv.GetPosition()
-	top := y1 + iv.barHeight()
+	top := y1
 
 	width := 0
 	for _, s := range lines {
@@ -1299,15 +1348,9 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 
 func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	iv.ScreenObject.Show(scr)
-	if iv.topBar != nil {
-		iv.topBar.SetVisible(!iv.full)
-		if !iv.full {
-			iv.topBar.Show(scr)
-		}
-	}
 
 	x1, y1, x2, y2 := iv.GetPosition()
-	top := y1 + iv.barHeight()
+	top := y1
 	scr.FillRect(x1, top, x2, y2, ' ', imageViewBackAttr)
 	if iv.gal != nil {
 		iv.showGallery(scr)
@@ -1431,6 +1474,16 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 	case '*', '0':
 		iv.ToggleActualSize()
 		return true
+	case '~', '`', 'ё', 'Ё':
+		// Compare: flip between this picture and the next one. The grid has
+		// its own use for every key, so the toggle is a single-picture key.
+		// The physical key left of "1" is matched here too, because its
+		// character depends on the layout and backend: ` and ~ on English,
+		// ё and Ё on Russian, and the gogpu host delivers it as text only.
+		if iv.gal == nil {
+			iv.ToggleCompare()
+		}
+		return true
 	case '>', '.':
 		iv.Rotate(90)
 		return true
@@ -1458,6 +1511,21 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 	case 's', 'S':
 		iv.Pan(0, 1)
 		return true
+	case 'j', 'J', 'о', 'О':
+		// Walk the directory, like Space: one hand, no numpad needed. The
+		// physical key is matched whatever the layout says (о/О is the same
+		// key on the Russian layout, and the terminal has nothing but the
+		// character); the grid keeps its own keys, so the pair is a
+		// single-picture one.
+		if iv.gal == nil {
+			iv.Step(1)
+		}
+		return true
+	case 'k', 'K', 'л', 'Л':
+		if iv.gal == nil {
+			iv.Step(-1)
+		}
+		return true
 	}
 
 	switch e.VirtualKeyCode {
@@ -1469,6 +1537,14 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 		return true
 	case vtinput.VK_PRIOR, vtinput.VK_BACK:
 		iv.Step(-1)
+		return true
+	case vtinput.VK_OEM_3:
+		// The key left of "1", whatever its character: backends that carry
+		// the physical key (Windows console, X11) may leave Char empty or
+		// hold a layout character that is not '~'.
+		if iv.gal == nil {
+			iv.ToggleCompare()
+		}
 		return true
 	case vtinput.VK_HOME:
 		if len(iv.siblings) > 0 {
@@ -1497,17 +1573,50 @@ func (iv *ImageView) ProcessKey(e *vtinput.InputEvent) bool {
 	case vtinput.VK_DELETE:
 		iv.SetSelected(iv.path, false)
 		return true
-	case vtinput.VK_LEFT:
-		iv.arrow(-1, 0)
+	case vtinput.VK_LEFT, vtinput.VK_RIGHT, vtinput.VK_UP, vtinput.VK_DOWN:
+		// The regular (enhanced) arrows walk the directory, whatever the
+		// zoom; the numpad arrows pan. The console marks the cluster arrows
+		// enhanced and leaves the numpad ones plain, and the terminal parser
+		// flags its arrow sequences the same way.
+		if e.ControlKeyState&vtinput.EnhancedKey != 0 {
+			if e.VirtualKeyCode == vtinput.VK_LEFT || e.VirtualKeyCode == vtinput.VK_UP {
+				iv.Step(-1)
+			} else {
+				iv.Step(1)
+			}
+			return true
+		}
+		iv.panKey(e.VirtualKeyCode)
 		return true
-	case vtinput.VK_RIGHT:
-		iv.arrow(1, 0)
+	case vtinput.VK_NUMPAD2, vtinput.VK_NUMPAD4, vtinput.VK_NUMPAD6, vtinput.VK_NUMPAD8:
+		// Numpad navigation with NumLock on.
+		iv.panKey(e.VirtualKeyCode)
 		return true
-	case vtinput.VK_UP:
-		iv.arrow(0, -1)
+	case vtinput.VK_J, vtinput.VK_K:
+		// The physical letters j/k, whatever the layout: the console and
+		// gogpu deliver the character and the code together, so a layout
+		// that puts another letter on the key still walks the same way.
+		if iv.gal == nil {
+			if e.VirtualKeyCode == vtinput.VK_J {
+				iv.Step(1)
+			} else {
+				iv.Step(-1)
+			}
+		}
 		return true
-	case vtinput.VK_DOWN:
-		iv.arrow(0, 1)
+	}
+	return false
+}
+
+// ProcessMouse: a double left click flips between the fitted and the actual
+// size, exactly like the * key.
+func (iv *ImageView) ProcessMouse(e *vtinput.InputEvent) bool {
+	if e == nil || e.Type != vtinput.MouseEventType {
+		return false
+	}
+	if e.KeyDown && e.ButtonState&vtinput.FromLeft1stButtonPressed != 0 &&
+		e.MouseEventFlags&vtinput.DoubleClick != 0 {
+		iv.ToggleActualSize()
 		return true
 	}
 	return false
@@ -1521,10 +1630,23 @@ func (iv *ImageView) HandleCommand(cmd int, args any) bool {
 	return iv.BaseFrame.HandleCommand(cmd, args)
 }
 
+// stopGallery cancels in-flight tile decodes and forgets the grid.
+func (iv *ImageView) stopGallery() {
+	if iv.gal == nil {
+		return
+	}
+	for _, cancel := range iv.gal.cancels {
+		cancel()
+	}
+	iv.gal = nil
+	clear(iv.blockTiles)
+}
+
 func (iv *ImageView) Close() {
 	// Full screen is a manager state, so leaving the viewer hands the bars back.
 	iv.full = false
 	iv.cancelDecode()
+	iv.stopGallery()
 	iv.stopSlideShow()
 	iv.stopAnimIfIdle()
 	vtui.FrameManager.HideBars = false
@@ -1548,12 +1670,9 @@ func (iv *ImageView) GetKeyLabels() *vtui.KeySet {
 
 func (iv *ImageView) GetType() vtui.FrameType { return vtui.TypeUser + 7 }
 
-// GetTitle is the full window title (name, size, scale, position, state).
+// GetTitle is the window title: just the file name and the resolution, so
+// the terminal title and the workspace tab stay short, e.g. "photo.jpg
+// (1920x1080)". The rest of the picture's state lives in the OSD.
 func (iv *ImageView) GetTitle() string {
-	parts := []string{iv.titleName(), iv.displaySize(), fmt.Sprintf("%d%%", iv.scalePercent())}
-	if rel := iv.positionLabel(); rel != "" {
-		parts = append(parts, rel)
-	}
-	parts = append(parts, iv.stateLabel())
-	return strings.Join(parts, "   ")
+	return iv.titleName() + " (" + iv.displaySize() + ")"
 }
