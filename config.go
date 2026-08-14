@@ -333,7 +333,7 @@ var AppConfig = F4Config{
 	SlideShowDelay:           defaultSlideShowDelay,
 	ImageExternalTimeout:     imagedec.DefaultImageExternalTimeout,
 	ImageDecoderPriority:     "",
-	ImageFullScreen:          false,
+	ImageFullScreen:          true,
 	ImageShowOverlay:         false,
 	ConfirmCopy:              true,
 	ConfirmMove:              true,
@@ -574,7 +574,7 @@ func LoadConfig() {
 	imagedec.ImageExternalTimeoutSeconds = AppConfig.ImageExternalTimeout
 	AppConfig.ImageDecoderPriority = ini.GetString("Images", "DecoderPriority", "")
 	imagedec.SetImageDecoderPriorities(imagedec.ParseImageDecoderPriorities(AppConfig.ImageDecoderPriority))
-	AppConfig.ImageFullScreen = ini.GetString("Images", "FullScreen", "0") == "1"
+	AppConfig.ImageFullScreen = ini.GetString("Images", "FullScreen", "1") == "1"
 	AppConfig.ImageShowOverlay = ini.GetString("Images", "ShowOverlay", "0") == "1"
 	AppConfig.ImageBlockRenderer = 1
 	fmt.Sscanf(ini.GetString("Images", "BlockRenderer", "1"), "%d", &AppConfig.ImageBlockRenderer)

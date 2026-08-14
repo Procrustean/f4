@@ -114,12 +114,7 @@ func (iv *ImageView) ToggleGallery() {
 	iv.stopSlideShow()
 	iv.stopAnimIfIdle()
 	if iv.gal != nil {
-		// Stop in-flight tile decodes; their thumbs are no longer wanted.
-		for _, cancel := range iv.gal.cancels {
-			cancel()
-		}
-		iv.gal = nil
-		clear(iv.blockTiles)
+		iv.stopGallery()
 		return
 	}
 	cursor := iv.index
@@ -270,7 +265,7 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 		return
 	}
 	x1, y1, x2, y2 := iv.GetPosition()
-	top := y1 + iv.barHeight()
+	top := y1
 
 	g.layout(x2-x1+1, y2-top+1)
 	total := len(iv.siblings)

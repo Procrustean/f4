@@ -31,8 +31,7 @@ func (iv *ImageView) ToggleSlideShow() {
 		return // one picture is not a slide show
 	}
 
-	// The grid and the show can't both own the current picture.
-	iv.gal = nil
+	iv.stopGallery()
 
 	stop := make(chan struct{})
 	iv.slideStop = stop

@@ -122,8 +122,10 @@ func TestImageViewGalleryDrawsATileForEachPicture(t *testing.T) {
 		t.Errorf("two thumbnails are ready, %d were placed", n)
 	}
 
-	// Every tile is captioned, whether its thumbnail has arrived or not.
-	row := ScreenRow(scr, imageTileRows, 0, 79)
+	// Every tile is captioned, whether its thumbnail has arrived or not. The
+	// grid starts at the very top of the screen, so the first caption is on
+	// the tile's bottom row, one short of the tile height.
+	row := ScreenRow(scr, imageTileRows-1, 0, 79)
 	for _, name := range []string{"a.png", "b.png", "c.png"} {
 		if !strings.Contains(row, name) {
 			t.Errorf("the caption row is %q, without %s", row, name)
