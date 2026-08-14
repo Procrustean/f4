@@ -700,7 +700,10 @@ func registerWICProgressCancel(decoder uintptr, ctx context.Context) func() {
 		wicRelease(prog)
 		return noop
 	}
-	return func() { wicRelease(prog) }
+	return func() {
+		defer runtime.KeepAlive(state)
+		wicRelease(prog)
+	}
 }
 
 // wicProgressState is the per-decode payload the codec hands back to the
