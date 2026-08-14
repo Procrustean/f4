@@ -8,14 +8,10 @@ import (
 	"github.com/unxed/vtui"
 )
 
-// newBlockTestScreen returns a small silent screen for block render tests.
+// newBlockTestScreen is newBenchScreen wrapped for tests.
 func newBlockTestScreen(t *testing.T) *vtui.ScreenBuf {
 	t.Helper()
-	scr := vtui.NewScreenBuf()
-	scr.Writer = io.Discard
-	scr.AllocBuf(80, 25)
-	scr.Graphics().SetProtocol(vtui.GraphicsNone)
-	return scr
+	return newBenchScreen()
 }
 
 // newBenchScreen is newBlockTestScreen without the testing.T, for benchmarks.

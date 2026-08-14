@@ -7,15 +7,10 @@ import (
 	"github.com/unxed/vtui"
 )
 
-// Rotation and mirroring over the RGBA bytes: the backends only ship a
-// rectangle of pixels, so orientation must be baked in first.
-//
-// Every function returns a fresh, tightly packed surface and never touches
-// the source, so the decoded picture stays around and the shown one rebuilds.
-//
-// A quarter turn (a transposition) runs in one cache-blocked pass, so a turn
-// plus mirroring lands in a single allocation; half turns and mirrorings stay
-// per-pixel, near memcpy speed.
+// Rotation and mirroring over RGBA bytes. Every function returns a fresh,
+// tightly packed surface and never touches the source, so the decoded
+// picture stays around and the shown one rebuilds. A quarter turn runs in
+// one cache-blocked pass; half turns and mirrorings stay per-pixel.
 
 // CopySurface returns a tightly packed copy of a surface.
 func CopySurface(src *vtui.ImageSurface) *vtui.ImageSurface {
