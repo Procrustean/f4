@@ -22,3 +22,5 @@ BENCH_NOTES.md
 image_block_legacy_bench_test.go
 imagedec/image_decode_bench_test.go
 kitty_graphics_bench_test.go
+IMAGE_VIEWER_FEATURES.md
+
