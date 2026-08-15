@@ -59,15 +59,19 @@ would need callbacks to keep four things in step and would gain nothing.
 In `f4` (package `main`):
 
 - `image_pipeline.go` — the cache, the job queue, the workers, prefetch
-- `image_decode.go`, `image_qoi.go`, `image_bmp.go`, `image_preview.go` —
-  decoders and the Exif thumbnail path
-- `image_external.go` — the converter of last resort: `magick`, `convert` or
-  `ffmpeg`, whichever is on the `PATH`
+- `image_lru.go` — the one weight-bounded LRU behind every pipeline cache
+- `image_preview.go` — the Exif thumbnail path
 - `image_transform.go` — rotation and mirroring over the RGBA bytes
+- `image_block.go` — the half-block cell renderer (fallback for no graphics),
+  with the plain (glyph-less) insurance tier and its `BlockPlain` setting
 - `image_view.go` — the viewer frame: layout, zoom, panning, orientation,
   the info overlay, keys
 - `image_gallery.go` — the F12 thumbnail grid and the shared selection
 - `image_slideshow.go` — the Ctrl+S timer
+- `imagedec/` — every decoder: `image_decode.go` (registry and stdlib),
+  `image_qoi.go`, `image_bmp_ico.go`, `image_netpbm.go`, `image_external.go`
+  (`magick`/`convert`/`ffmpeg`), `image_decode_win_api.go` (WIC and the
+  Windows shell), `image_native_darwin.go`
 - `kitty_graphics.go` — accepting the kitty protocol in the built-in terminal
 - `actions.go` — `tryOpenImageViewer`, `imageSiblingPaths`, and the wiring of
   the selection between the viewer and the panel
@@ -91,7 +95,7 @@ built-in terminal (transmission, placement, drawing through
 the child process (`KITTY_WINDOW_ID`, `TERM_PROGRAM`, `TERM=xterm-kitty` under
 a terminfo check and the `AnnounceKittyTerm` option); the decoding pipeline;
 preview from the Exif thumbnail; QOI and BMP decoders; walking the neighbours
-with prefetch; the 100% mode; `Ctrl+R`; errors shown in the title.
+with prefetch; the 100% mode; `Ctrl+R`; errors shown in a toast.
 
 Done in the current sequence, listed in the order the work happened rather
 than in the order of the numbering below, which the work has already outgrown.
@@ -108,8 +112,9 @@ never copied. Keys: `>` and `.` turn clockwise, `<` and `,` counter-clockwise,
 **2. Full screen and the info overlay.** `FrameManager.HideBars` in vtui;
 `ImageView.ResizeConsole` remembers the console size and gives the key bar row
 to the picture in full screen; `F` and `Ctrl+F` switch it, `Close` gives it
-back. `Ctrl+I` (and `I`) raises a panel with the name, the size on screen, the
-file size, the decoder, the scale and the orientation.
+back. `Ctrl+I` (and `I`) raises a panel with the name, the picture size, the
+file size and its modification time, the decoder and decode duration, and the
+orientation.
 
 **3. The gallery and the slide show.** `F12` opens a grid of thumbnails;
 `Ins` and `Del` pick and unpick, and the choice is shared with the panel in
@@ -139,10 +144,30 @@ a cell changes size. Leaving the alternate screen now drops its pictures.
 
 **R1. Picking and walking in the single picture view.** Asked for on the
 issue: `Ins` and `Del` pick and unpick the picture on screen and move on to
-the next, exactly as they do in the grid, and the title bar turns the colour a
-picked tile has and gains an asterisk. The arrow keys walk the directory when
-their axis has nothing to pan and pan when it has; `w`, `a`, `s` and `d` pan
-whatever happens.
+the next, exactly as they do in the grid, and the window title marks a picked
+picture with an asterisk. The regular (enhanced) arrows walk the directory;
+the numpad arrows pan; `w`, `a`, `s` and `d` pan whatever happens. `j`/`k`
+walk too, and `~` flips between two neighbouring pictures for comparison.
+
+Done after that, on top of the sequence above: the `~` compare toggle that
+carries zoom and pan between the two sides; zoom and pan following the reader
+from one picture to the next (as a share of the pan range); `j`/`k` walking;
+the numpad-vs-arrow split; a double click for the 1:1 fit; the viewer's own
+title bar removed in favour of a short window title; the gallery starting at
+the top row; in-flight tile decodes cancelled when the viewer closes, the grid
+closes or a slide show starts; the three pipeline caches merged into one
+generic LRU; and the WIC progress callback lifetime fix.
+
+**The plain insurance tier.** `BlockPlain` (`[Images]`) stamps every cell
+as a space with one colour — the linear average of the two halves — instead
+of the `▀` half-block with a fg/bg pair, so a font that lacks the block
+glyph cannot break the picture (it still degrades to 256/16 colours through
+vtui's writer). It is also automatic on 16-colour consoles, whose fonts
+cannot be trusted with the glyph. `Shift+F4` cycles the renderers on every
+terminal: with the graphics protocol it is graphics → half-block → plain,
+and without one it flips the two block variants, so the glyph-free picture
+is one keypress away anywhere. The renderer's memo counts the plain flag,
+so toggling it mid-view cannot serve stale cells.
 
 ## 5. What is left, in order
 
@@ -211,11 +236,33 @@ so that far2l running inside f4 can hand pictures over through its own channel.
 **12. Video.** A second source of frames on top of the same placement layer:
 decode through an external `ffmpeg` into a stream of RGBA, a frame timer, and
 controls from the viewer (`Right`/`Left` for ±10 seconds, `Up`/`Down` for
-volume).
+volume). A still frame from a video is done — the Windows shell decoder
+renders the first frame from a real path — but playback, seeking and volume
+are not.
 
 Note that steps 9 to 11 exist because **kitty images do not work in either
 direction between f4 and far2l today**: not when f4 runs inside far2l, and not
 the other way round.
+
+**13. Viewer features and keys that are still missing.** Not done yet; the
+list is a wish-list rather than a schedule.
+
+- Animated GIF and WebP: only the first frame is shown today.
+- Video playback controls: seek, volume, a frame timer (see step 12).
+- Mouse wheel zoom and drag-to-pan; today the mouse only toggles 1:1 on a
+  double click.
+- Fit-width and fit-height modes, in addition to fit and 1:1.
+- EXIF metadata display beyond the thumbnail (shutter, ISO, lens).
+- File operations from the viewer: delete, move, rename, copy the path.
+- Rotate/save-as: persist an orientation instead of only viewing it.
+- Settings-dialog entries for `SlideShowDelay`, `ExternalTimeout`,
+  `DecoderPriority`, `BlockRenderer`, `BlockPlain`, `FullScreen` and
+  `ShowOverlay` — they are config-file only today.
+- Gallery tile size (18x9 cells) as a `[Images]` setting.
+- A slide show that waits for a decode instead of skipping a still-loading
+  frame.
+- iTerm2 and sixel output and input (steps 7 and 8) and the far2l interop
+  (steps 9 to 11).
 
 ## 6. Decisions worth not undoing
 
@@ -280,14 +327,14 @@ the other way round.
   reading any file on the machine. It is refused before it reaches the file
   system rather than after.
 
-- **An arrow steps only when its axis cannot be panned at all.** Panning to
-  the edge of a zoomed picture and then jumping to the next one reads as a
-  slip of the finger. A picture that fits has no edge to reach, and that is
-  the case the request was about; `w`, `a`, `s` and `d` pan unconditionally,
-  so nothing is lost.
-- **The title bar carries both a colour and a mark for a picked picture.** The
-  colour is the one the grid gives a picked tile, so the two views agree; the
-  asterisk survives a terminal whose colours nobody has set up.
+- **The regular arrows walk, the numpad arrows pan.** The console flags the
+  cluster arrows `EnhancedKey` and leaves the numpad ones plain, so the two
+  can be told apart; `w`, `a`, `s` and `d` pan unconditionally. A reader who
+  zooms a picture pans with the numpad or `wasd`, and never jumps to the next
+  file by accident.
+- **The window title marks a picked picture with an asterisk.** The asterisk
+  survives a terminal whose colours nobody has set up; the title itself stays
+  short (`name (WxH)`) so the workspace tab does not crowd.
 
 ## 7. Traps
 
@@ -337,10 +384,10 @@ asking, and the user may want a different one.
   is never seen. Either the attribute needs a "default colour" state, or the
   graphics layer needs to tell the backend not to paint the cells a negative
   `z` placement covers.
-- `ImageView.panMaxX` and `panMaxY` come from the last frame, so the arrow
-  keys walk rather than pan until the picture has been drawn once. That is the
-  right answer for a picture that fits, which is every picture before somebody
-  zooms it, so the case never shows.
+- `ImageView.panMaxX` and `panMaxY` come from the last frame, so a carry
+  taken before the first draw sees a zero range and lands at the origin. That
+  only happens for a picture that has never been drawn, where there is nothing
+  to carry.
 - `t=s` works wherever shared memory objects appear in the file system, which
   is Linux and the BSDs. On macOS and Windows `kittyShmPath` reports that the
   system has none, and the client gets `EBADF`. Doing better would need cgo
@@ -348,11 +395,71 @@ asking, and the user may want a different one.
 - Leaving the alternate screen drops its pictures but does not tell the store
   that they are gone, so the images themselves wait for the `kittyMaxImages`
   eviction. The same was already true of the erase path.
-- `ImagePipeline.run` still calls the loader with `context.Background()`, so
-  the context now threaded down to the external decoder is never cancelled in
-  practice. The timeout works; the cancellation is waiting for the pipeline to
-  learn how to drop a job.
+- A decode is never cancelled mid-flight. The job's context is threaded to
+  the loader and the result is dropped when the waiter's context expires, but
+  the decoder keeps running to completion; the pipeline has no way to abort a
+  job it has already handed to a decoder.
 - Only the still picture is taken from a converter that could give more: an
   animated `webp` arrives as its first frame. Animation belongs with step 12.
 - `ExternalTimeout` and `DecoderPriority` are read and written but do not
   appear in the settings dialog, same as `SlideShowDelay`.
+
+## 9. Mip-mapping and tiled rendering at zoom and pan — analysis, not code
+
+Asked about: whether precomputed mip levels and a tile-based display would
+help when a large picture is zoomed or panned, so only part of it (or a very
+small part) is on screen. This is a CPU-side question: the backends ship
+rectangles of pixels to a terminal or a native renderer, they do not expose
+OpenGL/DX-style texture sampling, so any answer has to be about the two
+renderers f4 itself controls.
+
+**The graphics backends already tile the display.** A kitty/sixel placement
+carries a source rect (`SrcX/SrcY/SrcW/SrcH`) and the terminal scales that
+rect into the cell grid. Deep zoom sends a placement whose source rect is the
+visible region only — the terminal keeps the full picture under the same
+`gfxKey` and scales the crop, so only the placement command is re-sent, not
+the pixels. The decoded surface in memory is still the whole picture, but the
+display cost does not grow with the image; it grows with the window. There is
+nothing to tile on the display side for these backends.
+
+**The block renderer is the only CPU filter, and it already bounds its work
+two ways.** The half-block pass is a separable box filter in linear RGB that
+averages the source crop into the cell rect. Two caches keep it from running
+every frame: `memoHit` re-stamps the cells while the geometry is unchanged,
+and `workDraw` resamples the visible region plus a margin once and pans cut
+cached colours from that working copy. So a static view, and pans inside the
+margin, never re-filter. What still costs is a geometry change on a very
+large picture zoomed out: the horizontal pass walks the whole crop (a fully
+fitted 12000x8000 picture reads ~96M pixels once, ~100-200 ms), and each zoom
+step outside the margin re-runs it.
+
+**Mip-maps would help only that one case.** A lazy 2x pyramid — build levels
+only when a zoomed-out view needs them, pick the level whose density is a
+few source pixels per output pixel, then box-filter a small region — would
+bound the filter to ~4-16x the output size regardless of the source. The
+costs are extra memory (~1.33x the pixels if all levels are kept; a lazy
+build keeps only the levels actually used) and one downscale pass per level.
+For the common photo sizes the current filter is fine, so the pyramid should
+only kick in past a threshold (say a few megapixels of crop). A cheaper
+alternative with the same effect is decimation: when the target density is
+below one output pixel per handful of source pixels, stride the horizontal
+pass by a factor of K so the box average still samples a few pixels per
+output cell. Slightly lower quality than a true mip, no memory, trivial to
+implement — the right first step if profiling shows the zoomed-out filter is
+actually the bottleneck.
+
+**Tiled decode is a format question, not a renderer one.** JPEG and PNG are
+not randomly addressable: any visible region requires decoding the whole
+frame (or a WIC scaler, which decodes whole at a reduced size). Only tiled
+TIFF and, awkwardly, progressive JPEG support cropping during decode, and the
+pipeline's `requestFull` already fetches the whole picture for deep zoom. The
+display-side tiling the backends already do makes decode-side tiling
+pointless for the common formats; it would only matter for genuinely huge
+images (hundreds of megapixels) where decoding the whole frame into memory is
+the real cost, and there the answer is a sized decode, not tiles.
+
+**Bottom line.** Nothing to change for the graphics backends — they already
+scale crops terminal-side and the working copy covers the block renderer's
+pans. If a huge zoomed-out picture feels slow to re-fit in half-block mode,
+add decimation (or a lazy mip) to the block filter; measure first, since the
+filter already runs once per geometry change.

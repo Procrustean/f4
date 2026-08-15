@@ -322,7 +322,7 @@
     ├── hotkeys_ui_test.go
     ├── I18N.md
     ├── IDEAS.md
-    ├── image_bmp.go
+    ├── image_bmp_ico.go
     ├── image_decode.go
     ├── image_decode_test.go
     ├── image_external.go
