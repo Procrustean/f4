@@ -11,6 +11,11 @@ import (
 // newBlockTestScreen is newBenchScreen wrapped for tests.
 func newBlockTestScreen(t *testing.T) *vtui.ScreenBuf {
 	t.Helper()
+	// The placement tests assume the tab bar reserves the top row, so pin
+	// the mode: earlier tests may have switched it globally.
+	wasMode := vtui.FrameManager.WorkspaceTabMode
+	vtui.FrameManager.WorkspaceTabMode = vtui.WorkspaceTabsAlways
+	t.Cleanup(func() { vtui.FrameManager.WorkspaceTabMode = wasMode })
 	return newBenchScreen()
 }
 
