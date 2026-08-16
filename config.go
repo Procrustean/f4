@@ -215,6 +215,7 @@ type F4Config struct {
 	ImageFullScreen        bool
 	ImageShowOverlay       bool
 	ImageBlockRenderer     int // 0 = off, 1 = half-block fallback, 2 = always
+	ImageSixelPalette      string // tiled (default), adaptive, or fixed cube
 	RegisteredPlugins      []string
 	ConfirmCopy            bool
 	ConfirmMove            bool
@@ -335,6 +336,7 @@ var AppConfig = F4Config{
 	ImageDecoderPriority:     "",
 	ImageFullScreen:          true,
 	ImageShowOverlay:         false,
+	ImageSixelPalette:        "tiled",
 	ConfirmCopy:              true,
 	ConfirmMove:              true,
 	ConfirmDelete:            true,
@@ -581,6 +583,13 @@ func LoadConfig() {
 	if AppConfig.ImageBlockRenderer < 0 || AppConfig.ImageBlockRenderer > 2 {
 		AppConfig.ImageBlockRenderer = 1
 	}
+	AppConfig.ImageSixelPalette = ini.GetString("Images", "SixelPalette", "tiled")
+	switch strings.ToLower(AppConfig.ImageSixelPalette) {
+	case "fixed", "adaptive", "tiled":
+		AppConfig.ImageSixelPalette = strings.ToLower(AppConfig.ImageSixelPalette)
+	default:
+		AppConfig.ImageSixelPalette = "tiled"
+	}
 	AppConfig.UseExternalEditor = ini.GetString("Editor", "UseExternalEditor", "0") == "1"
 	AppConfig.ExternalEditorCommand = ini.GetString("Editor", "ExternalEditorCommand", "")
 	plugStr := ini.GetString("Plugins", "List", "")
@@ -749,6 +758,7 @@ func SaveConfig() {
 	sb.WriteString(fmt.Sprintf("FullScreen = %d\n", map[bool]int{true: 1, false: 0}[AppConfig.ImageFullScreen]))
 	sb.WriteString(fmt.Sprintf("ShowOverlay = %d\n", map[bool]int{true: 1, false: 0}[AppConfig.ImageShowOverlay]))
 	sb.WriteString(fmt.Sprintf("BlockRenderer = %d\n", AppConfig.ImageBlockRenderer))
+	sb.WriteString(fmt.Sprintf("SixelPalette = %s\n", AppConfig.ImageSixelPalette))
 	sb.WriteString("\n[Plugins]\n")
 	sb.WriteString(fmt.Sprintf("List = %s\n", strings.Join(AppConfig.RegisteredPlugins, "|")))
 

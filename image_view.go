@@ -1004,6 +1004,9 @@ func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
 	if scr == nil {
 		return
 	}
+	// The sixel palette mode is read when the encoder is first built, so it
+	// has to be in place before any image is drawn.
+	vtui.SetSixelPaletteMode(AppConfig.ImageSixelPalette)
 	prots := vtui.ProbeGraphicsProtocols()
 	best := vtui.GraphicsNone
 	if len(prots) > 0 {

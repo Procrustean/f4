@@ -51,6 +51,7 @@ func TestConfig_SaveAndLoad(t *testing.T) {
 	AppConfig.RestoreWorkspaceTabs = false
 	AppConfig.WorkspaceTabNumbering = WorkspaceTabNumbersOrder
 	AppConfig.ApplyCommandParallelism = 0
+	AppConfig.ImageSixelPalette = "fixed"
 
 	// 2. Save
 	SaveConfig()
@@ -75,6 +76,7 @@ func TestConfig_SaveAndLoad(t *testing.T) {
 	AppConfig.RestoreWorkspaceTabs = true
 	AppConfig.WorkspaceTabNumbering = WorkspaceTabNumbersAlways
 	AppConfig.ApplyCommandParallelism = 1
+	AppConfig.ImageSixelPalette = "adaptive"
 
 	// 4. Load
 	LoadConfig()
@@ -142,6 +144,9 @@ func TestConfig_SaveAndLoad(t *testing.T) {
 	}
 	if AppConfig.ApplyCommandParallelism != 0 {
 		t.Errorf("ApplyCommandParallelism = %d, want Unlimited (0)", AppConfig.ApplyCommandParallelism)
+	}
+	if AppConfig.ImageSixelPalette != "fixed" {
+		t.Errorf("LoadConfig failed to restore ImageSixelPalette: %q", AppConfig.ImageSixelPalette)
 	}
 }
 
