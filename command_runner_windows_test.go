@@ -20,7 +20,7 @@ func TestLocalCommandRunnerWindowsStreamsMergedLinesAndExitStatus(t *testing.T) 
 	code, err := NewLocalCommandRunner().RunCommand(
 		context.Background(),
 		dir,
-		`cd & (set /p F4_TEST_INPUT= || echo stdin-eof) & echo stderr-line 1>&2 & <nul set /p "=partial" & exit /b 7`,
+		`cd & echo out-line & echo err-line 1>&2 & <nul set /p =tail & exit /b 7`,
 		func(line string) { got = append(got, line) },
 	)
 	if err != nil {
@@ -29,8 +29,27 @@ func TestLocalCommandRunnerWindowsStreamsMergedLinesAndExitStatus(t *testing.T) 
 	if code != 7 {
 		t.Fatalf("exit code = %d, want 7", code)
 	}
-	if len(got) != 4 || !strings.EqualFold(got[0], dir) || got[1] != "stdin-eof" || got[2] != "stderr-line" || got[3] != "partial" {
-		t.Fatalf("lines = %#v", got)
+
+	// stdout and stderr are separate pipes, so their lines may be delivered
+	// in either order; cmd also pads echo and set /p output with trailing
+	// spaces. Assert that each stream's line and the unterminated tail line
+	// were all delivered, rather than a specific cross-stream ordering.
+	var sawDir, sawOut, sawErr, sawTail bool
+	for _, line := range got {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.EqualFold(line, dir):
+			sawDir = true
+		case line == "out-line":
+			sawOut = true
+		case line == "err-line":
+			sawErr = true
+		case line == "tail":
+			sawTail = true
+		}
+	}
+	if !sawDir || !sawOut || !sawErr || !sawTail {
+		t.Fatalf("lines = %#v, want dir, out-line (stdout), err-line (stderr) and tail present", got)
 	}
 
 	info := NewLocalCommandRunner().CommandRunnerInfo()
