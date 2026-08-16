@@ -156,6 +156,7 @@ func TestSemantic_ViewerViewActions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create viewer: %v", err)
 	}
+	defer viewer.Close()
 
 	// Test scroll action
 	actionScroll := map[string]any{

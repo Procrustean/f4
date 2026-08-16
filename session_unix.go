@@ -395,6 +395,8 @@ func runServer(sockPath string) {
 			vtui.DebugLog("SERVER: FD %d is NOT a terminal, raw mode skipped.", os.Stdin.Fd())
 		}
 
+		applyImageGraphicsStartup(scr)
+
 		// Sync terminal size
 		if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 && h > 0 {
 			vtui.DebugLog("SERVER: Terminal size: %dx%d", w, h)

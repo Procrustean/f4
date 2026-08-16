@@ -783,10 +783,9 @@ func (iv *ImageView) clampPan(visW, visH int) {
 	}
 }
 
-// cellSize returns the graphics cell size, with the fallback for backends
-// that report none.
+// cellSize returns the protocol-aware cell size, with the 8x16 fallback.
 func cellSize(scr *vtui.ScreenBuf) (int, int) {
-	cw, ch := scr.Graphics().CellSize()
+	cw, ch := scr.Graphics().EffectiveCellSize()
 	if cw <= 0 || ch <= 0 {
 		return imageViewFallbackCellW, imageViewFallbackCellH
 	}
@@ -986,11 +985,38 @@ func (iv *ImageView) ToggleOverlay() {
 	}
 }
 
-// CycleRenderer round-robins the picture renderer: the graphics protocol
-// and the half-block cells. A backend without a graphics protocol leaves
-// the cycle one stop long, so the half-block cells stay put and the
-// setting is not touched. Otherwise the choice is saved and both stations
-// alternate, no matter which one the picture uses at the moment.
+// applyImageGraphicsStartup resolves the image protocol for the session and
+// installs it on the screen: the terminal is probed (environment first, then
+// a DA1 query) and the best available protocol is used.
+func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
+	if scr == nil {
+		return
+	}
+	prots := vtui.ProbeGraphicsProtocols()
+	best := vtui.GraphicsNone
+	if len(prots) > 0 {
+		best = prots[0]
+	}
+	scr.Graphics().SetProtocol(best)
+	applyImageCellSize(scr)
+}
+
+// applyImageCellSize records the terminal's real cell size on the graphics
+// layer, so placement matches the terminal's pixel grid instead of the 8x16
+// fallback (which left the picture a few rows short at the bottom).
+func applyImageCellSize(scr *vtui.ScreenBuf) {
+	if scr.Graphics().Protocol() == vtui.GraphicsNone {
+		return
+	}
+	if cw, ch, ok := vtui.QueryCellSize(); ok {
+		scr.Graphics().SetCellSize(cw, ch)
+	}
+}
+
+// CycleRenderer toggles the picture renderer between the graphics protocol
+// and the half-block cells. A backend without a graphics protocol leaves the
+// cycle one stop long, so the half-block cells stay put and the setting is
+// not touched.
 func (iv *ImageView) CycleRenderer() {
 	scr := vtui.FrameManager.Screen()
 	if scr == nil || !scr.SupportsGraphics() {
@@ -1000,7 +1026,6 @@ func (iv *ImageView) CycleRenderer() {
 	mode := 1
 	label := "graphics"
 	if !imageBlockMode(scr) {
-		// Currently the graphics protocol: the next stop is the cells.
 		mode = 2
 		label = "half-block"
 	}

@@ -77,10 +77,12 @@ type blockRender struct {
 	cells []vtui.CharInfo
 
 	// Memo of the last placement: identical geometry re-stamps cached cells.
+	// memoPlain is in the key so a flip never serves cells for the other glyph.
 	memoPlace vtui.ImagePlacement
 	memoBG    uint32
 	memoCW    int
 	memoCH    int
+	memoPlain bool
 	memoHit   bool
 
 	// hMemo reuses the horizontal pass across a vertical-only pan: hBuf
@@ -149,22 +151,26 @@ func (r *blockRender) draw(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32
 		cw, ch = 10, 20 // Fallback 1:2
 	}
 
+	// Plain cells are a drawing property: resolved here so every consumer
+	// gets it for free and the memo key cannot drift.
+	plain := blockPlainMode(scr)
+
 	// Static geometry: re-stamp the cached cells (the box is cleared each
 	// draw, so they must be re-written) instead of re-filtering. This hot
 	// path must stay closure-free: a closure capture would put the placement
 	// on the heap on every repeat draw.
-	if r.memoHit && r.memoPlace == p && r.memoBG == bg && r.memoCW == cw && r.memoCH == ch {
+	if r.memoHit && r.memoPlace == p && r.memoBG == bg && r.memoCW == cw && r.memoCH == ch && r.memoPlain == plain {
 		for cy := range p.Rows {
 			scr.Write(p.Col, p.Row+cy, r.cells[cy*p.Cols:(cy+1)*p.Cols])
 		}
 		return
 	}
 
-	r.drawCold(scr, p, bg, cw, ch)
-	r.memoPlace, r.memoBG, r.memoCW, r.memoCH, r.memoHit = p, bg, cw, ch, true
+	r.drawCold(scr, p, bg, cw, ch, plain)
+	r.memoPlace, r.memoBG, r.memoCW, r.memoCH, r.memoPlain, r.memoHit = p, bg, cw, ch, plain, true
 }
 
-func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32, cw, ch int) {
+func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32, cw, ch int, plain bool) {
 	srcX, srcY, srcW, srcH := p.Source()
 	if srcW <= 0 || srcH <= 0 {
 		srcX, srcY, srcW, srcH = 0, 0, p.Surface.Width, p.Surface.Height
@@ -220,7 +226,7 @@ func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg ui
 	// colors (the half-block analogue of the native backends' working copy).
 	if cropW < p.Surface.Width || cropH < p.Surface.Height {
 		if r.workDraw(p.Surface, bg, cropX, cropY, cropW, cropH, dstW, dstH,
-			cells, cols, rows, offsetX, offsetYCells, bgAttr) {
+			cells, cols, rows, offsetX, offsetYCells, bgAttr, plain) {
 			for cy := range rows {
 				scr.Write(p.Col, p.Row+cy, cells[cy*cols:(cy+1)*cols])
 			}
@@ -256,7 +262,7 @@ func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg ui
 	r.hMemoHit = true
 
 	r.vertPass(cropH, dstW, dstH, hBuf, vBuf, prefR, prefG, prefB, prefStride)
-	stampCells(cells, vBuf, dstW, cols, rows, offsetX, offsetYCells, dstW, dstH, bgAttr)
+	stampCells(cells, vBuf, dstW, cols, rows, offsetX, offsetYCells, dstW, dstH, bgAttr, plain)
 
 	for cy := range rows {
 		scr.Write(p.Col, p.Row+cy, cells[cy*cols:(cy+1)*cols])
@@ -399,8 +405,10 @@ func (r *blockRender) vertPass(cropH, dstW, dstH int, hBuf []uint16, vBuf []uint
 }
 
 // stampCells pads the whole box with bg and stamps the image's half-row
-// colors (stride-separated, dstW x dstH) into the grid.
-func stampCells(cells []vtui.CharInfo, colors []uint32, stride, cols, rows, offsetX, offsetYCells, dstW, dstH int, bgAttr uint64) {
+// colors (stride-separated, dstW x dstH) into the grid. In plain mode every
+// cell is a space with one colour — the linear average of its two halves —
+// so no block glyph is needed.
+func stampCells(cells []vtui.CharInfo, colors []uint32, stride, cols, rows, offsetX, offsetYCells, dstW, dstH int, bgAttr uint64, plain bool) {
 	for i := range cols * rows {
 		cells[i] = vtui.CharInfo{Char: ' ', Attributes: bgAttr}
 	}
@@ -412,6 +420,11 @@ func stampCells(cells []vtui.CharInfo, colors []uint32, stride, cols, rows, offs
 		for cx := range dstW {
 			fg := colors[topRow+cx]
 			bgc := colors[botRow+cx]
+			if plain {
+				blended := blockBlend(fg, bgc)
+				cells[cellRowStart+cx] = vtui.CharInfo{Char: ' ', Attributes: vtui.SetRGBBoth(0, blended, blended)}
+				continue
+			}
 			ch := uint64(blockHalfChar)
 			if fg == bgc {
 				ch = ' '
@@ -421,10 +434,20 @@ func stampCells(cells []vtui.CharInfo, colors []uint32, stride, cols, rows, offs
 	}
 }
 
+// blockBlend merges the two half-row colors into the plain cell's single
+// colour, averaged in linear RGB like the filters, so brightness stays
+// correct without a glyph.
+func blockBlend(a, b uint32) uint32 {
+	linR := (blockSrgbToLinear[byte((a>>16)&0xFF)] + blockSrgbToLinear[byte((b>>16)&0xFF)]) / 2
+	linG := (blockSrgbToLinear[byte((a>>8)&0xFF)] + blockSrgbToLinear[byte((b>>8)&0xFF)]) / 2
+	linB := (blockSrgbToLinear[byte(a&0xFF)] + blockSrgbToLinear[byte(b&0xFF)]) / 2
+	return uint32(blockLinearToSrgb[linR])<<16 | uint32(blockLinearToSrgb[linG])<<8 | uint32(blockLinearToSrgb[linB])
+}
+
 // workDraw serves a zoomed placement from the working copy: pans inside the
 // margin cut cached colors (snapped to the copy's grid) instead of
 // re-filtering. Returns false to fall through to the ordinary filter.
-func (r *blockRender) workDraw(surf *vtui.ImageSurface, bg uint32, cropX, cropY, cropW, cropH, dstW, dstH int, cells []vtui.CharInfo, cols, rows, offsetX, offsetYCells int, bgAttr uint64) bool {
+func (r *blockRender) workDraw(surf *vtui.ImageSurface, bg uint32, cropX, cropY, cropW, cropH, dstW, dstH int, cells []vtui.CharInfo, cols, rows, offsetX, offsetYCells int, bgAttr uint64, plain bool) bool {
 	// Beyond this zoom a pan outruns the margin; hMemo stays the fallback.
 	if zoom := float64(surf.Width) / float64(cropW); zoom > blockWorkMaxZoom {
 		return false
@@ -471,7 +494,7 @@ func (r *blockRender) workDraw(surf *vtui.ImageSurface, bg uint32, cropX, cropY,
 	if offX < 0 || offY < 0 {
 		return false
 	}
-	stampCells(cells, r.workV[offY*r.workW+offX:], r.workW, cols, rows, offsetX, offsetYCells, dstW, dstH, bgAttr)
+	stampCells(cells, r.workV[offY*r.workW+offX:], r.workW, cols, rows, offsetX, offsetYCells, dstW, dstH, bgAttr, plain)
 	return true
 }
 
@@ -512,4 +535,11 @@ func imageBlockMode(scr *vtui.ScreenBuf) bool {
 		return true
 	}
 	return scr != nil && !scr.SupportsGraphics()
+}
+
+// blockPlainMode reports whether the block renderer must use plain cells
+// (spaces, one colour) instead of the half-block glyph: a 16-colour console's
+// font cannot be trusted to carry the half-block at all.
+func blockPlainMode(scr *vtui.ScreenBuf) bool {
+	return scr != nil && scr.ColorProfile == vtui.ColorProfile16
 }

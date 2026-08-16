@@ -270,6 +270,106 @@ func TestBlockGammaHalfAlphaBlend(t *testing.T) {
 	}
 }
 
+// blockPlainTestSurface is the 2x4 red/green/blue/yellow surface the
+// half-block draw test uses, so plain mode is checked on the same geometry.
+func blockPlainTestSurface() *vtui.ImageSurface {
+	surface := vtui.NewImageSurface(2, 4)
+	for x := 0; x < 2; x++ {
+		surface.SetPixel(x, 0, 255, 0, 0, 255)
+		surface.SetPixel(x, 1, 0, 255, 0, 255)
+		surface.SetPixel(x, 2, 0, 0, 255, 255)
+		surface.SetPixel(x, 3, 255, 255, 0, 255)
+	}
+	return surface
+}
+
+func TestBlockDrawPlainCells(t *testing.T) {
+	scr := newBlockTestScreen(t)
+	scr.ColorProfile = vtui.ColorProfile16
+	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 1, 1, 2, 2)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	r := &blockRender{}
+	r.draw(scr, p, blockImageBack)
+	// Every cell is a space with one colour: the linear average of the halves.
+	if c := scr.GetCell(1, 1); c.Char != ' ' {
+		t.Errorf("top cell: char %d, want ' '", c.Char)
+	} else {
+		want := blockBlend(0xFF0000, 0x00FF00)
+		if fg, bg := vtui.GetRGBFore(c.Attributes), vtui.GetRGBBack(c.Attributes); fg != want || bg != want {
+			t.Errorf("top cell %06X/%06X, want %06X", fg, bg, want)
+		}
+	}
+	if c := scr.GetCell(1, 2); c.Char != ' ' {
+		t.Errorf("bottom cell: char %d, want ' '", c.Char)
+	} else {
+		want := blockBlend(0x0000FF, 0xFFFF00)
+		if fg, bg := vtui.GetRGBFore(c.Attributes), vtui.GetRGBBack(c.Attributes); fg != want || bg != want {
+			t.Errorf("bottom cell %06X/%06X, want %06X", fg, bg, want)
+		}
+	}
+}
+
+func TestBlockBlendIsLinear(t *testing.T) {
+	// The midpoint of black and white in linear RGB is not 128: it must
+	// come out as the sRGB value of linear 0.5, which is what the LUT
+	// round-trip produces.
+	lin := blockSrgbToLinear[0] + blockSrgbToLinear[255] // 0 + 65535
+	want := uint32(blockLinearToSrgb[lin/2])<<16 | uint32(blockLinearToSrgb[lin/2])<<8 | uint32(blockLinearToSrgb[lin/2])
+	if got := blockBlend(0, 0xFFFFFF); got != want {
+		t.Errorf("black+white blend %06X, want %06X (sRGB average would be 808080)", got, want)
+	}
+	// Two equal halves must come back unchanged.
+	if got := blockBlend(0x804020, 0x804020); got != 0x804020 {
+		t.Errorf("equal blend %06X, want 804020", got)
+	}
+}
+
+func TestBlockDrawPlainTogglesMemo(t *testing.T) {
+	scr := newBlockTestScreen(t)
+	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 0, 0, 2, 2)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	r := &blockRender{}
+
+	scr.ColorProfile = vtui.ColorProfileTrueColor
+	r.draw(scr, p, blockImageBack)
+	if c := scr.GetCell(0, 0); c.Char != blockHalfChar {
+		t.Fatalf("half-block draw: char %d, want %d", c.Char, blockHalfChar)
+	}
+
+	// Same geometry, 16-colour console: the memo must not serve half-block cells.
+	scr.ColorProfile = vtui.ColorProfile16
+	r.draw(scr, p, blockImageBack)
+	if c := scr.GetCell(0, 0); c.Char != ' ' ||
+		vtui.GetRGBFore(c.Attributes) != vtui.GetRGBBack(c.Attributes) {
+		t.Fatalf("plain after switch: char %d, fg %06X, bg %06X (stale memo?)",
+			c.Char, vtui.GetRGBFore(c.Attributes), vtui.GetRGBBack(c.Attributes))
+	}
+
+	// And back: the memo must not hold plain cells either.
+	scr.ColorProfile = vtui.ColorProfileTrueColor
+	r.draw(scr, p, blockImageBack)
+	if c := scr.GetCell(0, 0); c.Char != blockHalfChar {
+		t.Fatalf("half-block after switch: char %d (stale memo?)", c.Char)
+	}
+}
+
+func TestBlockWorkCopyPlainMatchesFresh(t *testing.T) {
+	surf := newBenchSurface(96, 96)
+	r := &blockRender{}
+	scr := newBlockTestScreen(t)
+	scr.ColorProfile = vtui.ColorProfile16
+	for sx := 0; sx <= 40; sx += 2 {
+		p := vtui.ImagePlacement{Surface: surf, Cols: 24, Rows: 8,
+			SrcX: sx, SrcY: 0, SrcW: 48, SrcH: 24}
+		r.draw(scr, p, blockImageBack)
+		assertFreshDraw(t, r, scr, p)
+	}
+}
+
 func TestImageBlockMode(t *testing.T) {
 	scr := newBlockTestScreen(t)
 	old := AppConfig.ImageBlockRenderer
@@ -323,7 +423,7 @@ func TestShiftF4CyclesRenderers(t *testing.T) {
 	scr := newBlockTestScreen(t)
 	withViewerScreen(scr, func() {
 		// Without a graphics protocol the half-block cells are the only
-		// stop of the round robin: the setting has to stay put.
+		// renderer: the cycle leaves the setting put.
 		AppConfig.ImageBlockRenderer = 1
 		for i := 0; i < 2; i++ {
 			if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
@@ -334,24 +434,56 @@ func TestShiftF4CyclesRenderers(t *testing.T) {
 			t.Fatalf("no-graphics cycle moved the setting to %d, want 1",
 				AppConfig.ImageBlockRenderer)
 		}
-		// With kitty available the two renderers alternate.
+		// With kitty available Shift+F4 flips graphics <-> half-block.
 		scr.Graphics().SetProtocol(vtui.GraphicsKitty)
+		AppConfig.ImageBlockRenderer = 1
 		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
 		if AppConfig.ImageBlockRenderer != 2 {
-			t.Fatalf("graphics -> cells cycle set %d, want 2",
+			t.Fatalf("graphics -> half-block set %d, want 2",
 				AppConfig.ImageBlockRenderer)
 		}
 		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
 		if AppConfig.ImageBlockRenderer != 1 {
-			t.Fatalf("cells -> graphics cycle set %d, want 1",
-				AppConfig.ImageBlockRenderer)
-		}
-		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
-		if AppConfig.ImageBlockRenderer != 2 {
-			t.Fatalf("second cells -> cycle set %d, want 2",
+			t.Fatalf("half-block -> graphics set %d, want 1",
 				AppConfig.ImageBlockRenderer)
 		}
 	})
+}
+
+func TestBlockPlainMode(t *testing.T) {
+	scr := newBlockTestScreen(t)
+	scr.ColorProfile = vtui.ColorProfileTrueColor
+	if blockPlainMode(scr) {
+		t.Error("a truecolor terminal must not be plain")
+	}
+	scr.ColorProfile = vtui.ColorProfile16
+	if !blockPlainMode(scr) {
+		t.Error("a 16-colour console must fall back to plain cells")
+	}
+	if blockPlainMode(nil) {
+		t.Error("nil screen must not be plain")
+	}
+}
+
+func TestBlockAutoPlainOn16Color(t *testing.T) {
+	scr := newBlockTestScreen(t)
+	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 0, 0, 2, 2)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	r := &blockRender{}
+	// A 16-colour console gets plain cells even with the setting off...
+	scr.ColorProfile = vtui.ColorProfile16
+	r.draw(scr, p, blockImageBack)
+	if c := scr.GetCell(0, 0); c.Char != ' ' {
+		t.Fatalf("16-colour console: char %d, want plain ' '", c.Char)
+	}
+	// ...and the half-block returns on a truecolor screen (memo included).
+	scr.ColorProfile = vtui.ColorProfileTrueColor
+	r.draw(scr, p, blockImageBack)
+	if c := scr.GetCell(0, 0); c.Char != blockHalfChar {
+		t.Fatalf("truecolor screen: char %d, want half-block", c.Char)
+	}
 }
 
 func TestShiftF4IgnoredInGallery(t *testing.T) {
@@ -456,6 +588,7 @@ func assertFreshDraw(t *testing.T, r *blockRender, scr *vtui.ScreenBuf, p vtui.I
 	t.Helper()
 	fresh := &blockRender{}
 	freshScr := newBlockTestScreen(t)
+	freshScr.ColorProfile = scr.ColorProfile
 	fresh.draw(freshScr, p, blockImageBack)
 	for y := 0; y < p.Rows; y++ {
 		for x := 0; x < p.Cols; x++ {

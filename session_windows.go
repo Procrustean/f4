@@ -32,7 +32,7 @@ func ManageSessions() {
 	stopWindowAppearanceManager := startWindowsConsoleWindowAppearanceManager()
 	defer stopWindowAppearanceManager()
 
-	InitCore()
+	scr := InitCore()
 
 	restore, err := vtui.PrepareTerminal()
 	if err != nil {
@@ -42,6 +42,8 @@ func ManageSessions() {
 	if restore != nil {
 		defer restore()
 	}
+
+	applyImageGraphicsStartup(scr)
 
 	reader := vtinput.NewReader(os.Stdin, false)
 	vtui.FrameManager.Run(reader)
