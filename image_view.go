@@ -1082,9 +1082,13 @@ func (iv *ImageView) baseName() string {
 	return filepath.Base(iv.path)
 }
 
-// displaySize is the picture dimensions, "1442x2160".
+// displaySize is the picture dimensions, "1442x2160". An empty view with no
+// decoded surface yet reports "?" so the title path never dereferences nil.
 func (iv *ImageView) displaySize() string {
 	img := iv.display()
+	if img == nil {
+		return "?"
+	}
 	return fmt.Sprintf("%dx%d", img.Width, img.Height)
 }
 

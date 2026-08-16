@@ -697,6 +697,16 @@ func TestImageViewWindowTitleIsNameAndResolution(t *testing.T) {
 	}
 }
 
+// TestImageViewWindowTitleWithoutImage checks the title path survives an
+// empty view: AddScreen/SwitchScreen resolve GetTitle for every workspace, so
+// a view with no decoded surface must not dereference nil in displaySize.
+func TestImageViewWindowTitleWithoutImage(t *testing.T) {
+	iv := &ImageView{BaseFrame: vtui.BaseFrame{}, path: "photo.jpg"}
+	if got := iv.GetTitle(); got != "photo.jpg (?)" {
+		t.Errorf("window title for an empty view is %q, want %q", got, "photo.jpg (?)")
+	}
+}
+
 func TestImageViewDecodeToastDefersToUser(t *testing.T) {
 	iv := newTestImageView(t, 10, 10)
 	iv.toast("scale: 100%")
