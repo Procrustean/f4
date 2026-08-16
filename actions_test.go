@@ -2173,6 +2173,13 @@ func TestActionEditFile_DirectoryRedirectsToAttributes(t *testing.T) {
 	}
 }
 func TestActionCreateLink_Flow(t *testing.T) {
+	// File symlinks need elevated privileges or Developer Mode on Windows.
+	// Probe the actual capability instead of skipping all of Windows so the
+	// flow still runs where symlink creation is available.
+	if err := os.Symlink("target", filepath.Join(t.TempDir(), "probe-link")); err != nil {
+		t.Skipf("file symlink creation unavailable: %v", err)
+	}
+
 	vtui.FrameManager.Init(vtui.NewSilentScreenBuf())
 	SetDefaultF4Palette()
 
