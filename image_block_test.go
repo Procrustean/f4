@@ -87,6 +87,78 @@ func TestBlockViewerPlacementFitsAndCentres(t *testing.T) {
 	}
 }
 
+// TestBlockViewerPlacementMatchesGraphics locks in the canonical-crop
+// contract: on a terminal with a real cell size (wezterm's 9x17) the
+// half-block placement uses the same cell as the graphics backend, so
+// Shift+F4 never re-frames or re-scales the picture.
+func TestBlockViewerPlacementMatchesGraphics(t *testing.T) {
+	// Make the effective sixel cell follow SetCellSize on every host.
+	t.Setenv("WT_SESSION", "")
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	for _, proto := range []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel} {
+		scr := newBlockTestScreen(t)
+		scr.Graphics().SetProtocol(proto)
+		scr.Graphics().SetCellSize(9, 17)
+		iv := newTestImageView(t, 100, 100)
+
+		bw, bh := blockCellSize(scr)
+		gw, gh := cellSize(scr)
+		if bw != gw || bh != gh {
+			t.Fatalf("%s: block cell %dx%d must equal the graphics cell %dx%d", proto, bw, bh, gw, gh)
+		}
+		bp, ok1 := iv.placementForSize(scr, bw, bh)
+		gp, ok2 := iv.placementFor(scr)
+		if !ok1 || !ok2 {
+			t.Fatal("layout failed")
+		}
+		if bp.Cols != gp.Cols || bp.Rows != gp.Rows || bp.Col != gp.Col || bp.Row != gp.Row ||
+			bp.SrcW != gp.SrcW || bp.SrcH != gp.SrcH || bp.SrcX != gp.SrcX || bp.SrcY != gp.SrcY {
+			t.Errorf("%s: block placement %+v must match the graphics one %+v", proto, bp, gp)
+		}
+		if gp.Cols == 0 || gp.Rows == 0 {
+			t.Fatalf("%s: empty placement", proto)
+		}
+	}
+}
+
+// TestBlockFillsCanonicalRectOnOddCell is the regression test for the
+// half-block aspect fix: on a 9x17 cell the renderer fills the whole
+// canonical rect instead of re-fitting by the real cell and padding a
+// column of background, so the half-block picture covers exactly the
+// same cells as the graphics placement.
+func TestBlockFillsCanonicalRectOnOddCell(t *testing.T) {
+	scr := newBlockTestScreen(t)
+	scr.Graphics().SetCellSize(9, 17)
+	iv := newTestImageView(t, 100, 100)
+	iv.surface = solidSurface(100, 100, 0x8080C0)
+
+	cw, ch := blockCellSize(scr)
+	p, ok := iv.placementForSize(scr, cw, ch)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+
+	// The rect covers the fitted 408x408 px within one cell per axis.
+	dispW := int(float64(100)*iv.lastScale + 0.5)
+	dispH := int(float64(100)*iv.lastScale + 0.5)
+	if dw, dh := p.Cols*cw-dispW, p.Rows*ch-dispH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
+		t.Fatalf("rect %dx%d cells (%d x %d px) misses the fitted %dx%d px", p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, dispW, dispH)
+	}
+
+	r := &blockRender{}
+	r.draw(scr, p, blockImageBack)
+	// Every cell of the rect is the picture; the old re-fit left a column
+	// of background at the right edge on a 9x17 cell.
+	for y := 0; y < p.Rows; y++ {
+		for x := 0; x < p.Cols; x++ {
+			c := scr.GetCell(p.Col+x, p.Row+y)
+			if vtui.GetRGBFore(c.Attributes) != 0x8080C0 {
+				t.Fatalf("cell %d,%d of the rect is not the picture: fg %06X", x, y, vtui.GetRGBFore(c.Attributes))
+			}
+		}
+	}
+}
+
 func TestBlockViewerPlacementZoomCropsAndPans(t *testing.T) {
 	scr := newBlockTestScreen(t)
 	iv := newTestImageView(t, 100, 100)
@@ -182,39 +254,62 @@ func TestBlockDrawRedrawsAfterMove(t *testing.T) {
 	}
 }
 
-func TestBlockDrawLetterboxesWideImage(t *testing.T) {
+func TestBlockRectFitsWideImage(t *testing.T) {
 	scr := newBlockTestScreen(t)
-	// A 4:1 picture in a 4x4 cell box (0.5:1): it fills the full width and
-	// one cell row, the rows above and below are background.
+	// A 4:1 picture in a 4x4 cell box: the canonical fit gives it a 4x1-cell
+	// rect centred vertically, and the renderer fills exactly that rect — the
+	// letterbox rows are the caller's background, never painted here.
 	surface := solidSurface(100, 25, 0x804020)
+	p, ok := fitPlacement(surface, 1, 2, 0, 0, 4, 4)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if p.Cols != 4 || p.Rows != 1 || p.Row != 1 {
+		t.Fatalf("wide picture must get a 4x1 rect in row 1, got %dx%d at %d", p.Cols, p.Rows, p.Row)
+	}
 	r := &blockRender{}
-	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 4, Rows: 4, SrcW: 100, SrcH: 25}, blockImageBack)
-	if c := scr.GetCell(0, 0); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("padding row above: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
+	r.draw(scr, p, blockImageBack)
+	for x := 0; x < 4; x++ {
+		if c := scr.GetCell(x, 1); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
+			t.Errorf("rect cell %d,1: char %d, fg %06X", x, c.Char, vtui.GetRGBFore(c.Attributes))
+		}
 	}
-	if c := scr.GetCell(3, 3); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("padding row below: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
-	}
-	if c := scr.GetCell(1, 1); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
-		t.Errorf("image row: char %d, fg %06X", c.Char, vtui.GetRGBFore(c.Attributes))
+	for y := 0; y < 4; y++ {
+		if y == 1 {
+			continue
+		}
+		if c := scr.GetCell(1, y); vtui.GetRGBFore(c.Attributes) == 0x804020 {
+			t.Errorf("row %d outside the rect was painted by the renderer", y)
+		}
 	}
 }
 
-func TestBlockDrawLetterboxesTallImage(t *testing.T) {
+func TestBlockRectFitsTallImage(t *testing.T) {
 	scr := newBlockTestScreen(t)
-	// A 1:4 picture in an 8x2 cell box (2:1): it fills the full height and
-	// two cell columns, the columns on either side are background.
+	// A 1:4 picture in an 8x2 cell box: the canonical fit gives it a 1x2-cell
+	// rect centred horizontally; the renderer fills that rect and nothing else.
 	surface := solidSurface(25, 100, 0x804020)
+	p, ok := fitPlacement(surface, 1, 2, 0, 0, 8, 2)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if p.Cols != 1 || p.Rows != 2 || p.Col != 3 {
+		t.Fatalf("tall picture must get a 1x2 rect in column 3, got %dx%d at %d", p.Cols, p.Rows, p.Col)
+	}
 	r := &blockRender{}
-	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 8, Rows: 2, SrcW: 25, SrcH: 100}, blockImageBack)
-	if c := scr.GetCell(0, 0); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("padding column left: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
+	r.draw(scr, p, blockImageBack)
+	for y := 0; y < 2; y++ {
+		if c := scr.GetCell(3, y); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
+			t.Errorf("rect cell 3,%d: char %d, fg %06X", y, c.Char, vtui.GetRGBFore(c.Attributes))
+		}
 	}
-	if c := scr.GetCell(5, 0); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("padding column right: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
-	}
-	if c := scr.GetCell(3, 0); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
-		t.Errorf("image cell: char %d, fg %06X", c.Char, vtui.GetRGBFore(c.Attributes))
+	for x := 0; x < 8; x++ {
+		if x == 3 {
+			continue
+		}
+		if c := scr.GetCell(x, 0); vtui.GetRGBFore(c.Attributes) == 0x804020 {
+			t.Errorf("column %d outside the rect was painted by the renderer", x)
+		}
 	}
 }
 
@@ -236,21 +331,19 @@ func TestBlockContainNeverCrops(t *testing.T) {
 	}
 }
 
-func TestBlockContainEvenHeight(t *testing.T) {
+func TestBlockRectEvenHeight(t *testing.T) {
 	scr := newBlockTestScreen(t)
-	// Aspect that would map to 3 source rows per half-row pair: dstH must
-	// be snapped down to an even 2, so the extra row becomes background.
+	// A surface whose fitted height is odd in half-blocks: dstH is 2 per cell
+	// row, so the whole 4x3 rect stays covered — no row is dropped or padded.
 	surface := solidSurface(40, 30, 0xA0B0C0)
 	r := &blockRender{}
 	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 4, Rows: 3, SrcW: 40, SrcH: 30}, blockImageBack)
-	if c := scr.GetCell(0, 0); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("odd remainder row above: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
-	}
-	if c := scr.GetCell(1, 1); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0xA0B0C0 {
-		t.Errorf("image cell: char %d, fg %06X", c.Char, vtui.GetRGBFore(c.Attributes))
-	}
-	if c := scr.GetCell(0, 2); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Errorf("odd remainder row below: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 4; x++ {
+			if c := scr.GetCell(x, y); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0xA0B0C0 {
+				t.Fatalf("cell %d,%d: char %d, fg %06X (rect must be covered)", x, y, c.Char, vtui.GetRGBFore(c.Attributes))
+			}
+		}
 	}
 }
 
@@ -507,14 +600,13 @@ func TestBlockRenderGrowsBuffers(t *testing.T) {
 	surface := solidSurface(4, 2, 0x804020)
 	r := &blockRender{}
 	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 4, Rows: 1, SrcW: 4, SrcH: 2}, blockImageBack)
-	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 8, Rows: 4, SrcW: 4, SrcH: 2}, blockImageBack)
-	// The 2:1 source fits the 8x4 box by width and is centred vertically,
-	// so the image occupies cell rows 1-2; (7,3) is padding.
-	if c := scr.GetCell(7, 2); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
+	r.draw(scr, vtui.ImagePlacement{Surface: surface, Cols: 8, Rows: 2, SrcW: 4, SrcH: 2}, blockImageBack)
+	// The 2:1 source fills the wider 8x2 rect: every cell is the image.
+	if c := scr.GetCell(7, 1); c.Char != ' ' || vtui.GetRGBFore(c.Attributes) != 0x804020 {
 		t.Fatalf("cell after buffer growth: char %d, fg %06X", c.Char, vtui.GetRGBFore(c.Attributes))
 	}
-	if c := scr.GetCell(7, 3); vtui.GetRGBFore(c.Attributes) != 0x101010 {
-		t.Fatalf("padding below image: fg %06X, want 101010", vtui.GetRGBFore(c.Attributes))
+	if c := scr.GetCell(0, 0); vtui.GetRGBFore(c.Attributes) != 0x804020 {
+		t.Fatalf("top-left after growth: fg %06X", vtui.GetRGBFore(c.Attributes))
 	}
 }
 

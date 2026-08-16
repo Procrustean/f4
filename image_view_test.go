@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +50,128 @@ func restoreBars(t *testing.T) {
 	t.Helper()
 	was := vtui.FrameManager.HideBars
 	t.Cleanup(func() { vtui.FrameManager.HideBars = was })
+}
+
+// TestImageViewPlacementAspectPreserved proves the kitty and sixel
+// placements keep the picture's aspect across cell geometries: the cell
+// rect covers the canonical fitted pixels within one cell per axis. This
+// is the "how correct is the aspect in wezterm" check — wezterm reports a
+// 9x17 cell, Windows Terminal's sixel rasterises at a fixed 10x20, and
+// 8x16 is the no-report fallback.
+func TestImageViewPlacementAspectPreserved(t *testing.T) {
+	// Make the effective sixel cell follow SetCellSize on every host (a
+	// Windows or WSL host would otherwise force the 10x20 conhost cell).
+	t.Setenv("WT_SESSION", "")
+	t.Setenv("TERM_PROGRAM", "wezterm")
+
+	prots := []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel}
+	cells := [][2]int{{9, 17}, {10, 20}, {8, 16}}
+	shapes := [][2]int{{1000, 1000}, {1600, 900}, {900, 1600}, {2000, 1000}, {1000, 2000}}
+	worst, worstDesc := 0.0, ""
+
+	for _, proto := range prots {
+		for _, cell := range cells {
+			for _, sh := range shapes {
+				scr := newImageTestScreen(t)
+				scr.Graphics().SetProtocol(proto)
+				scr.Graphics().SetCellSize(cell[0], cell[1])
+				iv := newTestImageView(t, sh[0], sh[1])
+
+				p, ok := iv.placementFor(scr)
+				if !ok {
+					t.Fatal("layout failed")
+				}
+				cw, ch := cellSize(scr)
+				if cw != cell[0] || ch != cell[1] {
+					t.Fatalf("%s: effective cell %dx%d, want %dx%d", proto, cw, ch, cell[0], cell[1])
+				}
+
+				// The rect covers the canonical fitted pixels within one
+				// cell per axis — the placement cannot distort more than
+				// one cell of rounding, in kitty and sixel alike.
+				dispW := int(float64(sh[0])*iv.lastScale + 0.5)
+				dispH := int(float64(sh[1])*iv.lastScale + 0.5)
+				if dw, dh := p.Cols*cw-dispW, p.Rows*ch-dispH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
+					t.Errorf("%s %dx%d %dx%d: rect %dx%d cells (%d x %d px) misses the fitted %dx%d px",
+						proto, cell[0], cell[1], sh[0], sh[1], p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, dispW, dispH)
+				}
+				if p.SrcW != 0 || p.SrcH != 0 {
+					t.Errorf("%s %dx%d %dx%d: a fitting image must not be cropped", proto, cell[0], cell[1], sh[0], sh[1])
+				}
+
+				rectAspect := float64(p.Cols*cw) / float64(p.Rows*ch)
+				srcAspect := float64(sh[0]) / float64(sh[1])
+				err := math.Abs(rectAspect/srcAspect - 1)
+				if err > worst {
+					worst, worstDesc = err, fmt.Sprintf("%s %dx%d cell, %dx%d image", proto, cell[0], cell[1], sh[0], sh[1])
+				}
+			}
+		}
+	}
+	t.Logf("worst fitted aspect deviation: %.2f%% (%s)", worst*100, worstDesc)
+}
+
+// TestImageViewZoomedCropAspectPreserved checks the zoomed path: the shown
+// crop must land in the cell rect at its canonical scale (within one cell
+// per axis), in both kitty and sixel on the wezterm 9x17 cell.
+func TestImageViewZoomedCropAspectPreserved(t *testing.T) {
+	t.Setenv("WT_SESSION", "")
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	for _, proto := range []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel} {
+		scr := newImageTestScreen(t)
+		scr.Graphics().SetProtocol(proto)
+		scr.Graphics().SetCellSize(9, 17)
+		iv := newTestImageView(t, 1000, 1000)
+		iv.SetZoom(2)
+
+		p, ok := iv.placementFor(scr)
+		if !ok {
+			t.Fatal("layout failed")
+		}
+		if p.SrcW <= 0 || p.SrcH <= 0 || p.SrcW >= 1000 || p.SrcH >= 1000 {
+			t.Fatalf("%s: a 2x zoom must crop, got src %dx%d", proto, p.SrcW, p.SrcH)
+		}
+		cw, ch := cellSize(scr)
+		shownW := int(float64(p.SrcW)*iv.lastScale + 0.5)
+		shownH := int(float64(p.SrcH)*iv.lastScale + 0.5)
+		if dw, dh := p.Cols*cw-shownW, p.Rows*ch-shownH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
+			t.Errorf("%s: crop %dx%d at scale %.3f shown in %dx%d cells (%d x %d px), want %dx%d px",
+				proto, p.SrcW, p.SrcH, iv.lastScale, p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, shownW, shownH)
+		}
+		// The on-screen rect keeps the crop's aspect: the crop and the box
+		// share one scale, so a distortion here would stretch the picture.
+		rectAspect := float64(p.Cols*cw) / float64(p.Rows*ch)
+		cropAspect := float64(p.SrcW) / float64(p.SrcH)
+		if err := math.Abs(rectAspect/cropAspect - 1); err > 0.06 {
+			t.Errorf("%s: rect aspect %.3f vs crop aspect %.3f (%.1f%%)", proto, rectAspect, cropAspect, err*100)
+		}
+	}
+}
+
+// TestFitPlacementAspectPreserved locks in the gallery tile and quick-view
+// fit: fitPlacement with the real cell metric yields a rect that covers the
+// fitted pixels within one cell per axis, so a 9x17 cell cannot stretch a
+// thumbnail beyond one cell of rounding.
+func TestFitPlacementAspectPreserved(t *testing.T) {
+	cells := [][2]int{{9, 17}, {10, 20}, {8, 16}}
+	shapes := [][2]int{{1000, 1000}, {1600, 900}, {900, 1600}, {2000, 1000}, {1000, 2000}}
+	boxes := [][2]int{{16, 7}, {30, 12}}
+	for _, cell := range cells {
+		for _, sh := range shapes {
+			for _, box := range boxes {
+				surf := solidSurface(sh[0], sh[1], 0x804020)
+				p, ok := fitPlacement(surf, cell[0], cell[1], 0, 0, box[0], box[1])
+				if !ok {
+					t.Fatal("layout failed")
+				}
+				fw, fh := vtui.FitInside(sh[0], sh[1], box[0]*cell[0], box[1]*cell[1])
+				if dw, dh := p.Cols*cell[0]-fw, p.Rows*cell[1]-fh; dw < 0 || dw > cell[0]-1 || dh < 0 || dh > cell[1]-1 {
+					t.Errorf("%dx%d cell, %dx%d in %dx%d box: rect %dx%d (%d x %d px) misses the fitted %dx%d px",
+						cell[0], cell[1], sh[0], sh[1], box[0], box[1], p.Cols, p.Rows, p.Cols*cell[0], p.Rows*cell[1], fw, fh)
+				}
+			}
+		}
+	}
 }
 
 func TestImageViewFitsAndCentres(t *testing.T) {

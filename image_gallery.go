@@ -325,7 +325,8 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 	boxCols, boxRows := imageTileCols-2, imageTileRows-2
 
 	if imageBlockMode(scr) {
-		if p, ok := fitPlacement(surface, 1, 2, col+1, row, boxCols, boxRows); ok {
+		bw, bh := blockCellSize(scr)
+		if p, ok := fitPlacement(surface, bw, bh, col+1, row, boxCols, boxRows); ok {
 			c := iv.blockTiles[slot]
 			if c == nil {
 				c = &blockRender{}

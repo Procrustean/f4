@@ -80,8 +80,6 @@ type blockRender struct {
 	// memoPlain is in the key so a flip never serves cells for the other glyph.
 	memoPlace vtui.ImagePlacement
 	memoBG    uint32
-	memoCW    int
-	memoCH    int
 	memoPlain bool
 	memoHit   bool
 
@@ -139,16 +137,12 @@ func (r *blockRender) ensureCapacity(srcMax, hBufSize, vBufSize, cellsSize int) 
 }
 
 // draw renders the placement with a gamma-correct separable box filter:
-// pixels are blended and averaged in linear RGB, then the source is fitted
-// into the grid ("contain"), centred and padded with bg. Never crops.
+// pixels are blended and averaged in linear RGB, then the placement's source
+// crop is resampled into its cell rect (one half-block pixel per column, two
+// per row). The rect is the canonical image rect worked out by the caller.
 func (r *blockRender) draw(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32) {
 	if scr == nil || !p.Surface.Valid() || p.Cols <= 0 || p.Rows <= 0 {
 		return
-	}
-
-	cw, ch := scr.Graphics().CellSize()
-	if cw <= 0 || ch <= 0 {
-		cw, ch = 10, 20 // Fallback 1:2
 	}
 
 	// Plain cells are a drawing property: resolved here so every consumer
@@ -159,55 +153,30 @@ func (r *blockRender) draw(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32
 	// draw, so they must be re-written) instead of re-filtering. This hot
 	// path must stay closure-free: a closure capture would put the placement
 	// on the heap on every repeat draw.
-	if r.memoHit && r.memoPlace == p && r.memoBG == bg && r.memoCW == cw && r.memoCH == ch && r.memoPlain == plain {
+	if r.memoHit && r.memoPlace == p && r.memoBG == bg && r.memoPlain == plain {
 		for cy := range p.Rows {
 			scr.Write(p.Col, p.Row+cy, r.cells[cy*p.Cols:(cy+1)*p.Cols])
 		}
 		return
 	}
 
-	r.drawCold(scr, p, bg, cw, ch, plain)
-	r.memoPlace, r.memoBG, r.memoCW, r.memoCH, r.memoPlain, r.memoHit = p, bg, cw, ch, plain, true
+	r.drawCold(scr, p, bg, plain)
+	r.memoPlace, r.memoBG, r.memoPlain, r.memoHit = p, bg, plain, true
 }
 
-func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32, cw, ch int, plain bool) {
+func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg uint32, plain bool) {
 	srcX, srcY, srcW, srcH := p.Source()
 	if srcW <= 0 || srcH <= 0 {
 		srcX, srcY, srcW, srcH = 0, 0, p.Surface.Width, p.Surface.Height
 	}
 
+	// The placement rect is the canonical image rect (one half-block pixel
+	// per cell column, two per cell row): resample the crop into it exactly,
+	// like the graphics backend stretches the same crop into the same rect.
+	// The caller works out the rect (fitPlacement / placementForSize), so no
+	// re-fit or padding is done here.
 	cols, rows := p.Cols, p.Rows
-	var dstW, dstH int
-
-	// Contain math in int64: compare srcW/srcH with (cols*cw)/(rows*ch),
-	// then fit the source into the grid without cropping.
-	if int64(srcW)*int64(rows)*int64(ch) > int64(srcH)*int64(cols)*int64(cw) {
-		dstW = cols
-		dstH = int((int64(dstW) * int64(cw) * int64(srcH) * 2) / (int64(ch) * int64(srcW)))
-	} else {
-		dstH = rows * 2
-		dstW = int((int64(dstH) * int64(ch) * int64(srcW)) / (int64(cw) * int64(srcH) * 2))
-	}
-
-	// Clamp and keep dstH even so every half-row has a pair for the ▀ glyph.
-	if dstW < 1 {
-		dstW = 1
-	}
-	if dstW > cols {
-		dstW = cols
-	}
-	if dstH < 2 {
-		dstH = 2
-	}
-	if dstH > rows*2 {
-		dstH = rows * 2
-	}
-	if dstH%2 != 0 {
-		dstH--
-	}
-
-	offsetX := (cols - dstW) / 2
-	offsetYCells := (rows - dstH/2) / 2
+	dstW, dstH := cols, rows*2
 
 	cropX, cropY, cropW, cropH := srcX, srcY, srcW, srcH
 
@@ -226,7 +195,7 @@ func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg ui
 	// colors (the half-block analogue of the native backends' working copy).
 	if cropW < p.Surface.Width || cropH < p.Surface.Height {
 		if r.workDraw(p.Surface, bg, cropX, cropY, cropW, cropH, dstW, dstH,
-			cells, cols, rows, offsetX, offsetYCells, bgAttr, plain) {
+			cells, cols, rows, 0, 0, bgAttr, plain) {
 			for cy := range rows {
 				scr.Write(p.Col, p.Row+cy, cells[cy*cols:(cy+1)*cols])
 			}
@@ -262,7 +231,7 @@ func (r *blockRender) drawCold(scr *vtui.ScreenBuf, p vtui.ImagePlacement, bg ui
 	r.hMemoHit = true
 
 	r.vertPass(cropH, dstW, dstH, hBuf, vBuf, prefR, prefG, prefB, prefStride)
-	stampCells(cells, vBuf, dstW, cols, rows, offsetX, offsetYCells, dstW, dstH, bgAttr, plain)
+	stampCells(cells, vBuf, dstW, cols, rows, 0, 0, dstW, dstH, bgAttr, plain)
 
 	for cy := range rows {
 		scr.Write(p.Col, p.Row+cy, cells[cy*cols:(cy+1)*cols])

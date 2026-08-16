@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
+	"golang.org/x/term"
 )
 
 const (
@@ -792,6 +794,16 @@ func cellSize(scr *vtui.ScreenBuf) (int, int) {
 	return cw, ch
 }
 
+// blockCellSize is the cell the half-block text renders at: the terminal's
+// raw cell, because sixel's virtual 10x20 cell applies only to sixel rasters.
+func blockCellSize(scr *vtui.ScreenBuf) (int, int) {
+	cw, ch := scr.Graphics().CellSize()
+	if cw <= 0 || ch <= 0 {
+		return imageViewFallbackCellW, imageViewFallbackCellH
+	}
+	return cw, ch
+}
+
 // placementFor computes where the picture goes: centred when it fits, cropped
 // and panned once zoomed past the window.
 func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, bool) {
@@ -803,7 +815,7 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 }
 
 // placementForSize is placementFor with an explicit cell size, so the block
-// renderer (1x2 pixels per cell) and the graphics backend share one path.
+// renderer (its cells) and the graphics backend share one path.
 func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.ImagePlacement, bool) {
 	img := iv.display()
 	if scr == nil || !img.Valid() {
@@ -943,8 +955,8 @@ func cellsFor(pixels, cellSize, limit int) int {
 	return n
 }
 
-// fitPlacement fits and centres a surface in a cw x ch cell box. The block
-// renderer passes 1x2 so its cells and the backend's agree on what fits.
+// fitPlacement fits and centres a surface in a cw x ch cell box; both the
+// block renderer and the graphics backend pass their own cell metrics.
 func fitPlacement(surface *vtui.ImageSurface, cw, ch, col, row, boxCols, boxRows int) (vtui.ImagePlacement, bool) {
 	if !surface.Valid() || boxCols <= 0 || boxRows <= 0 {
 		return vtui.ImagePlacement{}, false
@@ -1003,9 +1015,11 @@ func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
 
 // applyImageCellSize records the terminal's real cell size on the graphics
 // layer, so placement matches the terminal's pixel grid instead of the 8x16
-// fallback (which left the picture a few rows short at the bottom).
+// fallback (which left the picture a few rows short at the bottom). The
+// half-block renderer needs the real cell on a graphics-less terminal too;
+// only a session with no terminal to ask skips the query.
 func applyImageCellSize(scr *vtui.ScreenBuf) {
-	if scr.Graphics().Protocol() == vtui.GraphicsNone {
+	if scr.Graphics().Protocol() == vtui.GraphicsNone && !term.IsTerminal(int(os.Stdin.Fd())) {
 		return
 	}
 	if cw, ch, ok := vtui.QueryCellSize(); ok {
@@ -1387,7 +1401,8 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	}
 
 	if imageBlockMode(scr) {
-		if p, ok := iv.placementForSize(scr, 1, 2); ok {
+		cw, ch := blockCellSize(scr)
+		if p, ok := iv.placementForSize(scr, cw, ch); ok {
 			iv.block.draw(scr, p, blockImageBack)
 			iv.logGeometry(scr, p)
 		}
