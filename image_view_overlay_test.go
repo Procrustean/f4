@@ -228,6 +228,89 @@ func TestPlainToastAndOverlayEmitted(t *testing.T) {
 	}
 }
 
+// TestSixelToastChangeReassertsCleanly locks in that a renderer-cycle toast
+// is re-asserted after the sixel image on the frame it changes: the old
+// message must not survive as a leftover on the bottom row.
+func TestSixelToastChangeReassertsCleanly(t *testing.T) {
+	setRendererMode(t, 1)
+	scr := newSixelTestScreen(t)
+	iv := newTestImageView(t, 4000, 2000)
+	iv.surface = solidSurface(4000, 2000, 0xCC8855)
+	iv.zoom = 2
+	iv.overlay = true
+	iv.path = "photo.png"
+
+	var out bytes.Buffer
+	scr.SetOutput(&out)
+
+	iv.toast("renderer: sixel adaptive")
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	scr.Flush()
+	out.Reset()
+
+	// The renderer cycle replaces the toast with a shorter one on the same
+	// picture; the frame must re-emit the image and re-assert the new text.
+	iv.toast("renderer: sixel fixed")
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	scr.Flush()
+	raw := out.String()
+
+	lastDCS := strings.LastIndex(raw, "\x1bP0;1;8q")
+	if lastDCS < 0 {
+		t.Fatalf("the changed toast must re-emit the image so the old one is painted over: %q", raw)
+	}
+	if i := strings.LastIndex(raw, "renderer: sixel fixed"); i < lastDCS {
+		t.Errorf("the new toast must be re-asserted after the image (DCS at %d, toast at %d): %q", lastDCS, i, raw)
+	}
+}
+
+// TestSixelLoadingToastDoesNotReemitImage locks in that an animated
+// loading toast never forces the sixel image out again: the comet changes
+// cells that SetTextAbove re-asserts after the DCS anyway, so re-emitting
+// the whole raster on every tick would make a slow decode flicker.
+func TestSixelLoadingToastDoesNotReemitImage(t *testing.T) {
+	setRendererMode(t, 1)
+	scr := newSixelTestScreen(t)
+	iv := newTestImageView(t, 4000, 2000)
+	iv.surface = solidSurface(4000, 2000, 0xCC8855)
+	iv.zoom = 2
+	iv.path = "photo.png"
+	iv.loading = true
+	iv.decodeStart = time.Now().Add(-time.Second)
+
+	var out bytes.Buffer
+	scr.SetOutput(&out)
+
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	scr.Flush()
+	if !strings.Contains(out.String(), "\x1bP0;1;8q") {
+		t.Fatal("first frame must emit the sixel image")
+	}
+
+	// The comet moves with the decode clock: a later frame at a different
+	// phase changes the loading row without touching the picture.
+	iv.decodeStart = time.Now().Add(-time.Second - 300*time.Millisecond)
+	out.Reset()
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+	scr.Flush()
+	raw := out.String()
+	if i := strings.Index(raw, "\x1bP0;1;8q"); i >= 0 {
+		t.Errorf("the animated toast must not re-emit the sixel image: %q", raw[:min(i+20, len(raw))])
+	}
+	if !strings.Contains(raw, " deco") {
+		t.Errorf("the loading row must still be re-asserted as text, got %q", raw)
+	}
+	iv.stopAnimIfIdle()
+}
+
 func TestKittyKeepsOnePlacement(t *testing.T) {
 	setRendererMode(t, 1)
 	scr := newImageTestScreen(t)
