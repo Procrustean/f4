@@ -1197,23 +1197,23 @@ func TestImageViewToastSlidesOutThenClears(t *testing.T) {
 	if iv.tempMsg != "" {
 		t.Errorf("after the slide the toast must be gone, got %q", iv.tempMsg)
 	}
-	if iv.animStop != nil {
-		t.Error("a finished slide must stop its redraw ticker")
+	if iv.animReg {
+		t.Error("a finished slide must release its heartbeat animation")
 	}
 }
 
-// One ticker serves every toast animation: starting it twice must leave a
-// single redraw ticker, and stopping it once must end it.
-func TestImageViewToastAnimationsShareOneTicker(t *testing.T) {
+// One heartbeat animation serves every toast animation: starting it twice
+// must leave a single registration, and stopping it once must release it.
+func TestImageViewToastAnimationsShareOneHeartbeat(t *testing.T) {
 	iv := newTestImageView(t, 10, 10)
 	iv.ensureAnim()
 	iv.ensureAnim()
-	if iv.animStop == nil {
-		t.Fatal("ensureAnim must start the redraw ticker")
+	if !iv.animReg {
+		t.Fatal("ensureAnim must register the heartbeat animation")
 	}
 	iv.stopAnimIfIdle()
-	if iv.animStop != nil {
-		t.Error("stopAnimIfIdle must stop the redraw ticker")
+	if iv.animReg {
+		t.Error("stopAnimIfIdle must release the heartbeat animation")
 	}
 }
 
@@ -1239,16 +1239,16 @@ func TestImageViewWallFlashRestoresRestingColours(t *testing.T) {
 	}
 }
 
-// Clearing the toast must also end the redraw ticker that kept its
-// animation in motion.
-func TestImageViewToastClearStopsTicker(t *testing.T) {
+// Clearing the toast must also release the heartbeat animation that kept
+// its slide in motion.
+func TestImageViewToastClearStopsAnimation(t *testing.T) {
 	iv := newTestImageView(t, 10, 10)
 	iv.toast("gone soon")
 	iv.tempSlideStart = time.Now()
 	iv.ensureAnim()
 	iv.toastClear()
-	if iv.animStop != nil {
-		t.Error("clearing the toast must stop the redraw ticker")
+	if iv.animReg {
+		t.Error("clearing the toast must release the heartbeat animation")
 	}
 }
 

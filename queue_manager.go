@@ -232,7 +232,8 @@ func (qm *OpQueueManager) Enqueue(task *QueueTask) {
 			active := queueTaskActive(t.State)
 			t.mu.Unlock()
 			if active {
-				vtui.ShowToast("Background operation started. Press Ctrl+Tab for Queue.", 4*time.Second)
+				// The hint points at the bottom queue, so show it there.
+				vtui.ShowToastStyled("Background operation started. Press Ctrl+Tab for Queue.", 4*time.Second, vtui.ToastStyle{Attr: appToastStyle.Attr, Row: -1})
 			}
 			break
 		}

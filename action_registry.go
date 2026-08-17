@@ -1215,7 +1215,7 @@ func init() {
 		Handler: withPF(func(pf *PanelsFrame) {
 			SaveConfig()
 			SaveSession()
-			vtui.ShowToast("Settings saved", 2*time.Second)
+			vtui.ShowToastStyled("Settings saved", 2*time.Second, appToastStyle)
 		}),
 	})
 	RegisterAction(Action{

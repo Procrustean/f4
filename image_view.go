@@ -49,9 +49,8 @@ const (
 	imageViewToastDelay = 2 * time.Second // toast stays a moment
 
 	// The toast slides out over the left edge; the slide, the wall flash and
-	// the loading band all redraw on one tick.
-	imageToastSlideDur  = 150 * time.Millisecond
-	imageToastSlideTick = 30 * time.Millisecond
+	// the loading band all redraw on the vtui heartbeat.
+	imageToastSlideDur = 150 * time.Millisecond
 
 	// One full pass of the bright band across the loading slab.
 	imageLoadingCycle = 900 * time.Millisecond
@@ -82,6 +81,10 @@ var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
 
 // toast: white on a dark slab; the light glyphs keep it readable on the image.
 var imageToastAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x333333)
+
+// appToastStyle shares the viewer's toast palette with the app-wide popups,
+// so every toast reads as the same surface.
+var appToastStyle = vtui.ToastStyle{Attr: imageToastAttr}
 
 // bare text over the picture: no slab, so the sixel image shows around the
 // glyphs. The text is re-asserted after the image (SetTextAbove), which the
@@ -188,12 +191,31 @@ type ImageView struct {
 	// tempSlideStart: when the toast's exit began (zero = not exiting).
 	tempSlideStart time.Time
 
-	// animStop ends the ticker that drives the toast animations; nil when idle.
-	animStop chan struct{}
+	// animReg: one heartbeat animation per viewer; cleared when the callback
+	// reports idle, so ensureAnim can re-register after a stop.
+	animReg bool
 
 	// loadRow reuses the loading slab's cells across frames, so a long decode
 	// doesn't allocate a row per tick.
 	loadRow []vtui.CharInfo
+
+	// toastRowCache holds the toast's cells across animation ticks; only a
+	// message or attribute change rebuilds it. toastTextWidth caches the
+	// display width, since go-runewidth allocates on every measurement.
+	toastRowCache  []vtui.CharInfo
+	toastRowMsg    string
+	toastRowAttr   uint64
+	toastWidthText string
+	toastWidth     int
+
+	// toastMsg caches " msg " so resting frames don't re-concat.
+	toastMsgText string
+	toastMsg     string
+
+	// loadText is the cached loading report, rebuilt per progress step.
+	loadText string
+	loadStep time.Duration // quantized decode time the text was built for
+	loadPct  int           // percentage the text was built for; -1 = time-based
 
 	decodeStart  time.Time          // toast once past imageViewDecodeDelay
 	decodeCancel context.CancelFunc // stops an in-flight decode on moving on
@@ -1439,39 +1461,34 @@ func (iv *ImageView) tempSliding() bool {
 	return !iv.tempSlideStart.IsZero() && time.Since(iv.tempSlideStart) < imageToastSlideDur
 }
 
-// ensureAnim starts the redraw ticker that drives the toast animations.
-// Idempotent.
+// ensureAnim keeps the vtui heartbeat redrawing while the toast animates.
+// One registration per viewer; the callback removes itself when idle.
 func (iv *ImageView) ensureAnim() {
-	if iv.animStop != nil {
+	if iv.animReg {
 		return
 	}
-	stop := make(chan struct{})
-	iv.animStop = stop
-	go func() {
-		ticker := time.NewTicker(imageToastSlideTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				vtui.FrameManager.PostTask(func() {
-					if iv.animStop == stop {
-						vtui.FrameManager.Redraw()
-					}
-				})
-			}
-		}
-	}()
+	iv.animReg = true
+	vtui.FrameManager.AddAnimation(iv.animTick)
 }
 
-// stopAnimIfIdle ends the redraw ticker, if one is running.
+// stopAnimIfIdle lets the heartbeat drop the toast animation at its next tick.
 func (iv *ImageView) stopAnimIfIdle() {
-	if iv.animStop == nil {
-		return
+	iv.animReg = false
+}
+
+// animTick is the heartbeat callback: idle once nothing animates.
+func (iv *ImageView) animTick(float64) bool {
+	if !iv.toastAnimates() {
+		iv.animReg = false
+		return true
 	}
-	close(iv.animStop)
-	iv.animStop = nil
+	return false
+}
+
+// toastAnimates reports whether the toast still needs heartbeat redraws:
+// the loading comet, the wall flash or the exit slide.
+func (iv *ImageView) toastAnimates() bool {
+	return iv.loadingToastOn() || iv.flashing() || iv.tempSliding()
 }
 
 func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64) {
@@ -1491,19 +1508,48 @@ func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64)
 // feeds both the drawing and the guard rectangle used for the re-assertion.
 func (iv *ImageView) toastText() string {
 	if iv.tempMsg != "" {
-		return " " + iv.tempMsg + " "
+		if iv.toastMsgText != iv.tempMsg {
+			iv.toastMsgText = iv.tempMsg
+			iv.toastMsg = " " + iv.tempMsg + " "
+		}
+		return iv.toastMsg
 	}
 	if iv.loadingToastOn() {
-		dur := time.Since(iv.decodeStart)
-		text := " decoding " + formatImageDuration(dur) + " "
-		if iv.decodePct != nil {
-			if pct := int(iv.decodePct.Load()); pct > 0 {
-				text = fmt.Sprintf(" decoding %d%% ", pct)
-			}
-		}
-		return text
+		return iv.loadingReport()
 	}
 	return ""
+}
+
+// toastTextWidth is the display width of text, cached because measuring
+// allocates via go-runewidth's grapheme iterator.
+func (iv *ImageView) toastTextWidth(text string) int {
+	if iv.toastWidthText != text {
+		iv.toastWidthText = text
+		iv.toastWidth = runewidth.StringWidth(text)
+	}
+	return iv.toastWidth
+}
+
+// loadingReport is the "decoding …" label, rebuilt only when the displayed
+// progress changes: the duration is quantized, the percentage discrete.
+func (iv *ImageView) loadingReport() string {
+	dur := time.Since(iv.decodeStart)
+	pct := -1
+	if iv.decodePct != nil {
+		if p := int(iv.decodePct.Load()); p > 0 {
+			pct = p
+		}
+	}
+	if step := dur / (100 * time.Millisecond); pct != iv.loadPct || (pct < 0 && step != iv.loadStep) {
+		iv.loadPct = pct
+		iv.loadStep = step
+		if pct > 0 {
+			iv.loadText = fmt.Sprintf(" decoding %d%% ", pct)
+		} else {
+			iv.loadText = " decoding " + formatImageDuration(dur) + " "
+		}
+	}
+	return iv.loadText
 }
 
 // toastGuardRect is the bottom-row span the toast occupies at rest, from the
@@ -1519,7 +1565,7 @@ func (iv *ImageView) toastGuardRect() (vtui.Rect, bool) {
 	if limit < 1 {
 		limit = 1
 	}
-	width := runewidth.StringWidth(text)
+	width := iv.toastTextWidth(text)
 	if width > limit {
 		width = limit
 	}
@@ -1539,18 +1585,31 @@ func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
 	if limit < 1 {
 		limit = 1
 	}
-	width := runewidth.StringWidth(text)
-	if width > limit {
-		text = runewidth.Truncate(text, limit, "…")
-		width = runewidth.StringWidth(text)
-	}
 	attr := imageToastAttr
 	if iv.flashing() {
 		attr = imageWallFlashAttr
 	} else if iv.textOnImage {
 		attr = imageBareTextAttr
 	}
-	scr.Write(x1+iv.tempSlideOffset(width), y2, vtui.StringToCharInfo(text, attr))
+	row, width := iv.toastRow(text, attr, limit)
+	scr.Write(x1+iv.tempSlideOffset(width), y2, row)
+}
+
+// toastRow returns the toast's cells, reusing one buffer across animation
+// ticks; only a message or attribute change rebuilds it.
+func (iv *ImageView) toastRow(text string, attr uint64, limit int) ([]vtui.CharInfo, int) {
+	if iv.toastRowMsg != text || iv.toastRowAttr != attr {
+		iv.toastRowCache = vtui.FillCharInfo(iv.toastRowCache[:0], []byte(text), attr)
+		iv.toastRowMsg = text
+		iv.toastRowAttr = attr
+	}
+	width := iv.toastTextWidth(text)
+	if width > limit {
+		// Rare over-wide message (a long error): truncate on the fly.
+		text = runewidth.Truncate(text, limit, "…")
+		return vtui.StringToCharInfo(text, attr), runewidth.StringWidth(text)
+	}
+	return iv.toastRowCache, width
 }
 
 // tempSlideOffset is how far the toast has slid left, eased (smoothstep).
@@ -1603,19 +1662,13 @@ func (iv *ImageView) drawLoadingToast(scr *vtui.ScreenBuf) {
 	if limit < 1 {
 		limit = 1
 	}
-	// One clock read drives both the counter and the band phase. A decoder
-	// that reports progress (WIC) puts its percentage here instead.
-	dur := time.Since(iv.decodeStart)
-	text := " decoding " + formatImageDuration(dur) + " "
-	if iv.decodePct != nil {
-		if pct := int(iv.decodePct.Load()); pct > 0 {
-			text = fmt.Sprintf(" decoding %d%% ", pct)
-		}
-	}
-	text = runewidth.Truncate(text, limit, "…")
+	// The text comes from the same source as the guard rect; one clock read
+	// drives the band phase. A decoder that reports progress (WIC) puts its
+	// percentage in the label instead.
+	text := runewidth.Truncate(iv.toastText(), limit, "…")
 	// Phase counts from decodeStart (pinned when loading began), never from
 	// the frame clock, so the band cannot sit frozen at its first shape.
-	phase := float64(dur%imageLoadingCycle) / float64(imageLoadingCycle)
+	phase := float64(time.Since(iv.decodeStart)%imageLoadingCycle) / float64(imageLoadingCycle)
 	iv.loadRow = buildLoadingRow(iv.loadRow[:0], text, phase)
 	scr.Write(x1, y2, iv.loadRow)
 }

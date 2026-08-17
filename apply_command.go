@@ -817,10 +817,10 @@ func (s *applyCommandSession) enqueue(request applyBatchRequest, model *applyBat
 			model.Finish(fallback)
 		}
 		s.refreshCapturedPanels()
-		vtui.ShowToast(Msg("ApplyCommand.StatusFinishedToast"), 3*time.Second)
+		vtui.ShowToastStyled(Msg("ApplyCommand.StatusFinishedToast"), 3*time.Second, appToastStyle)
 	}
 	GlobalQueueManager.Enqueue(task)
-	vtui.ShowToast(Msg("ApplyCommand.QueuedToast"), 3*time.Second)
+	vtui.ShowToastStyled(Msg("ApplyCommand.QueuedToast"), 3*time.Second, appToastStyle)
 }
 
 func (s *applyCommandSession) queuePreconditions() []OpPrecondition {
