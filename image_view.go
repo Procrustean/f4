@@ -1281,19 +1281,10 @@ func (iv *ImageView) baseName() string {
 }
 
 // displaySize is the picture dimensions, "1442x2160", with the reader's own
-// turn applied. The header pass supplies the real size before the full
-// decode, so the title and the OSD never jump when the preview is replaced.
+// turn applied. Only the decoded surface answers: a header-probed size
+// would flash over the picture that is still on screen while a new file
+// decodes, so it is not reported.
 func (iv *ImageView) displaySize() string {
-	if hd, ok := ImagePipe.Identified(iv.vfs, iv.path); ok && hd.Width > 0 && hd.Height > 0 {
-		w, h := hd.Width, hd.Height
-		if hd.Orientation >= 5 && hd.Orientation <= 8 {
-			w, h = h, w
-		}
-		if iv.rotation%180 != 0 {
-			w, h = h, w
-		}
-		return fmt.Sprintf("%dx%d", w, h)
-	}
 	img := iv.display()
 	if img != nil && img.Valid() && img.Width > 0 && img.Height > 0 {
 		return fmt.Sprintf("%dx%d", img.Width, img.Height)

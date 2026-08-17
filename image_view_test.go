@@ -987,11 +987,12 @@ func TestImageViewOverlayLines(t *testing.T) {
 	}
 }
 
-// TestImageViewOverlayShowsIdentifiedBeforeDecode locks in the header-pass
-// consumer in the viewer: the overlay and the title report the real size and
-// the camera's orientation before any decode lands, so nothing jumps when
-// the preview is replaced by the full picture.
-func TestImageViewOverlayShowsIdentifiedBeforeDecode(t *testing.T) {
+// TestImageViewOverlayIgnoresIdentifiedBeforeDecode locks in the viewer's
+// resolution consumer: the header-pass size is not reported before the
+// picture decodes (it would flash over the surface still on screen), so the
+// overlay and the title show only the decoded surface's dimensions. The
+// camera's EXIF orientation is still read from the header.
+func TestImageViewOverlayIgnoresIdentifiedBeforeDecode(t *testing.T) {
 	withStubPipeline(t, 8, 8)
 	iv := newTestImageView(t, 8, 8)
 	iv.path = "photo.jpg"
@@ -1001,23 +1002,24 @@ func TestImageViewOverlayShowsIdentifiedBeforeDecode(t *testing.T) {
 	ImagePipe.idents.put(imageCacheKey{Path: "photo.jpg"}, imagedec.ImageHead{Width: 1600, Height: 900, Orientation: 6})
 	ImagePipe.mu.Unlock()
 
-	// Orientation 6 swaps the sides: the viewer shows 900x1600, exactly what
-	// the decoded surface will report later.
-	if got := iv.displaySize(); got != "900x1600" {
-		t.Errorf("displaySize before decode is %q, want 900x1600", got)
+	// The size on screen is the 8x8 surface; the header's 1600x900 must not
+	// leak into the title or the panel ahead of the decode.
+	if got := iv.displaySize(); got != "8x8" {
+		t.Errorf("displaySize before decode is %q, want 8x8", got)
 	}
-	if got := iv.GetTitle(); !strings.Contains(got, "900x1600") {
-		t.Errorf("title before decode is %q, without 900x1600", got)
+	if got := iv.GetTitle(); strings.Contains(got, "1600x900") || strings.Contains(got, "900x1600") {
+		t.Errorf("title before decode is %q, must not carry the header size", got)
 	}
 	lines := iv.overlayLines()
-	if !strings.Contains(lines[1], "900x1600") || !strings.Contains(strings.Join(lines, "|"), "EXIF orientation 6") {
-		t.Errorf("the panel before decode says %v", lines)
+	if !strings.Contains(strings.Join(lines, "|"), "EXIF orientation 6") {
+		t.Errorf("the camera's orientation must still come from the header, got %v", lines)
 	}
 
-	// The reader's own turn stacks on top of the header size.
-	iv.Rotate(90)
+	// Once the decoded surface lands, its own size (and the reader's turn)
+	// is what is reported.
+	iv.SetImage(ImageResult{Surface: vtui.NewImageSurface(1600, 900)})
 	if got := iv.displaySize(); got != "1600x900" {
-		t.Errorf("displaySize after a reader turn is %q, want 1600x900", got)
+		t.Errorf("displaySize after decode is %q, want 1600x900", got)
 	}
 }
 
