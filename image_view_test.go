@@ -770,22 +770,30 @@ func TestImageViewNavigationFollowsToThePanel(t *testing.T) {
 }
 
 func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
-	asked := withStubPipeline(t, 8, 8)
-	// The ring beyond the full decodes is only thumbnailed: catch those
-	// preview requests on a second channel.
-	previewed := make(chan string, 8)
-	ImagePipe.preview = func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
-		previewed <- path
-		return imageTestSurface(4, 4), imagePreviewDecoder, nil
-	}
+	// The neighbours carry real headers with embedded thumbnails, so the
+	// probe pass can prepare the ring without the decode path.
+	thumb := jpegBytes(t, 8, 6)
+	file := jpegWithThumbnail(t, jpegBytes(t, 64, 48), thumb)
+	v := &mapVFS{files: map[string][]byte{
+		"0.jpg": file, "1.jpg": file, "2.jpg": file, "3.jpg": file, "4.jpg": file,
+	}}
+
+	asked := make(chan string, 16)
+	old := ImagePipe
+	t.Cleanup(func() { ImagePipe = old })
+	ImagePipe = newTestPipeline(func(ctx context.Context, vfs vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		asked <- path
+		return imageTestSurface(8, 8), "stub", nil
+	})
 
 	iv := newTestImageView(t, 100, 100)
+	iv.vfs = v
 	iv.path = "2.jpg"
 	iv.SetSiblings([]string{"0.jpg", "1.jpg", "2.jpg", "3.jpg", "4.jpg"}, 2)
 
 	// The nearest neighbours are decoded whole; the ones beyond them are
-	// only worth a thumbnail (JPEG names, so the preview filter lets them
-	// through).
+	// only worth a thumbnail (JPEG names, so the probe's preview filter
+	// lets them through).
 	seen := map[string]bool{}
 	for i := 0; i < 2; i++ {
 		deadline := time.NewTimer(time.Second)
@@ -808,17 +816,20 @@ func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
 		t.Error("the picture on screen is not its own neighbour")
 	}
 
+	// The ring's thumbnails are extracted by the probe pass: the same
+	// single head read that identifies each picture.
 	previewSeen := map[string]bool{}
-	for i := 0; i < 2; i++ {
-		deadline := time.NewTimer(time.Second)
-		select {
-		case path := <-previewed:
-			if !deadline.Stop() {
-				<-deadline.C
+	deadline := time.After(2 * time.Second)
+	for len(previewSeen) < 2 {
+		for _, name := range []string{"0.jpg", "4.jpg"} {
+			if res, ok := ImagePipe.PreviewSync(context.Background(), v, name); ok && res.Preview {
+				previewSeen[name] = true
 			}
-			previewSeen[path] = true
-		case <-deadline.C:
+		}
+		select {
+		case <-deadline:
 			t.Fatalf("only %d thumbnails were prepared: %v", len(previewSeen), previewSeen)
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
 	for _, want := range []string{"0.jpg", "4.jpg"} {

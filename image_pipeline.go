@@ -43,6 +43,11 @@ const (
 	// imageIdentCacheLimit bounds the header identifications kept; each is a
 	// few dozen bytes, so the count can be generous.
 	imageIdentCacheLimit = 4096
+
+	// imageHeadsCacheLimit bounds the raw head bytes the probe pass keeps;
+	// each is at most the preview head, so the budget holds the ring and
+	// window with room to spare.
+	imageHeadsCacheLimit = 32 << 20
 )
 
 // ImageResult is what a picture request produces. A preview is provisional:
@@ -94,12 +99,13 @@ type imageJob struct {
 	waiters         []imageWaiter
 }
 
-type imagePreviewJob struct {
-	cancel context.CancelFunc
-}
-
-type imageIdentJob struct {
-	cancel context.CancelFunc
+// imageProbeJob is one header read shared by identification and the
+// embedded-preview extraction: the read size is chosen by whether a preview
+// is wanted, and both answers come out of the same bytes.
+type imageProbeJob struct {
+	cancel        context.CancelFunc
+	previewWanted bool
+	started       bool
 }
 
 type imageBytesJob struct {
@@ -129,14 +135,16 @@ type ImagePipeline struct {
 	surfaceCache *imageLRU[imageCacheKey, *imageEntry]
 	// previews holds embedded thumbnails, bounded by count.
 	previews *imageLRU[imageCacheKey, ImageResult]
-	// previewJobs are cancellable thumbnail extractions.
-	previewJobs map[imageCacheKey]*imagePreviewJob
 
 	// idents holds header identifications (dimensions, orientation), the
 	// cheap pass that runs over far more pictures than the decode prefetch.
 	idents *imageLRU[imageCacheKey, imagedec.ImageHead]
-	// identJobs are cancellable header probes.
-	identJobs map[imageCacheKey]*imageIdentJob
+
+	// heads holds the raw head bytes a probe read, so the preview and the
+	// identification share one transfer instead of two.
+	heads *imageLRU[imageCacheKey, []byte]
+	// probeJobs are cancellable header reads shared by both passes.
+	probeJobs map[imageCacheKey]*imageProbeJob
 
 	// bytesCache shares one transfer between preview and full decode.
 	bytesCache *imageLRU[imageCacheKey, []byte]
@@ -163,8 +171,10 @@ func NewImagePipeline() *ImagePipeline {
 		surfaceCache: newImageLRU[imageCacheKey, *imageEntry](imageCacheLimit, func(e *imageEntry) int64 { return e.bytes }),
 		previews:     newImageLRU[imageCacheKey, ImageResult](imagePreviewCacheLimit, nil),
 		idents:       newImageLRU[imageCacheKey, imagedec.ImageHead](imageIdentCacheLimit, nil),
+		heads:        newImageLRU[imageCacheKey, []byte](imageHeadsCacheLimit, func(d []byte) int64 { return int64(len(d)) }),
 		bytesCache:   newImageLRU[imageCacheKey, []byte](imageBytesCacheLimit, func(d []byte) int64 { return int64(len(d)) }),
 		bytesJobs:    make(map[imageCacheKey]*imageBytesJob),
+		probeJobs:    make(map[imageCacheKey]*imageProbeJob),
 		dispatch:     func(fn func()) { vtui.FrameManager.PostTask(fn) },
 	}
 	p.load = p.loadWithCache
@@ -172,13 +182,31 @@ func NewImagePipeline() *ImagePipeline {
 	return p
 }
 
-// previewWithCache cuts the preview out of cached bytes instead of reopening
-// the file.
+// previewWithCache cuts the preview out of bytes already in hand instead of
+// reopening the file: the whole picture, then the probe's head, then a fresh
+// read.
 func (p *ImagePipeline) previewWithCache(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 	if data, ok := p.CachedBytes(v, path); ok && len(data) > 0 {
 		return imagePreviewFromHead(data)
 	}
+	// The probe pass read the head already; the thumbnail is cut from the
+	// same bytes, no second transfer. A thumbnail beyond the head (rare)
+	// falls through to a fresh read.
+	if head, ok := p.cachedHead(v, path); ok {
+		if surf, name, err := imagePreviewFromHead(head); err == nil {
+			return surf, name, nil
+		}
+	}
 	return imageQuickPreview(ctx, v, path)
+}
+
+// cachedHead returns the raw head bytes the probe pass read for a picture,
+// so the preview needs no new transfer.
+func (p *ImagePipeline) cachedHead(v vfs.VFS, path string) ([]byte, bool) {
+	key := imageCacheKey{Source: imageSource(v), Path: path}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.heads.get(key)
 }
 
 // loadWithCache decodes through the byte cache, so a picture decoded once is
@@ -261,9 +289,10 @@ func (p *ImagePipeline) PreviewSync(ctx context.Context, v vfs.VFS, path string)
 	return res, true
 }
 
-// PreviewPrefetch extracts the embedded thumbnails of the given pictures in
-// the background (a header read, not a full decode). The list replaces the
-// previous one, like Prefetch replaces the decode queue.
+// PreviewPrefetch asks the probe pass to extract the embedded thumbnails of
+// the given pictures in the background: one header read covers both the
+// preview and the identification of each. The list replaces the previous
+// one, like Prefetch replaces the decode queue.
 func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	source := imageSource(v)
 	wanted := make(map[imageCacheKey]bool, len(paths))
@@ -272,14 +301,13 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	}
 
 	p.mu.Lock()
-	for key, job := range p.previewJobs {
-		if !wanted[key] {
+	// Only the thumbnail requests are this pass's to cancel; a probe doing
+	// identification alone belongs to the wider window.
+	for key, job := range p.probeJobs {
+		if !wanted[key] && job.previewWanted {
 			job.cancel()
-			delete(p.previewJobs, key)
+			delete(p.probeJobs, key)
 		}
-	}
-	if p.previewJobs == nil {
-		p.previewJobs = make(map[imageCacheKey]*imagePreviewJob)
 	}
 	p.mu.Unlock()
 
@@ -287,35 +315,16 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 		if imagedec.IsVideoFile(path) || !canEmbeddedPreview(path) {
 			continue
 		}
-		key := imageCacheKey{Source: source, Path: path}
-		p.mu.Lock()
-		_, cached := p.surfaceCache.peek(key)
-		_, have := p.previews.peek(key)
-		if cached || have || p.previewJobs[key] != nil {
-			p.mu.Unlock()
-			continue
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		job := &imagePreviewJob{cancel: cancel}
-		p.previewJobs[key] = job
-		p.mu.Unlock()
-
-		go func(job *imagePreviewJob, ctx context.Context, key imageCacheKey, path string) {
-			p.PreviewSync(ctx, v, path)
-			p.mu.Lock()
-			if p.previewJobs[key] == job {
-				delete(p.previewJobs, key)
-			}
-			p.mu.Unlock()
-		}(job, ctx, key, path)
+		p.requestProbe(v, path, imageCacheKey{Source: source, Path: path}, true)
 	}
 }
 
-// IdentifyPrefetch reads the headers of the given pictures in the background
-// and remembers their dimensions and orientation. It is the cheap pass that
-// covers far more pictures than the decode prefetch, so the gallery and the
-// viewer know a picture's size before it decodes. The list replaces the
-// previous one, like Prefetch replaces the decode queue.
+// IdentifyPrefetch asks the probe pass to read the headers of the given
+// pictures in the background and remember their dimensions and orientation.
+// It is the cheap pass that covers far more pictures than the decode
+// prefetch, so the gallery and the viewer know a picture's size before it
+// decodes. The list replaces the previous one, like Prefetch replaces the
+// decode queue.
 func (p *ImagePipeline) IdentifyPrefetch(v vfs.VFS, paths []string) {
 	source := imageSource(v)
 	wanted := make(map[imageCacheKey]bool, len(paths))
@@ -324,14 +333,13 @@ func (p *ImagePipeline) IdentifyPrefetch(v vfs.VFS, paths []string) {
 	}
 
 	p.mu.Lock()
-	for key, job := range p.identJobs {
-		if !wanted[key] {
+	// A probe already reading a thumbnail also answers the identification;
+	// only the identification-only probes are this pass's to cancel.
+	for key, job := range p.probeJobs {
+		if !wanted[key] && !job.previewWanted {
 			job.cancel()
-			delete(p.identJobs, key)
+			delete(p.probeJobs, key)
 		}
-	}
-	if p.identJobs == nil {
-		p.identJobs = make(map[imageCacheKey]*imageIdentJob)
 	}
 	p.mu.Unlock()
 
@@ -339,27 +347,7 @@ func (p *ImagePipeline) IdentifyPrefetch(v vfs.VFS, paths []string) {
 		if imagedec.IsVideoFile(path) {
 			continue
 		}
-		key := imageCacheKey{Source: source, Path: path}
-		p.mu.Lock()
-		_, cached := p.surfaceCache.peek(key)
-		_, have := p.idents.peek(key)
-		if cached || have || p.identJobs[key] != nil {
-			p.mu.Unlock()
-			continue
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		job := &imageIdentJob{cancel: cancel}
-		p.identJobs[key] = job
-		p.mu.Unlock()
-
-		go func(ctx context.Context, key imageCacheKey, path string) {
-			p.identifyOne(ctx, v, path, key)
-			p.mu.Lock()
-			if p.identJobs[key] == job {
-				delete(p.identJobs, key)
-			}
-			p.mu.Unlock()
-		}(ctx, key, path)
+		p.requestProbe(v, path, imageCacheKey{Source: source, Path: path}, false)
 	}
 }
 
@@ -386,14 +374,82 @@ func (p *ImagePipeline) IdentifiedHead(v vfs.VFS, path string) (imagedec.ImageHe
 	return p.idents.get(key)
 }
 
-// identifyOne reads a file's head and remembers what it found. A cancelled
-// or unreadable file is skipped quietly: identification is never worth an
-// error message.
-func (p *ImagePipeline) identifyOne(ctx context.Context, v vfs.VFS, path string, key imageCacheKey) {
+// requestProbe starts one header read for a picture, shared by both passes:
+// the identification always comes out of it, the embedded preview too when
+// a preview is wanted. An existing probe covers the request; a thumbnail
+// wanted by a probe that has not started yet upgrades it.
+func (p *ImagePipeline) requestProbe(v vfs.VFS, path string, key imageCacheKey, wantPreview bool) {
+	p.mu.Lock()
+	if wantPreview {
+		if _, ok := p.surfaceCache.peek(key); ok {
+			p.mu.Unlock()
+			return
+		}
+		if _, ok := p.previews.peek(key); ok {
+			p.mu.Unlock()
+			return
+		}
+	} else if _, ok := p.idents.peek(key); ok {
+		p.mu.Unlock()
+		return
+	}
+	if job := p.probeJobs[key]; job != nil {
+		if wantPreview && !job.started {
+			job.previewWanted = true
+		}
+		p.mu.Unlock()
+		return
+	}
+	// The identification pass may already have read this file's head (the
+	// gallery identifies the whole folder before the viewer opens); the
+	// thumbnail is cut from those bytes, no second transfer. A thumbnail
+	// beyond the head falls through to a deeper probe.
+	if wantPreview {
+		if head, ok := p.heads.peek(key); ok {
+			p.mu.Unlock()
+			if surf, name, err := imagePreviewFromHead(head); err == nil && surf != nil && surf.Valid() {
+				p.mu.Lock()
+				p.previews.put(key, ImageResult{Path: path, Surface: surf, Decoder: name, Preview: true})
+				p.mu.Unlock()
+				return
+			}
+			p.mu.Lock()
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &imageProbeJob{cancel: cancel, previewWanted: wantPreview}
+	p.probeJobs[key] = job
+	p.mu.Unlock()
+
+	go func(job *imageProbeJob, ctx context.Context, key imageCacheKey, path string) {
+		p.probeOne(ctx, v, path, key, job)
+		p.mu.Lock()
+		if p.probeJobs[key] == job {
+			delete(p.probeJobs, key)
+		}
+		p.mu.Unlock()
+	}(job, ctx, key, path)
+}
+
+// probeOne reads a file's head once, and from those bytes answers both the
+// identification and (for JPEGs) the embedded preview: one transfer covers
+// the cheap pass and the thumbnail. A cancelled or unreadable file is
+// skipped quietly: identification is never worth an error message.
+func (p *ImagePipeline) probeOne(ctx context.Context, v vfs.VFS, path string, key imageCacheKey, job *imageProbeJob) {
 	if ctx.Err() != nil {
 		return
 	}
-	head, err := imageReadHead(ctx, v, path, imageIdentHeadSize)
+	p.mu.Lock()
+	previewWanted := job.previewWanted
+	job.started = true
+	p.mu.Unlock()
+
+	limit := imageIdentHeadSize
+	if previewWanted {
+		// A thumbnail can sit deep in the header; read far enough for it.
+		limit = imagePreviewHeadSize
+	}
+	head, err := imageReadHead(ctx, v, path, limit)
 	if err != nil {
 		return
 	}
@@ -408,8 +464,21 @@ func (p *ImagePipeline) identifyOne(ctx context.Context, v vfs.VFS, path string,
 	if item, err := v.Stat(ctx, path); err == nil {
 		h.Size, h.MTime = item.Size, item.MTime
 	}
+
 	p.mu.Lock()
+	p.heads.put(key, head)
 	p.idents.put(key, h)
+	p.mu.Unlock()
+
+	if !previewWanted {
+		return
+	}
+	surf, name, err := imagePreviewFromHead(head)
+	if err != nil || surf == nil || !surf.Valid() {
+		return
+	}
+	p.mu.Lock()
+	p.previews.put(key, ImageResult{Path: path, Surface: surf, Decoder: name, Preview: true})
 	p.mu.Unlock()
 }
 
@@ -521,15 +590,12 @@ func (p *ImagePipeline) Invalidate(v vfs.VFS, path string) {
 	p.surfaceCache.delete(key)
 	p.previews.delete(key)
 	p.idents.delete(key)
+	p.heads.delete(key)
 	p.bytesCache.delete(key)
 	delete(p.bytesJobs, key)
-	if job := p.previewJobs[key]; job != nil {
+	if job := p.probeJobs[key]; job != nil {
 		job.cancel()
-		delete(p.previewJobs, key)
-	}
-	if job := p.identJobs[key]; job != nil {
-		job.cancel()
-		delete(p.identJobs, key)
+		delete(p.probeJobs, key)
 	}
 }
 
@@ -542,17 +608,14 @@ func (p *ImagePipeline) Clear() {
 	for key := range p.bytesJobs {
 		delete(p.bytesJobs, key)
 	}
-	for key, job := range p.previewJobs {
+	for key, job := range p.probeJobs {
 		job.cancel()
-		delete(p.previewJobs, key)
-	}
-	for key, job := range p.identJobs {
-		job.cancel()
-		delete(p.identJobs, key)
+		delete(p.probeJobs, key)
 	}
 	p.surfaceCache.clear()
 	p.previews.clear()
 	p.idents.clear()
+	p.heads.clear()
 	p.bytesCache.clear()
 }
 

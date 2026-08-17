@@ -222,9 +222,15 @@ func TestImagePipelineUrgentStartsWhilePrefetchIsInFlight(t *testing.T) {
 	}
 }
 
+// TestImagePipelinePreviewPrefetch locks in the shared probe: the ring's
+// thumbnails are extracted from the same single head read that identifies
+// each picture, so a slow source pays one transfer per file, not two.
 func TestImagePipelinePreviewPrefetch(t *testing.T) {
+	thumb := jpegBytes(t, 8, 6)
+	file := jpegWithThumbnail(t, jpegBytes(t, 64, 48), thumb)
+	v := &byteCacheVFS{data: file}
+
 	var mu sync.Mutex
-	previews := 0
 	loads := 0
 	p := newTestPipeline(func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 		mu.Lock()
@@ -232,28 +238,23 @@ func TestImagePipelinePreviewPrefetch(t *testing.T) {
 		mu.Unlock()
 		return imageTestSurface(8, 8), "stub", nil
 	})
-	p.preview = func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
-		mu.Lock()
-		previews++
-		mu.Unlock()
-		return imageTestSurface(4, 4), imagePreviewDecoder, nil
-	}
 
 	// The ring beyond the decoded neighbours: only thumbnails, no decodes.
 	// JPEG names, so the embedded-preview filter lets them through.
-	p.PreviewPrefetch(nil, []string{"far1.jpg", "far2.jpg"})
+	p.PreviewPrefetch(v, []string{"far1.jpg", "far2.jpg"})
 
+	// The probe finishes when its identification lands; the thumbnail is
+	// extracted from the same bytes right after.
 	deadline := time.After(2 * time.Second)
 	for {
-		mu.Lock()
-		n := previews
-		mu.Unlock()
-		if n == 2 {
-			break
+		if _, ok1 := p.IdentifiedHead(v, "far1.jpg"); ok1 {
+			if _, ok2 := p.IdentifiedHead(v, "far2.jpg"); ok2 {
+				break
+			}
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("the previews never arrived, %d extracted", n)
+			t.Fatal("the probes never arrived")
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
@@ -264,14 +265,27 @@ func TestImagePipelinePreviewPrefetch(t *testing.T) {
 	if gotLoads != 0 {
 		t.Errorf("preview prefetch must not decode whole files, got %d decodes", gotLoads)
 	}
+	// One open and one read per picture covers both the thumbnail and the
+	// identification.
+	if v.opens != 2 || v.readAts != 2 {
+		t.Errorf("preview prefetch must be one head read per picture, got %d opens, %d read-ats", v.opens, v.readAts)
+	}
+
+	// The thumbnails come out of those same reads, with no new transfer.
+	for _, name := range []string{"far1.jpg", "far2.jpg"} {
+		if res, ok := p.PreviewSync(context.Background(), v, name); !ok || !res.Preview {
+			t.Errorf("%s: the probe must have extracted the thumbnail: %+v", name, res)
+		}
+	}
+	if v.opens != 2 || v.readAts != 2 {
+		t.Errorf("the thumbnails must not be read again: %d opens, %d read-ats", v.opens, v.readAts)
+	}
+
 	p.mu.Lock()
-	running := len(p.previewJobs)
+	running := len(p.probeJobs)
 	p.mu.Unlock()
 	if running != 0 {
-		t.Errorf("%d preview jobs are still running", running)
-	}
-	if _, ok := p.previews.peek(imageCacheKey{Path: "far1.jpg"}); !ok {
-		t.Error("the extracted thumbnail must be remembered")
+		t.Errorf("%d probe jobs are still running", running)
 	}
 }
 
@@ -308,6 +322,29 @@ func (f *byteCacheFile) Size() int64                                     { retur
 // identification pass can carry size/time along with the header.
 func (v *byteCacheVFS) Stat(ctx context.Context, path string) (vfs.VFSItem, error) {
 	return vfs.VFSItem{Name: path, Size: int64(len(v.data)), MTime: time.Unix(1000, 0)}, nil
+}
+
+// mapVFS serves named byte blobs, so a test can hand the probe pass real
+// headers without touching the disk.
+type mapVFS struct {
+	vfs.VFS
+	files map[string][]byte
+}
+
+func (v *mapVFS) Open(ctx context.Context, path string) (vfs.ReadAtCloser, error) {
+	data, ok := v.files[path]
+	if !ok {
+		return nil, errors.New("no such file: " + path)
+	}
+	return &byteCacheFile{v: &byteCacheVFS{data: data}}, nil
+}
+
+func (v *mapVFS) Stat(ctx context.Context, path string) (vfs.VFSItem, error) {
+	data, ok := v.files[path]
+	if !ok {
+		return vfs.VFSItem{}, errors.New("no such file: " + path)
+	}
+	return vfs.VFSItem{Name: path, Size: int64(len(data))}, nil
 }
 
 func TestImagePipelineFileBytesAreReadOnce(t *testing.T) {
@@ -537,6 +574,61 @@ func TestImagePipelineIdentifyPrefetch(t *testing.T) {
 	if h, ok := p.IdentifiedHead(v, "a.png"); !ok || h.Width != 40 || h.Height != 30 || h.Size != int64(len(v.data)) || !h.MTime.Equal(time.Unix(1000, 0)) {
 		t.Errorf("the header identification must survive the decode with its stat, got %+v ok=%v", h, ok)
 	}
+}
+
+// TestImagePipelineProbeSharedByBothPasses locks in the merged probe: no
+// matter which pass runs first, one head read answers both the identification
+// and the embedded preview, so a slow source never pays twice.
+func TestImagePipelineProbeSharedByBothPasses(t *testing.T) {
+	thumb := jpegBytes(t, 8, 6)
+	file := jpegWithThumbnail(t, jpegBytes(t, 64, 48), thumb)
+
+	run := func(t *testing.T, identFirst bool) {
+		t.Helper()
+		v := &byteCacheVFS{data: file}
+		p := newTestPipeline(nil)
+
+		if identFirst {
+			p.IdentifyPrefetch(v, []string{"a.jpg"})
+			// The thumbnail is then cut from the identification's head.
+			p.PreviewPrefetch(v, []string{"a.jpg"})
+		} else {
+			p.PreviewPrefetch(v, []string{"a.jpg"})
+			// The identification joins the preview's probe, no new read.
+			p.IdentifyPrefetch(v, []string{"a.jpg"})
+		}
+
+		// Wait for the shared probe: its identification lands after the
+		// single head read, so the counters are settled before asserting.
+		deadline := time.After(2 * time.Second)
+		for {
+			if _, ok := p.IdentifiedHead(v, "a.jpg"); ok {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatal("the identification never arrived")
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+
+		if v.opens != 1 || v.readAts != 1 {
+			t.Errorf("ident+preview must be one head read, got %d opens, %d read-ats", v.opens, v.readAts)
+		}
+
+		// The thumbnail comes out of those same bytes, no new transfer.
+		for _, name := range []string{"a.jpg"} {
+			if res, ok := p.PreviewSync(context.Background(), v, name); !ok || !res.Preview {
+				t.Errorf("%s: the preview must come from the shared probe: %+v", name, res)
+			}
+		}
+		if v.opens != 1 || v.readAts != 1 {
+			t.Errorf("the thumbnail must not be read again: %d opens, %d read-ats", v.opens, v.readAts)
+		}
+	}
+
+	t.Run("identification-first", func(t *testing.T) { run(t, true) })
+	t.Run("preview-first", func(t *testing.T) { run(t, false) })
 }
 
 func TestImageNeighbourhood(t *testing.T) {
