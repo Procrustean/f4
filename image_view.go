@@ -569,9 +569,9 @@ func (iv *ImageView) accept(gen uint64, res ImageResult) {
 	if iv.sized && (iv.actual || iv.zoom > imageViewSizedHeadroom) {
 		iv.requestFull()
 	}
-	if !res.Preview && res.Decoder != "" && res.DecodeDur > imageViewDecodeDelay && !iv.tempActive() {
-		iv.toast(decoderWithTime(res.Decoder, res.DecodeDur))
-	}
+	// No decode-report toast: a slow decode is already announced by the
+	// loading toast, and a report popping up between pictures is what makes
+	// the OSD jump.
 }
 
 // ToggleActualSize switches between window-fit and literal pixels; the toast

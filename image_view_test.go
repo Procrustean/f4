@@ -711,20 +711,23 @@ func TestImageViewWindowTitleWithoutImage(t *testing.T) {
 	}
 }
 
-func TestImageViewDecodeToastDefersToUser(t *testing.T) {
+// TestImageViewDecodeResultKeepsNoToast locks in that a finished decode does
+// not pop a report into the corner: a slow decode is already announced by the
+// loading toast, and a report between pictures makes the OSD jump.
+func TestImageViewDecodeResultKeepsNoToast(t *testing.T) {
 	iv := newTestImageView(t, 10, 10)
 	iv.toast("scale: 100%")
 
 	res := ImageResult{Surface: vtui.NewImageSurface(20, 20), Decoder: "png", DecodeDur: time.Second}
 	iv.accept(iv.loadGen, res)
 	if iv.tempMsg != "scale: 100%" {
-		t.Errorf("a decode report must not overwrite a user message, got %q", iv.tempMsg)
+		t.Errorf("a decode result must not overwrite a user message, got %q", iv.tempMsg)
 	}
 
 	iv.tempMsg = ""
 	iv.accept(iv.loadGen, res)
-	if iv.tempMsg != "png 1.00s" {
-		t.Errorf("with the slot free the decode report is shown, got %q", iv.tempMsg)
+	if iv.tempMsg != "" {
+		t.Errorf("a decode result must not show a report toast, got %q", iv.tempMsg)
 	}
 }
 
