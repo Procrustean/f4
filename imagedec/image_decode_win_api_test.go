@@ -367,3 +367,38 @@ func containsString(list []string, want string) bool {
 	}
 	return false
 }
+
+// TestWICFormatNoAlpha locks in the opaque fast path: photo formats without
+// an alpha channel skip the alpha scan, while alpha-capable formats (the
+// converter's 32bppBGRA target included) fall through to it.
+func TestWICFormatNoAlpha(t *testing.T) {
+	makeFmt := func(data1 uint32, last byte) windows.GUID {
+		return windows.GUID{Data1: data1, Data2: 0x4e03, Data3: 0x4bfe,
+			Data4: [8]byte{0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, last}}
+	}
+	opaque := []windows.GUID{
+		makeFmt(0x6fddc324, 0x08), // 8bppGray
+		makeFmt(0x6fddc324, 0x0c), // 24bppBGR (JPEG/BMP)
+		makeFmt(0x6fddc324, 0x0d), // 24bppRGB
+		makeFmt(0x6fddc324, 0x0e), // 32bppBGR
+		makeFmt(0x6fddc324, 0x15), // 48bppRGB
+	}
+	for _, f := range opaque {
+		if !wicFormatNoAlpha(f) {
+			t.Errorf("format %x/%02x must be treated as opaque", f.Data1, f.Data4[7])
+		}
+	}
+	alpha := []windows.GUID{
+		guidWICPixelFormat32bppBGRA,
+		guidWICPixelFormat32bppPBGRA,
+		guidWICPixelFormat32bppRGBA,
+		guidWICPixelFormat32bppPRGBA,
+		makeFmt(0x6fddc324, 0x16), // 64bppRGBA
+		makeFmt(0x05ec7c2b, 0xd2), // 16bppBGRA5551 (a different Data1)
+	}
+	for _, f := range alpha {
+		if wicFormatNoAlpha(f) {
+			t.Errorf("format %x/%02x must be scanned for alpha", f.Data1, f.Data4[7])
+		}
+	}
+}

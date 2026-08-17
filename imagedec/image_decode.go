@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/draw"
 	"io"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -335,10 +336,6 @@ func DecodeImageFromPath(ctx context.Context, path string, d ImageDecoder) (*vtu
 
 // Extension-claiming decoders first, the rest as fallbacks; a name nobody
 // claims is refused outright, never sniffed.
-func DecodeImage(path string, data []byte) (*vtui.ImageSurface, string, error) {
-	return DecodeImageContext(context.Background(), path, data)
-}
-
 func DecodeImageContext(ctx context.Context, path string, data []byte) (*vtui.ImageSurface, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -749,11 +746,52 @@ func surfaceFromDecodedImage(img image.Image) (*vtui.ImageSurface, error) {
 		return surfaceFromRGBA(m.Rect.Dx(), m.Rect.Dy(), m.Stride, m.Pix)
 	case *image.YCbCr, *image.Gray, *image.CMYK:
 		return surfaceFromOpaque(img)
+	case *image.RGBA64:
+		// 16-bit PNGs decode to RGBA64; the high byte of each channel is
+		// the value, so the 16->8 conversion is a tight byte pass instead
+		// of a per-pixel At() call.
+		return surfaceFromRGBA64(m.Rect.Dx(), m.Rect.Dy(), m.Stride, m.Pix)
+	case *image.NRGBA64:
+		return surfaceFromRGBA64(m.Rect.Dx(), m.Rect.Dy(), m.Stride, m.Pix)
 	}
 	surf := vtui.NewImageSurfaceFromImage(img)
 	if surf == nil {
 		return nil, fmt.Errorf("unsupported image geometry")
 	}
+	return surf, nil
+}
+
+// surfaceFromRGBA64 converts a 16-bit-per-channel buffer (big-endian pairs
+// per channel) into the 8-bit surface the pipeline holds; the opacity flag is
+// set from the alpha bytes read along the way.
+func surfaceFromRGBA64(w, h, stride int, pix []byte) (*vtui.ImageSurface, error) {
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("unsupported image geometry")
+	}
+	out := make([]byte, w*h*4)
+	opaque := true
+	for y := 0; y < h; y++ {
+		so := y * stride
+		do := y * w * 4
+		for x := 0; x < w; x++ {
+			o := so + x*8
+			// RGBA64.Pix is big-endian per channel: the high byte is the value.
+			out[do] = pix[o]
+			out[do+1] = pix[o+2]
+			out[do+2] = pix[o+4]
+			a := pix[o+6]
+			out[do+3] = a
+			if a != 255 {
+				opaque = false
+			}
+			do += 4
+		}
+	}
+	surf := vtui.NewImageSurfaceFromPix(w, h, w*4, out)
+	if surf == nil {
+		return nil, fmt.Errorf("unsupported image geometry")
+	}
+	surf.Opaque = opaque
 	return surf, nil
 }
 
@@ -769,19 +807,102 @@ func surfaceFromRGBA(w, h, stride int, pix []byte) (*vtui.ImageSurface, error) {
 }
 
 // surfaceFromOpaque marks the by-construction opaque result for the fast path.
+// The YCbCr/Gray/CMYK to RGBA pass is row-independent, so tall pictures
+// convert in parallel; the bands re-slice the planes so the draw fast path
+// still runs (it indexes chroma from its own origin).
 func surfaceFromOpaque(img image.Image) (*vtui.ImageSurface, error) {
 	b := img.Bounds()
 	if b.Dx() <= 0 || b.Dy() <= 0 {
 		return nil, fmt.Errorf("unsupported image geometry")
 	}
 	out := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	draw.Draw(out, out.Bounds(), img, b.Min, draw.Src)
+	drawOpaqueParallel(out, img)
 	surf := vtui.NewImageSurfaceFromPix(b.Dx(), b.Dy(), out.Stride, out.Pix)
 	if surf == nil {
 		return nil, fmt.Errorf("unsupported image geometry")
 	}
 	surf.Opaque = true
 	return surf, nil
+}
+
+// drawOpaqueParallel draws img into out with draw.Draw, splitting the rows
+// across workers for a picture tall enough to pay for the goroutines. The
+// result is byte-identical to one serial draw.
+func drawOpaqueParallel(out *image.RGBA, img image.Image) {
+	rows := img.Bounds().Dy()
+	// The 4:1:0/4:1:1 ratios subsample chroma across four rows, which the
+	// even band split cannot re-align, so they stay serial.
+	if rows < 128 {
+		draw.Draw(out, out.Bounds(), img, img.Bounds().Min, draw.Src)
+		return
+	}
+	if m, ok := img.(*image.YCbCr); ok {
+		if m.SubsampleRatio == image.YCbCrSubsampleRatio410 || m.SubsampleRatio == image.YCbCrSubsampleRatio411 {
+			draw.Draw(out, out.Bounds(), img, img.Bounds().Min, draw.Src)
+			return
+		}
+	}
+	n := runtime.GOMAXPROCS(0)
+	if n < 2 {
+		n = 2
+	}
+	// Even band starts keep the 4:2:0 chroma rows aligned across bands.
+	per := (rows + n - 1) / n
+	if per&1 == 1 {
+		per++
+	}
+	if per < 32 {
+		per = 32
+	}
+	w := img.Bounds().Dx()
+	var wg sync.WaitGroup
+	for y0 := 0; y0 < rows; y0 += per {
+		y1 := y0 + per
+		if y1 > rows {
+			y1 = rows
+		}
+		sub := opaqueBand(img, y0, y1)
+		dst := out.SubImage(image.Rect(0, y0, w, y1)).(*image.RGBA)
+		wg.Add(1)
+		go func(dst *image.RGBA, sub image.Image) {
+			defer wg.Done()
+			draw.Draw(dst, dst.Bounds(), sub, sub.Bounds().Min, draw.Src)
+		}(dst, sub)
+	}
+	wg.Wait()
+}
+
+// opaqueBand returns a view of img covering rows [y0, y1) whose planes start
+// at their own origin, so the draw fast path indexes them from zero.
+func opaqueBand(img image.Image, y0, y1 int) image.Image {
+	switch m := img.(type) {
+	case *image.YCbCr:
+		sub := *m
+		n := y1 - y0
+		sub.Y = m.Y[y0*m.YStride:]
+		div := 2
+		if m.SubsampleRatio == image.YCbCrSubsampleRatio444 {
+			div = 1
+		}
+		sub.Cb = m.Cb[(y0/div)*m.CStride:]
+		sub.Cr = m.Cr[(y0/div)*m.CStride:]
+		sub.Rect = image.Rect(0, 0, m.Rect.Dx(), n)
+		return &sub
+	case *image.Gray:
+		sub := *m
+		n := y1 - y0
+		sub.Pix = m.Pix[y0*m.Stride:]
+		sub.Rect = image.Rect(0, 0, m.Rect.Dx(), n)
+		return &sub
+	case *image.CMYK:
+		sub := *m
+		n := y1 - y0
+		sub.Pix = m.Pix[y0*m.Stride:]
+		sub.Rect = image.Rect(0, 0, m.Rect.Dx(), n)
+		return &sub
+	default:
+		return img
+	}
 }
 
 // PNG fast path: magic bytes, not the extension, decide.
@@ -797,13 +918,47 @@ func DecodeImageWithStdlib(data []byte) (*vtui.ImageSurface, error) {
 		if err != nil {
 			return nil, err
 		}
-		return surfaceFromDecodedImage(img)
+		surf, err := surfaceFromDecodedImage(img)
+		if err == nil && !surf.Opaque && pngIsOpaque(data) {
+			// A PNG without an alpha channel or tRNS is opaque by
+			// construction, so the alpha scan in finishDecode is skipped.
+			surf.Opaque = true
+		}
+		return surf, err
 	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	return surfaceFromDecodedImage(img)
+}
+
+// pngIsOpaque reports whether the PNG declares no transparency: the colour
+// type has no alpha channel and no tRNS chunk precedes the image data.
+func pngIsOpaque(data []byte) bool {
+	if len(data) < 33 || !bytes.Equal(data[:8], pngSignature) {
+		return false
+	}
+	colorType := data[25]
+	if colorType == 4 || colorType == 6 {
+		return false // gray+alpha or RGBA
+	}
+	// Walk the chunks before IDAT looking for tRNS (which must precede it).
+	for off := 8; off+8 <= len(data); {
+		length := int(uint32(data[off])<<24 | uint32(data[off+1])<<16 | uint32(data[off+2])<<8 | uint32(data[off+3]))
+		typ := string(data[off+4 : off+8])
+		if typ == "tRNS" {
+			return false
+		}
+		if typ == "IDAT" {
+			return true
+		}
+		if length < 0 || off+8+length+4 > len(data) {
+			return false
+		}
+		off += 8 + length + 4
+	}
+	return false
 }
 
 var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}

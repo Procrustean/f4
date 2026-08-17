@@ -335,7 +335,7 @@ func TestExternalDecoderIsTheLastResort(t *testing.T) {
 		t.Fatalf("wrong order: %v", list)
 	}
 
-	_, name, err := DecodeImage("a.webp", []byte("RIFF\x00\x00\x00\x00WEBPbody"))
+	_, name, err := DecodeImageContext(context.Background(), "a.webp", []byte("RIFF\x00\x00\x00\x00WEBPbody"))
 	if err != nil || name != externalImageToolLabel([]byte("RIFF\x00\x00\x00\x00WEBPbody")) {
 		t.Fatalf("got %q %v", name, err)
 	}

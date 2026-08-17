@@ -354,20 +354,51 @@ func swapRB(p []byte) {
 // unpremultiplyRGBA straightens premultiplied alpha in place (RGBA byte
 // order, which the copy holds after swapRB). The WIC format converter does
 // not un-premultiply, so 32bppPBGRA/PRGBA would otherwise blend too dark.
-func unpremultiplyRGBA(p []byte) {
+// The bool says every alpha byte is 255, so the caller can skip the scan.
+func unpremultiplyRGBA(p []byte) bool {
+	opaque := true
 	for i := 0; i+3 < len(p); i += 4 {
 		a := uint32(p[i+3])
 		if a == 0 {
 			p[i], p[i+1], p[i+2] = 0, 0, 0
+			opaque = false
 			continue
 		}
 		if a == 255 {
 			continue
 		}
+		opaque = false
 		p[i] = byte((uint32(p[i])*255 + a/2) / a)
 		p[i+1] = byte((uint32(p[i+1])*255 + a/2) / a)
 		p[i+2] = byte((uint32(p[i+2])*255 + a/2) / a)
 	}
+	return opaque
+}
+
+// swapUnpremultiplyRGBA reorders BGRA into RGBA and straightens premultiplied
+// alpha in one pass, for a 32bppPBGRA copy (the swap and the division both
+// read the same bytes, so one sweep beats two). The bool says every alpha
+// byte is 255, so the caller can skip the alpha scan.
+func swapUnpremultiplyRGBA(p []byte) bool {
+	opaque := true
+	for i := 0; i+3 < len(p); i += 4 {
+		a := uint32(p[i+3])
+		if a == 0 {
+			p[i], p[i+1], p[i+2] = 0, 0, 0
+			opaque = false
+			continue
+		}
+		if a == 255 {
+			p[i], p[i+2] = p[i+2], p[i]
+			continue
+		}
+		opaque = false
+		r := byte((uint32(p[i+2])*255 + a/2) / a)
+		g := byte((uint32(p[i+1])*255 + a/2) / a)
+		b := byte((uint32(p[i])*255 + a/2) / a)
+		p[i], p[i+1], p[i+2] = r, g, b
+	}
+	return opaque
 }
 
 // wicRect is the source rectangle CopyPixels can be limited to; copying in
@@ -427,6 +458,21 @@ func wicOpenDecoder(data []byte) (stream, decoder uintptr, err error) {
 	return stream, decoder, nil
 }
 
+// wicFormatNoAlpha reports a WIC pixel format that cannot carry
+// transparency, so a copy from it is opaque by construction. The common
+// photo formats (24bppBGR, 8/16bppGray) live here; alpha-capable formats
+// (32bppBGRA, 64bppRGBA, the RGBA family) fall through to an alpha scan.
+func wicFormatNoAlpha(f windows.GUID) bool {
+	if f.Data1 != 0x6fddc324 {
+		return false
+	}
+	switch f.Data4[7] {
+	case 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x15, 0x1c:
+		return true
+	}
+	return false
+}
+
 // wicSourceRGBA yields a 32bppRGBA source: the source itself when already
 // RGBA, else a converter to BGRA (WIC's converter refuses 32bppRGBA as a
 // target, so the copy is reordered afterwards). swap says the channels need
@@ -455,7 +501,9 @@ func wicSourceRGBA(factory, src uintptr, srcFmt windows.GUID) (uintptr, bool, bo
 		wicRelease(converter)
 		return 0, false, false, false, nil, fmt.Errorf("converter Initialize: %w", err)
 	}
-	return converter, true, false, false, func() { wicRelease(converter) }, nil
+	// The converter target can carry alpha, so the result is not opaque by
+	// construction; decodeSingleFrame decides from the source format.
+	return converter, true, true, false, func() { wicRelease(converter) }, nil
 }
 
 // wicCopyPixels copies the source into surf in one call, or in scanline bands
@@ -632,13 +680,19 @@ func decodeSingleFrame(ctx context.Context, factory, decoder uintptr, tw, th int
 	if err := wicCopyPixels(ctx, src, int(w), int(h), surf, decodeProgressFrom(ctx)); err != nil {
 		return nil, err
 	}
-	if swap {
+	// The premultiply passes report opacity as they run, so a fully opaque
+	// result skips the alpha scan in finishDecode; swap-only sources keep the
+	// format-based guess (a JPEG is opaque by construction, a 32bppBGRA lets
+	// the scan decide).
+	surf.Opaque = !alpha || wicFormatNoAlpha(srcFmt)
+	switch {
+	case swap && premul:
+		surf.Opaque = swapUnpremultiplyRGBA(surf.Pix)
+	case premul:
+		surf.Opaque = unpremultiplyRGBA(surf.Pix)
+	case swap:
 		swapRB(surf.Pix)
 	}
-	if premul {
-		unpremultiplyRGBA(surf.Pix)
-	}
-	surf.Opaque = !alpha
 
 	// A codec without a flip rotator (or one whose Initialize failed) falls
 	// back to the Go-side pass.

@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"strings"
 	"testing"
@@ -147,7 +148,7 @@ func TestPathDecoderFor(t *testing.T) {
 func TestDecodeImagePNG(t *testing.T) {
 	data := makeTestPNG(t, 5, 3, color.RGBA{R: 10, G: 20, B: 30, A: 255})
 
-	surf, name, err := DecodeImage("shot.png", data)
+	surf, name, err := DecodeImageContext(context.Background(), "shot.png", data)
 	if err != nil {
 		t.Fatalf("decoding failed: %v", err)
 	}
@@ -165,10 +166,10 @@ func TestDecodeImagePNG(t *testing.T) {
 }
 
 func TestDecodeImageRejectsGarbage(t *testing.T) {
-	if _, _, err := DecodeImage("shot.png", []byte("not a picture")); err == nil {
+	if _, _, err := DecodeImageContext(context.Background(), "shot.png", []byte("not a picture")); err == nil {
 		t.Error("garbage must not decode")
 	}
-	if _, _, err := DecodeImage("notes.txt", makeTestPNG(t, 2, 2, color.RGBA{A: 255})); err == nil {
+	if _, _, err := DecodeImageContext(context.Background(), "notes.txt", makeTestPNG(t, 2, 2, color.RGBA{A: 255})); err == nil {
 		t.Error("an unclaimed extension must be refused")
 	}
 }
@@ -194,7 +195,7 @@ func TestImageDecoderPriorityAndOverride(t *testing.T) {
 	}
 	before := len(list)
 
-	if _, name, err := DecodeImage("a.png", nil); err != nil || name != "test-high" {
+	if _, name, err := DecodeImageContext(context.Background(), "a.png", nil); err != nil || name != "test-high" {
 		t.Fatalf("the highest priority decoder must win, got %q %v", name, err)
 	}
 	if called != "test-high" {
@@ -549,7 +550,7 @@ func TestDecodeICORejectsRubbish(t *testing.T) {
 
 // The F4 cycle offers the decoders that claim the extension, not the content
 // sniffers the automatic chain may fall back to for a mislabelled file: a
-// cycle that lands on go-bmp for a .jpg would pin a decoder that cannot read
+// cycle that lands on go-bmp-ico for a .jpg would pin a decoder that cannot read
 // it and look like F4 did nothing.
 func TestImageCycleOffersOnlyClaimingDecoders(t *testing.T) {
 	for _, d := range ImageCycleDecoders("a.jpg") {
@@ -607,7 +608,7 @@ func TestDecodeImageFallsBackWhenTheExtensionLies(t *testing.T) {
 	})
 
 	data := makeTestPNG(t, 2, 2, color.RGBA{R: 1, A: 255})
-	surf, name, err := DecodeImage("a.png", data)
+	surf, name, err := DecodeImageContext(context.Background(), "a.png", data)
 	if err != nil {
 		t.Fatalf("the fallback decoder should have succeeded: %v", err)
 	}
@@ -823,5 +824,105 @@ func TestDecodeImageWithStdlibRejectsDecompressionBomb(t *testing.T) {
 	_, err := DecodeImageWithStdlib(pngHeader(20000, 20000))
 	if err == nil || !strings.Contains(err.Error(), "pixel limit") {
 		t.Fatalf("error = %v, want a pixel-limit refusal before allocation", err)
+	}
+}
+
+func TestPNGIsOpaque(t *testing.T) {
+	// A truecolour PNG without tRNS is opaque by construction.
+	opaque := image.NewNRGBA(image.Rect(0, 0, 8, 8))
+	for i := 0; i < 8*8; i++ {
+		opaque.Pix[i*4+3] = 255
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, opaque); err != nil {
+		t.Fatal(err)
+	}
+	if !pngIsOpaque(buf.Bytes()) {
+		t.Error("an alpha-free PNG must be opaque")
+	}
+
+	// An RGBA PNG has an alpha channel.
+	rgba := image.NewNRGBA(image.Rect(0, 0, 8, 8))
+	rgba.Pix[3] = 128
+	buf.Reset()
+	if err := png.Encode(&buf, rgba); err != nil {
+		t.Fatal(err)
+	}
+	if pngIsOpaque(buf.Bytes()) {
+		t.Error("an RGBA PNG must not be opaque")
+	}
+
+	// A paletted PNG with a tRNS chunk is not opaque.
+	pal := image.NewPaletted(image.Rect(0, 0, 8, 8), color.Palette{
+		color.RGBA{R: 255, G: 0, B: 0, A: 255},
+		color.RGBA{R: 0, G: 0, B: 0, A: 0},
+	})
+	for i := 0; i < 8*8; i++ {
+		pal.Pix[i] = uint8(i % 2)
+	}
+	buf.Reset()
+	if err := png.Encode(&buf, pal); err != nil {
+		t.Fatal(err)
+	}
+	if pngIsOpaque(buf.Bytes()) {
+		t.Error("a paletted PNG with tRNS must not be opaque")
+	}
+
+	if pngIsOpaque([]byte{0x89, 'P', 'N', 'G'}) {
+		t.Error("a truncated header must not be reported opaque")
+	}
+}
+
+func TestSurfaceFromOpaqueParallelMatchesSerial(t *testing.T) {
+	// A tall YCbCr triggers the parallel banded pass; the output must be
+	// byte-identical to one serial draw.
+	m := image.NewYCbCr(image.Rect(0, 0, 128, 300), image.YCbCrSubsampleRatio420)
+	for y := 0; y < 300; y++ {
+		for x := 0; x < 128; x++ {
+			m.Y[m.YOffset(x, y)] = byte(16 + x*2 + y)
+			m.Cb[m.COffset(x, y)] = byte(64 + x)
+			m.Cr[m.COffset(x, y)] = byte(128 + y/2)
+		}
+	}
+	ref := image.NewRGBA(image.Rect(0, 0, 128, 300))
+	draw.Draw(ref, ref.Bounds(), m, m.Bounds().Min, draw.Src)
+
+	got, err := surfaceFromOpaque(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Opaque {
+		t.Error("the conversion result must be opaque")
+	}
+	for y := 0; y < 300; y++ {
+		for x := 0; x < 128; x++ {
+			o := (y*128 + x) * 4
+			if got.Pix[o] != ref.Pix[o] || got.Pix[o+1] != ref.Pix[o+1] ||
+				got.Pix[o+2] != ref.Pix[o+2] || got.Pix[o+3] != ref.Pix[o+3] {
+				t.Fatalf("pixel %d,%d: %d %d %d %d vs %d %d %d %d",
+					x, y, got.Pix[o], got.Pix[o+1], got.Pix[o+2], got.Pix[o+3],
+					ref.Pix[o], ref.Pix[o+1], ref.Pix[o+2], ref.Pix[o+3])
+			}
+		}
+	}
+}
+
+func TestSurfaceFromRGBA64ByteOrder(t *testing.T) {
+	// RGBA64.Pix is big-endian per channel: the high byte is the value. A
+	// converter that reads the low bytes would swap every channel.
+	pix := []byte{
+		0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+		0x00, 0x00, 0xFF, 0xFF, 0x80, 0x00, 0xFF, 0xFF,
+	}
+	s, err := surfaceFromRGBA64(2, 1, 16, pix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x12, 0x56, 0x9A, 0xDE, 0x00, 0xFF, 0x80, 0xFF}
+	if !bytes.Equal(s.Pix, want) {
+		t.Fatalf("pixels = % x, want % x (high bytes must be read)", s.Pix, want)
+	}
+	if s.Opaque {
+		t.Error("an alpha byte of 0xDE must not be treated as opaque")
 	}
 }

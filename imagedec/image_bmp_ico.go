@@ -1,7 +1,8 @@
 package imagedec
 
-// BMP. Nothing produces it on purpose any more and everything produces it by
-// accident, so a file manager had better read it.
+// BMP, ICO and CUR. Nothing produces BMP on purpose any more and everything
+// produces it by accident, so a file manager had better read it — and the
+// icon formats are BMP frames behind a small directory.
 
 import (
 	"encoding/binary"
@@ -362,7 +363,7 @@ func decodeICOBMP(data []byte) (*vtui.ImageSurface, error) {
 
 func init() {
 	RegisterImageDecoder(ImageDecoder{
-		Name:       "go-bmp",
+		Name:       "go-bmp-ico",
 		Priority:   10,
 		Extensions: []string{"bmp", "dib", "ico", "cur"},
 		Decode:     decodeBMPEntry,
