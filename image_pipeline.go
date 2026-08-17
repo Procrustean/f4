@@ -401,6 +401,13 @@ func (p *ImagePipeline) identifyOne(ctx context.Context, v vfs.VFS, path string,
 	if !ok {
 		return
 	}
+	// Carry the file stat along with the header: the OSD's size and time
+	// lines then arrive with the identification, ahead of the decode, with
+	// no separate round trip. A failed stat leaves the fields zero, and the
+	// viewer falls back to its own async stat.
+	if item, err := v.Stat(ctx, path); err == nil {
+		h.Size, h.MTime = item.Size, item.MTime
+	}
 	p.mu.Lock()
 	p.idents.put(key, h)
 	p.mu.Unlock()

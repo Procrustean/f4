@@ -7,13 +7,18 @@ package imagedec
 import (
 	"encoding/binary"
 	"strconv"
+	"time"
 )
 
-// ImageHead is what a header probe finds: the picture's dimensions and the
-// EXIF orientation tag (0 = none/unknown).
+// ImageHead is what a header probe finds: the picture's dimensions, the
+// EXIF orientation tag (0 = none/unknown), and the file stat (size and
+// modification time) the identification pass carries along, so the OSD's
+// size and time lines need no separate round trip.
 type ImageHead struct {
 	Width, Height int
 	Orientation   int
+	Size          int64
+	MTime         time.Time
 }
 
 // ProbeImageHead identifies a picture from the head of its file. The head

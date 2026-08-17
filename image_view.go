@@ -1253,8 +1253,18 @@ func (iv *ImageView) CycleRenderer() {
 
 // requestFileSize asks the file system how big the file is. Stat can be a
 // network round trip, so it runs off the drawing path, once, for the overlay.
+// The identification pass (which runs ahead of the decode over the whole
+// window) already carries the stat, so a picture identified in advance
+// answers at once; only a fresh file falls back to its own async stat.
 func (iv *ImageView) requestFileSize() {
 	if iv.sizeKnown || iv.vfs == nil {
+		return
+	}
+	if hd, ok := ImagePipe.IdentifiedHead(iv.vfs, iv.path); ok && hd.Size > 0 {
+		iv.fileSize, iv.sizeKnown = hd.Size, true
+		if !hd.MTime.IsZero() {
+			iv.fileTime, iv.timeKnown = hd.MTime, true
+		}
 		return
 	}
 	v, path, gen := iv.vfs, iv.path, iv.loadGen

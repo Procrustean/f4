@@ -304,6 +304,12 @@ func (f *byteCacheFile) Read(ctx context.Context, p []byte) (int, error) { retur
 func (f *byteCacheFile) Close() error                                    { return nil }
 func (f *byteCacheFile) Size() int64                                     { return int64(len(f.v.data)) }
 
+// Stat answers with the fixture's length and a fixed time, so the
+// identification pass can carry size/time along with the header.
+func (v *byteCacheVFS) Stat(ctx context.Context, path string) (vfs.VFSItem, error) {
+	return vfs.VFSItem{Name: path, Size: int64(len(v.data)), MTime: time.Unix(1000, 0)}, nil
+}
+
 func TestImagePipelineFileBytesAreReadOnce(t *testing.T) {
 	v := &byteCacheVFS{data: make([]byte, 4096)}
 	for i := range v.data {
@@ -526,9 +532,10 @@ func TestImagePipelineIdentifyPrefetch(t *testing.T) {
 	}
 	// The header identification survives the decode: IdentifiedHead keeps
 	// answering with the head, not the decoded surface, so the EXIF
-	// orientation stays available after the full picture arrives.
-	if h, ok := p.IdentifiedHead(v, "a.png"); !ok || h.Width != 40 || h.Height != 30 {
-		t.Errorf("the header identification must survive the decode, got %+v ok=%v", h, ok)
+	// orientation stays available after the full picture arrives. The stat
+	// travelled with the header, so the OSD needs no separate round trip.
+	if h, ok := p.IdentifiedHead(v, "a.png"); !ok || h.Width != 40 || h.Height != 30 || h.Size != int64(len(v.data)) || !h.MTime.Equal(time.Unix(1000, 0)) {
+		t.Errorf("the header identification must survive the decode with its stat, got %+v ok=%v", h, ok)
 	}
 }
 
