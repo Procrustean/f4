@@ -1550,9 +1550,10 @@ func loadingToastShade(x, width int, phase float64) uint32 {
 }
 
 // loadingToastOn reports whether the loading toast is drawn: a decode at
-// work past imageViewDecodeDelay, with no other message in the corner.
+// work past imageViewDecodeDelay, with no message (sliding out included)
+// in the corner, so the two never overlap.
 func (iv *ImageView) loadingToastOn() bool {
-	return iv.loading && !iv.tempActive() && time.Since(iv.decodeStart) > imageViewDecodeDelay
+	return iv.loading && iv.tempMsg == "" && time.Since(iv.decodeStart) > imageViewDecodeDelay
 }
 
 // drawLoadingToast shows the decode is still at work: seconds spent over a
