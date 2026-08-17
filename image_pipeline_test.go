@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"reflect"
 	"sync"
@@ -432,6 +435,66 @@ func TestImagePipelineVideoNeverReadsBytesWhole(t *testing.T) {
 	}
 	if v.opens != 0 || v.readAts != 0 {
 		t.Errorf("a video must never be read whole for a frame: %d opens, %d read-ats", v.opens, v.readAts)
+	}
+}
+
+// pngTestBytes encodes a small PNG so the identification pass has a real
+// header to read.
+func pngTestBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 128, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("png encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestImagePipelineIdentifyPrefetch locks in the cheap identification pass:
+// header reads only (no full decode), remembered so the gallery can caption a
+// tile before its thumbnail arrives.
+func TestImagePipelineIdentifyPrefetch(t *testing.T) {
+	v := &byteCacheVFS{data: pngTestBytes(t, 40, 30)}
+	p := newTestPipeline(nil)
+
+	p.IdentifyPrefetch(v, []string{"a.png"})
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if h, ok := p.Identified(v, "a.png"); ok && h.Width == 40 && h.Height == 30 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the identification never arrived")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	// One head read, no full decode.
+	if v.opens != 1 || v.readAts != 1 {
+		t.Errorf("identification must be one head read, got %d opens, %d read-ats", v.opens, v.readAts)
+	}
+
+	// A decoded picture answers Identified from its own dimensions.
+	p.load = func(context.Context, vfs.VFS, string) (*vtui.ImageSurface, string, error) {
+		return imageTestSurface(7, 5), "stub", nil
+	}
+	if res := p.LoadSync(context.Background(), v, "a.png"); res.Err != nil {
+		t.Fatalf("decode failed: %v", res.Err)
+	}
+	if h, ok := p.Identified(v, "a.png"); !ok || h.Width != 7 || h.Height != 5 {
+		t.Errorf("a decoded picture must identify from its surface, got %+v ok=%v", h, ok)
+	}
+	// The header identification survives the decode: IdentifiedHead keeps
+	// answering with the head, not the decoded surface, so the EXIF
+	// orientation stays available after the full picture arrives.
+	if h, ok := p.IdentifiedHead(v, "a.png"); !ok || h.Width != 40 || h.Height != 30 {
+		t.Errorf("the header identification must survive the decode, got %+v ok=%v", h, ok)
 	}
 }
 

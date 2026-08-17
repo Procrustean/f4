@@ -33,6 +33,14 @@ const (
 
 	// imageBytesCacheLimit bounds the file bytes the pipeline keeps around.
 	imageBytesCacheLimit = 64 << 20
+
+	// imageIdentHeadSize is how much of a file the identification pass reads:
+	// enough to reach every format's size fields, a fraction of a decode.
+	imageIdentHeadSize = 64 << 10
+
+	// imageIdentCacheLimit bounds the header identifications kept; each is a
+	// few dozen bytes, so the count can be generous.
+	imageIdentCacheLimit = 4096
 )
 
 // ImageResult is what a picture request produces. A preview is provisional:
@@ -88,6 +96,10 @@ type imagePreviewJob struct {
 	cancel context.CancelFunc
 }
 
+type imageIdentJob struct {
+	cancel context.CancelFunc
+}
+
 type imageBytesJob struct {
 	generation uint64
 	done       chan struct{}
@@ -118,6 +130,12 @@ type ImagePipeline struct {
 	// previewJobs are cancellable thumbnail extractions.
 	previewJobs map[imageCacheKey]*imagePreviewJob
 
+	// idents holds header identifications (dimensions, orientation), the
+	// cheap pass that runs over far more pictures than the decode prefetch.
+	idents *imageLRU[imageCacheKey, imagedec.ImageHead]
+	// identJobs are cancellable header probes.
+	identJobs map[imageCacheKey]*imageIdentJob
+
 	// bytesCache shares one transfer between preview and full decode.
 	bytesCache *imageLRU[imageCacheKey, []byte]
 	bytesJobs  map[imageCacheKey]*imageBytesJob
@@ -138,6 +156,7 @@ func NewImagePipeline() *ImagePipeline {
 		workers:      imageWorkers,
 		surfaceCache: newImageLRU[imageCacheKey, *imageEntry](imageCacheLimit, func(e *imageEntry) int64 { return e.bytes }),
 		previews:     newImageLRU[imageCacheKey, ImageResult](imagePreviewCacheLimit, nil),
+		idents:       newImageLRU[imageCacheKey, imagedec.ImageHead](imageIdentCacheLimit, nil),
 		bytesCache:   newImageLRU[imageCacheKey, []byte](imageBytesCacheLimit, func(d []byte) int64 { return int64(len(d)) }),
 		bytesJobs:    make(map[imageCacheKey]*imageBytesJob),
 		dispatch:     func(fn func()) { vtui.FrameManager.PostTask(fn) },
@@ -286,6 +305,101 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	}
 }
 
+// IdentifyPrefetch reads the headers of the given pictures in the background
+// and remembers their dimensions and orientation. It is the cheap pass that
+// covers far more pictures than the decode prefetch, so the gallery and the
+// viewer know a picture's size before it decodes. The list replaces the
+// previous one, like Prefetch replaces the decode queue.
+func (p *ImagePipeline) IdentifyPrefetch(v vfs.VFS, paths []string) {
+	source := imageSource(v)
+	wanted := make(map[imageCacheKey]bool, len(paths))
+	for _, path := range paths {
+		wanted[imageCacheKey{Source: source, Path: path}] = true
+	}
+
+	p.mu.Lock()
+	for key, job := range p.identJobs {
+		if !wanted[key] {
+			job.cancel()
+			delete(p.identJobs, key)
+		}
+	}
+	if p.identJobs == nil {
+		p.identJobs = make(map[imageCacheKey]*imageIdentJob)
+	}
+	p.mu.Unlock()
+
+	for _, path := range paths {
+		if imagedec.IsVideoFile(path) {
+			continue
+		}
+		key := imageCacheKey{Source: source, Path: path}
+		p.mu.Lock()
+		_, cached := p.surfaceCache.peek(key)
+		_, have := p.idents.peek(key)
+		if cached || have || p.identJobs[key] != nil {
+			p.mu.Unlock()
+			continue
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		job := &imageIdentJob{cancel: cancel}
+		p.identJobs[key] = job
+		p.mu.Unlock()
+
+		go func(ctx context.Context, key imageCacheKey, path string) {
+			p.identifyOne(ctx, v, path, key)
+			p.mu.Lock()
+			if p.identJobs[key] == job {
+				delete(p.identJobs, key)
+			}
+			p.mu.Unlock()
+		}(ctx, key, path)
+	}
+}
+
+// Identified returns the cached header identification of a picture, or the
+// dimensions of one already decoded.
+func (p *ImagePipeline) Identified(v vfs.VFS, path string) (imagedec.ImageHead, bool) {
+	key := imageCacheKey{Source: imageSource(v), Path: path}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.surfaceCache.peek(key); ok {
+		return imagedec.ImageHead{Width: e.res.Surface.Width, Height: e.res.Surface.Height}, true
+	}
+	h, ok := p.idents.get(key)
+	return h, ok
+}
+
+// IdentifiedHead is the header identification alone, without preferring a
+// decoded surface: the EXIF orientation survives the full decode this way,
+// so the viewer can keep reporting it without a jump.
+func (p *ImagePipeline) IdentifiedHead(v vfs.VFS, path string) (imagedec.ImageHead, bool) {
+	key := imageCacheKey{Source: imageSource(v), Path: path}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.idents.get(key)
+}
+
+// identifyOne reads a file's head and remembers what it found. A cancelled
+// or unreadable file is skipped quietly: identification is never worth an
+// error message.
+func (p *ImagePipeline) identifyOne(ctx context.Context, v vfs.VFS, path string, key imageCacheKey) {
+	if ctx.Err() != nil {
+		return
+	}
+	head, err := imageReadHead(ctx, v, path, imageIdentHeadSize)
+	if err != nil {
+		return
+	}
+	h, ok := imagedec.ProbeImageHead(head)
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	p.idents.put(key, h)
+	p.mu.Unlock()
+}
+
 // Load asks for a picture. A cached one is handed over on the calling thread;
 // otherwise the callback runs on the UI thread when ready. Shared requests
 // share one decoding job.
@@ -380,11 +494,16 @@ func (p *ImagePipeline) Invalidate(v vfs.VFS, path string) {
 	key := imageCacheKey{Source: imageSource(v), Path: path}
 	p.surfaceCache.delete(key)
 	p.previews.delete(key)
+	p.idents.delete(key)
 	p.bytesCache.delete(key)
 	delete(p.bytesJobs, key)
 	if job := p.previewJobs[key]; job != nil {
 		job.cancel()
 		delete(p.previewJobs, key)
+	}
+	if job := p.identJobs[key]; job != nil {
+		job.cancel()
+		delete(p.identJobs, key)
 	}
 }
 
@@ -401,8 +520,13 @@ func (p *ImagePipeline) Clear() {
 		job.cancel()
 		delete(p.previewJobs, key)
 	}
+	for key, job := range p.identJobs {
+		job.cancel()
+		delete(p.identJobs, key)
+	}
 	p.surfaceCache.clear()
 	p.previews.clear()
+	p.idents.clear()
 	p.bytesCache.clear()
 }
 
