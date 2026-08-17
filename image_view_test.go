@@ -982,8 +982,9 @@ func TestImageViewOverlayLines(t *testing.T) {
 	}
 	iv.Rotate(90)
 	lines = iv.overlayLines()
-	// The turn label joins before the decode timing, which stays the last line.
-	if lines[1] != "200x320" || len(lines) != 6 || !strings.Contains(lines[4], "90") || lines[5] != "png" {
+	// The turn label and the file size/time sit above the decode timing,
+	// which stays the last line.
+	if lines[1] != "200x320" || len(lines) != 6 || !strings.Contains(lines[2], "90") || lines[5] != "png" || !strings.Contains(lines[3], "4.0") {
 		t.Errorf("turned picture panel: %v", lines)
 	}
 	// No size and no time yet: the lines stay out, and no placeholder text

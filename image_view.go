@@ -1345,14 +1345,6 @@ func (iv *ImageView) overlayLines() []string {
 	if img := iv.display(); img != nil && img.Valid() && img.Width > 0 && img.Height > 0 {
 		lines = append(lines, fmt.Sprintf("%dx%d", img.Width, img.Height))
 	}
-	// Size and time appear only once the stat lands; a placeholder would be
-	// an intermediate message between pictures.
-	if iv.sizeKnown {
-		lines = append(lines, formatSize(iv.fileSize))
-	}
-	if iv.timeKnown {
-		lines = append(lines, iv.fileTime.Format("2006-01-02 15:04"))
-	}
 	if label := imageOrientationLabel(iv.rotation, iv.flipH, iv.flipV); label != "" {
 		lines = append(lines, label)
 	}
@@ -1360,6 +1352,16 @@ func (iv *ImageView) overlayLines() []string {
 	// the panel does not change when the full picture arrives.
 	if orient := iv.exifOrientation(); orient > 1 {
 		lines = append(lines, fmt.Sprintf("EXIF orientation %d", orient))
+	}
+	// The file size, its time and the decode timing can land after the
+	// picture (the stat is a separate round trip, the timing only after the
+	// decode), so they sit at the bottom: the lines above them never shift
+	// when they arrive.
+	if iv.sizeKnown {
+		lines = append(lines, formatSize(iv.fileSize))
+	}
+	if iv.timeKnown {
+		lines = append(lines, iv.fileTime.Format("2006-01-02 15:04"))
 	}
 	// The decode/render timing is the last line: it can be updated after the
 	// picture shows, without holding the rest of the panel back.
