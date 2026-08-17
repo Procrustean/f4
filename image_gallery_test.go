@@ -302,12 +302,10 @@ func TestImageViewGalleryShowsIdentifiedDimensions(t *testing.T) {
 	}
 }
 
-// TestGalleryVideoTileNeverReadsBytesWhole locks in the video-tile guard:
-// a gallery tile for a video must go straight through the pipeline's guarded
-// load (shell renders the frame from the path) instead of handing the whole
-// container to a size decoder or converter, which is how the "too large"
-// refusal surfaced.
-func TestGalleryVideoTileNeverReadsBytesWhole(t *testing.T) {
+// TestGalleryVideoTileSkipped locks in the video-tile guard: a gallery tile
+// for a video is skipped outright (the shell frame fetch can block for a long
+// time), so the grid shows only the caption and never reads the container.
+func TestGalleryVideoTileSkipped(t *testing.T) {
 	// A size decoder that would eagerly claim mp4 if the guard slipped.
 	imagedec.RegisterImageDecoder(imagedec.ImageDecoder{
 		Name:       "test-video-size",
@@ -333,8 +331,8 @@ func TestGalleryVideoTileNeverReadsBytesWhole(t *testing.T) {
 	defer func() { ImagePipe = oldPipe }()
 
 	res := loadGalleryTile(context.Background(), v, "clip.mp4", 32, 32)
-	if res.Err != nil {
-		t.Fatalf("the video tile failed: %v", res.Err)
+	if res.Err == nil {
+		t.Fatal("a video tile must be skipped, not decoded")
 	}
 	if v.opens != 0 || v.readAts != 0 {
 		t.Errorf("a video tile must never be read whole: %d opens, %d read-ats", v.opens, v.readAts)

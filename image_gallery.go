@@ -230,6 +230,23 @@ func galleryRing(g *imageGallery, idx int) int {
 	return dy
 }
 
+// galleryCanDecode reports whether a tile is worth decoding in the grid.
+// Videos and shell-only formats (SVG, EMF/WMF) are skipped: the Windows
+// shell thumbnailer can block for a long time on them, and a folder of mixed
+// files saturates the pipeline workers until the grid stops answering. Such
+// tiles show only their caption.
+func galleryCanDecode(path string) bool {
+	if imagedec.IsVideoFile(path) {
+		return false
+	}
+	for _, d := range imagedec.ImageDecodersFor(path) {
+		if d.Name != "shell" {
+			return true
+		}
+	}
+	return false
+}
+
 // requestThumb decodes one thumbnail off the drawing path.
 func (iv *ImageView) requestThumb(path string) {
 	g := iv.gal
@@ -237,6 +254,9 @@ func (iv *ImageView) requestThumb(path string) {
 		return
 	}
 	g.asked[path] = true
+	if !galleryCanDecode(path) {
+		return
+	}
 
 	v := iv.vfs
 	task := vtui.RunAsync(func(ctx *vtui.TaskContext) {
@@ -441,9 +461,13 @@ func loadGalleryTile(ctx context.Context, v vfs.VFS, path string, w, h int) Imag
 	}
 	decoders := imagedec.ImageDecodersFor(path)
 	// A video renders only from a real path; never hand its bytes to a size
-	// decoder or converter, which would read the whole container. The
-	// pipeline's guarded load serves the frame and skips quietly.
-	if len(decoders) == 0 || imagedec.IsVideoFile(path) {
+	// decoder or converter, which would read the whole container. The shell
+	// frame fetch can also block for a long time, so a tile is never worth
+	// it: the grid shows the caption and moves on.
+	if imagedec.IsVideoFile(path) {
+		return ImageResult{Path: path, Err: imagedec.ErrVideoPreviewUnavailable}
+	}
+	if len(decoders) == 0 {
 		return ImagePipe.LoadTileSync(ctx, v, path)
 	}
 	if d := decoders[0]; d.DecodeSize != nil {
