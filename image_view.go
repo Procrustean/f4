@@ -15,7 +15,6 @@ import (
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
-	"golang.org/x/term"
 )
 
 const (
@@ -37,6 +36,14 @@ const (
 
 	// How many pictures on each side are decoded before they are asked for.
 	imageViewPrefetchRadius = 2
+
+	// imageIdentWindow: the identification pass (cheap header reads) covers
+	// this many pictures on each side, far more than the decode prefetch.
+	imageIdentWindow = 64
+
+	// imageIdentMax caps the gallery's whole-list identification, so a huge
+	// directory never floods the background with header reads.
+	imageIdentMax = 512
 
 	imageViewToastDelay = 2 * time.Second // toast stays a moment
 
@@ -74,6 +81,11 @@ var imageOverlayAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x000000)
 
 // toast: white on a dark slab; the light glyphs keep it readable on the image.
 var imageToastAttr = vtui.SetRGBBoth(0, 0xFFFFFF, 0x333333)
+
+// bare text over the picture: no slab, so the sixel image shows around the
+// glyphs. The text is re-asserted after the image (SetTextAbove), which the
+// terminal paints on top, so no background is needed to keep it readable.
+var imageBareTextAttr = vtui.SetRGBFore(0, 0xFFFFFF)
 
 // A blocked step flashes the toast and the OSD in inverted "wall" colours:
 // dark glyphs on a lit slab. 0xC0C0C0 is the XTerm-256 light grey.
@@ -134,7 +146,12 @@ type ImageView struct {
 	// Last console size, so full-screen toggles can relayout without a resize.
 	conW, conH int
 
-	overlay   bool
+	overlay bool
+
+	// textOnImage: the overlay and the toast sit on the sixel picture this
+	// frame, so they are drawn without a slab and re-asserted after the image.
+	textOnImage bool
+
 	fileSize  int64
 	sizeKnown bool
 	fileTime  time.Time
@@ -244,7 +261,8 @@ func (iv *ImageView) SetSiblings(paths []string, index int) {
 }
 
 // prefetch decodes the neighbours in advance: the nearest whole, the ring
-// beyond only their embedded thumbnail (a header read, not a full decode).
+// beyond only their embedded thumbnail (a header read, not a full decode),
+// and a wide window identified by their headers alone.
 func (iv *ImageView) prefetch() {
 	if iv.index < 0 || iv.index >= len(iv.siblings) {
 		return
@@ -254,6 +272,29 @@ func (iv *ImageView) prefetch() {
 	if ring := ImageNeighbourhood(iv.siblings, iv.index, imageViewPrefetchRadius); len(ring) > len(near) {
 		ImagePipe.PreviewPrefetch(iv.vfs, ring[len(near):])
 	}
+	iv.identifySiblings()
+}
+
+// identifySiblings runs the cheap header pass over a wide window; the
+// current picture heads the list, so its size is known before the decode.
+func (iv *ImageView) identifySiblings() {
+	if iv.index < 0 || len(iv.siblings) == 0 {
+		return
+	}
+	ImagePipe.IdentifyPrefetch(iv.vfs, append([]string{iv.siblings[iv.index]}, ImageNeighbourhood(iv.siblings, iv.index, imageIdentWindow)...))
+}
+
+// identifyAll runs the header pass over the whole list (nearest first, up to
+// a cap), for the grid where every tile can show its dimensions.
+func (iv *ImageView) identifyAll() {
+	paths := iv.siblings
+	if len(paths) > imageIdentMax {
+		paths = ImageNeighbourhood(iv.siblings, iv.index, imageIdentMax/2)
+		if iv.index >= 0 {
+			paths = append([]string{iv.siblings[iv.index]}, paths...)
+		}
+	}
+	ImagePipe.IdentifyPrefetch(iv.vfs, paths)
 }
 
 // Step walks the siblings, stopping at the ends; the toast announces an edge,
@@ -529,20 +570,6 @@ func (iv *ImageView) accept(gen uint64, res ImageResult) {
 	}
 }
 
-// baseScale is what a zoom of one means: the picture fitted into the window,
-// or its own pixels when the actual size is asked for.
-func (iv *ImageView) baseScale(boxW, boxH int) float64 {
-	img := iv.display()
-	if !img.Valid() || img.Width <= 0 || iv.actual {
-		return 1
-	}
-	fitW, _ := vtui.FitInside(img.Width, img.Height, boxW, boxH)
-	if fitW <= 0 {
-		return 1
-	}
-	return float64(fitW) / float64(img.Width)
-}
-
 // ToggleActualSize switches between window-fit and literal pixels; the toast
 // says the new scale.
 func (iv *ImageView) ToggleActualSize() {
@@ -794,8 +821,9 @@ func cellSize(scr *vtui.ScreenBuf) (int, int) {
 	return cw, ch
 }
 
-// blockCellSize is the cell the half-block text renders at: the terminal's
-// raw cell, because sixel's virtual 10x20 cell applies only to sixel rasters.
+// blockCellSize is the cell the half-block text renders at: the
+// terminal's raw cell, because sixel's virtual 10x20 cell applies only
+// to sixel rasters.
 func blockCellSize(scr *vtui.ScreenBuf) (int, int) {
 	cw, ch := scr.Graphics().CellSize()
 	if cw <= 0 || ch <= 0 {
@@ -815,7 +843,7 @@ func (iv *ImageView) placementFor(scr *vtui.ScreenBuf) (vtui.ImagePlacement, boo
 }
 
 // placementForSize is placementFor with an explicit cell size, so the block
-// renderer (its cells) and the graphics backend share one path.
+// renderer (1x2 pixels per cell) and the graphics backend share one path.
 func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.ImagePlacement, bool) {
 	img := iv.display()
 	if scr == nil || !img.Valid() {
@@ -830,16 +858,40 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 		return vtui.ImagePlacement{}, false
 	}
 
-	boxW := cols * cw
-	boxH := rows * ch
-	scale := iv.baseScale(boxW, boxH) * iv.zoom
-	if scale <= 0 {
+	// The view is anchored to the canonical half-block grid — a cell is one
+	// unit wide and two tall — so the graphics and the cell renderers fit,
+	// crop and pan identically at the same zoom. The terminal's real cell
+	// only decides how many pixels a cell covers, never what the view is.
+	// The literal 1:1 size is one image pixel per cell pixel, which works
+	// out to one image pixel per cw real pixels; the cell renderers see the
+	// same view with a cell of one pixel.
+	s := iv.zoom / float64(cw) // image pixels per canonical cell unit
+	if !iv.actual {
+		fw, _ := vtui.FitInside(img.Width, img.Height, cols, rows*2)
+		if fw <= 0 {
+			return vtui.ImagePlacement{}, false
+		}
+		s = float64(fw) / float64(img.Width) * iv.zoom
+	}
+	if s <= 0 {
 		return vtui.ImagePlacement{}, false
 	}
-	iv.lastScale = scale
 
-	dispW := max(1, int(float64(img.Width)*scale+0.5))
-	dispH := max(1, int(float64(img.Height)*scale+0.5))
+	// The reported scale is the graphics view of the same picture (image
+	// pixels per real cell pixel), so the toast and the OSD read the same
+	// in every mode; the literal size is a scale of one whatever the grid.
+	if realCw, _ := cellSize(scr); realCw > 0 && !iv.actual {
+		iv.lastScale = s * float64(realCw)
+	} else {
+		iv.lastScale = s * float64(cw)
+	}
+
+	dispCols := float64(img.Width) * s
+	dispRows := float64(img.Height) * s // half-cell units, two per cell row
+	// Round before deciding, as the pre-canonical code did with its pixel
+	// sizes: an image within half a cell of the box still counts as fitting.
+	fitCols := int(dispCols + 0.5)
+	fitRows := int(dispRows + 0.5)
 
 	p := vtui.ImagePlacement{Surface: img}
 	if iv.overlay {
@@ -848,21 +900,21 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 		p.ZIndex = -1
 	}
 
-	if dispW <= boxW && dispH <= boxH {
+	if fitCols <= cols && fitRows <= rows*2 {
 		iv.panX, iv.panY = 0, 0
 		iv.panMaxX, iv.panMaxY = 0, 0
 		iv.visW, iv.visH = img.Width, img.Height
 		iv.anchorPending = false
 		iv.carryPending = false
 		iv.carrySurface = nil
-		p.Cols, p.Rows = cellsFor(dispW, cw, cols), cellsFor(dispH, ch, rows)
+		p.Cols, p.Rows = cellsFor(fitCols, 1, cols), cellsFor(fitRows, 2, rows)
 		p.Col = x1 + (cols-p.Cols)/2
 		p.Row = top + (rows-p.Rows)/2
 		return p, true
 	}
 
-	visW := max(1, min(img.Width, int(float64(boxW)/scale)))
-	visH := max(1, min(img.Height, int(float64(boxH)/scale)))
+	visW := max(1, min(img.Width, int(float64(cols)/s)))
+	visH := max(1, min(img.Height, int(float64(rows*2)/s)))
 	iv.panMaxX = max(0, float64(img.Width-visW))
 	iv.panMaxY = max(0, float64(img.Height-visH))
 	iv.visW, iv.visH = visW, visH
@@ -880,16 +932,16 @@ func (iv *ImageView) placementForSize(scr *vtui.ScreenBuf, cw, ch int) (vtui.Ima
 	}
 	iv.clampPan(visW, visH)
 
-	shownW := int(float64(visW)*scale + 0.5)
-	shownH := int(float64(visH)*scale + 0.5)
-	if shownW > boxW {
-		shownW = boxW
+	shownW := int(float64(visW)*s + 0.5)
+	shownH := int(float64(visH)*s + 0.5)
+	if shownW > cols {
+		shownW = cols
 	}
-	if shownH > boxH {
-		shownH = boxH
+	if shownH > rows*2 {
+		shownH = rows * 2
 	}
 
-	p.Cols, p.Rows = cellsFor(shownW, cw, cols), cellsFor(shownH, ch, rows)
+	p.Cols, p.Rows = cellsFor(shownW, 1, cols), cellsFor(shownH, 2, rows)
 	p.Col = x1 + (cols-p.Cols)/2
 	p.Row = top + (rows-p.Rows)/2
 	p.SrcX, p.SrcY = int(iv.panX), int(iv.panY)
@@ -955,18 +1007,20 @@ func cellsFor(pixels, cellSize, limit int) int {
 	return n
 }
 
-// fitPlacement fits and centres a surface in a cw x ch cell box; both the
-// block renderer and the graphics backend pass their own cell metrics.
-func fitPlacement(surface *vtui.ImageSurface, cw, ch, col, row, boxCols, boxRows int) (vtui.ImagePlacement, bool) {
+// fitPlacement fits and centres a surface in a box of cells. The fit uses
+// the canonical half-block grid (a cell is one unit wide and two tall), so
+// the graphics and the cell renderers agree on what fits and place the
+// picture in the same cells whatever the terminal's real cell aspect is.
+func fitPlacement(surface *vtui.ImageSurface, col, row, boxCols, boxRows int) (vtui.ImagePlacement, bool) {
 	if !surface.Valid() || boxCols <= 0 || boxRows <= 0 {
 		return vtui.ImagePlacement{}, false
 	}
-	fw, fh := vtui.FitInside(surface.Width, surface.Height, boxCols*cw, boxRows*ch)
+	fw, fh := vtui.FitInside(surface.Width, surface.Height, boxCols, boxRows*2)
 	if fw <= 0 || fh <= 0 {
 		return vtui.ImagePlacement{}, false
 	}
 	p := vtui.ImagePlacement{Surface: surface}
-	p.Cols, p.Rows = cellsFor(fw, cw, boxCols), cellsFor(fh, ch, boxRows)
+	p.Cols, p.Rows = cellsFor(fw, 1, boxCols), cellsFor(fh, 2, boxRows)
 	p.Col = col + (boxCols-p.Cols)/2
 	p.Row = row + (boxRows-p.Rows)/2
 	return p, true
@@ -997,9 +1051,15 @@ func (iv *ImageView) ToggleOverlay() {
 	}
 }
 
+// imageGraphicsProtocols is the terminal's protocol list, probed once at
+// startup, before the input reader starts, and reused by the Shift+F4
+// renderer cycle: cycling must not query the terminal mid-session.
+var imageGraphicsProtocols []vtui.GraphicsProtocol
+
 // applyImageGraphicsStartup resolves the image protocol for the session and
 // installs it on the screen: the terminal is probed (environment first, then
-// a DA1 query) and the best available protocol is used.
+// a DA1 query) and the best available protocol is used. The whole list is
+// remembered for the Shift+F4 renderer cycle.
 func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
 	if scr == nil {
 		return
@@ -1007,10 +1067,10 @@ func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
 	// The sixel palette mode is read when the encoder is first built, so it
 	// has to be in place before any image is drawn.
 	vtui.SetSixelPaletteMode(AppConfig.ImageSixelPalette)
-	prots := vtui.ProbeGraphicsProtocols()
+	imageGraphicsProtocols = vtui.ProbeGraphicsProtocols()
 	best := vtui.GraphicsNone
-	if len(prots) > 0 {
-		best = prots[0]
+	if len(imageGraphicsProtocols) > 0 {
+		best = imageGraphicsProtocols[0]
 	}
 	scr.Graphics().SetProtocol(best)
 	applyImageCellSize(scr)
@@ -1018,11 +1078,9 @@ func applyImageGraphicsStartup(scr *vtui.ScreenBuf) {
 
 // applyImageCellSize records the terminal's real cell size on the graphics
 // layer, so placement matches the terminal's pixel grid instead of the 8x16
-// fallback (which left the picture a few rows short at the bottom). The
-// half-block renderer needs the real cell on a graphics-less terminal too;
-// only a session with no terminal to ask skips the query.
+// fallback (which left the picture a few rows short at the bottom).
 func applyImageCellSize(scr *vtui.ScreenBuf) {
-	if scr.Graphics().Protocol() == vtui.GraphicsNone && !term.IsTerminal(int(os.Stdin.Fd())) {
+	if scr.Graphics().Protocol() == vtui.GraphicsNone {
 		return
 	}
 	if cw, ch, ok := vtui.QueryCellSize(); ok {
@@ -1030,27 +1088,146 @@ func applyImageCellSize(scr *vtui.ScreenBuf) {
 	}
 }
 
-// CycleRenderer toggles the picture renderer between the graphics protocol
-// and the half-block cells. A backend without a graphics protocol leaves the
-// cycle one stop long, so the half-block cells stay put and the setting is
-// not touched.
-func (iv *ImageView) CycleRenderer() {
-	scr := vtui.FrameManager.Screen()
-	if scr == nil || !scr.SupportsGraphics() {
-		iv.toast("renderer: half-block")
-		return
+// rendererStop is one station of the Shift+F4 renderer cycle: a graphics
+// protocol, or the half-block / plain cell renderers. A zero protocol means
+// the cell renderer named by blockMode (2 = half-block glyphs, 3 = plain
+// spaces) and leaves the active protocol alone. Sixel stops carry the palette
+// mode they select (adaptive or fixed); other stops leave it empty.
+type rendererStop struct {
+	label     string
+	protocol  vtui.GraphicsProtocol
+	blockMode int
+	palette   string
+}
+
+// weztermEnv reports whether the session runs inside WezTerm, matching the
+// terminal's own probe (TERM_PROGRAM or WEZTERM_PANE). WezTerm renders the
+// half-block glyph with a visible seam between cell rows, and keeps a stale
+// image on screen when a sixel placement is dropped, so its Shift+F4 cycle
+// stops at the native protocols and the cell renderers stay off wherever the
+// graphics ones work.
+func weztermEnv() bool {
+	return strings.EqualFold(os.Getenv("TERM_PROGRAM"), "wezterm") || os.Getenv("WEZTERM_PANE") != ""
+}
+
+// rendererCycle lists the renderer stops for the current screen, best
+// first: every graphics protocol the backend or terminal can display, then
+// the half-block cells, then the plain cells. Sixel contributes two stops
+// (adaptive and fixed palette), so the palette switches in place. A backend
+// with no graphics protocol leaves only the two cell stops; inside WezTerm
+// with working graphics the two cell stops are skipped, because its
+// half-block seams and stale sixel image make them useless.
+func rendererCycle(scr *vtui.ScreenBuf) []rendererStop {
+	stops := []rendererStop{}
+	if scr != nil && scr.SupportsGraphics() {
+		cur := scr.Graphics().Protocol()
+		if cur == vtui.GraphicsNative {
+			// A GUI backend blits pixels itself: native is its only protocol.
+			stops = append(stops, rendererStop{label: "native", protocol: vtui.GraphicsNative, blockMode: 1})
+		} else {
+			prots := imageGraphicsProtocols
+			if len(prots) == 0 {
+				// No probe recorded (tests, or a backend that set its own
+				// protocol): at least the active one is on the cycle.
+				prots = []vtui.GraphicsProtocol{cur}
+			}
+			for _, p := range prots {
+				if p == vtui.GraphicsSixel {
+					// The palette is part of the sixel stop, so adaptive and
+					// fixed are two stations Shift+F4 switches in place.
+					stops = append(stops,
+						rendererStop{label: "sixel adaptive", protocol: p, blockMode: 1, palette: "adaptive"},
+						rendererStop{label: "sixel fixed", protocol: p, blockMode: 1, palette: "fixed"},
+					)
+					continue
+				}
+				stops = append(stops, rendererStop{label: p.String(), protocol: p, blockMode: 1})
+			}
+		}
 	}
-	mode := 1
-	label := "graphics"
-	if !imageBlockMode(scr) {
-		mode = 2
-		label = "half-block"
+	if len(stops) == 0 || !weztermEnv() {
+		stops = append(stops,
+			rendererStop{label: "half-block", blockMode: 2},
+			rendererStop{label: "plain", blockMode: 3},
+		)
 	}
-	if AppConfig.ImageBlockRenderer != mode {
-		AppConfig.ImageBlockRenderer = mode
+	return stops
+}
+
+// currentRendererIndex finds the cycle station the picture is on now: the
+// active graphics protocol, or the half-block / plain cells.
+func currentRendererIndex(scr *vtui.ScreenBuf, stops []rendererStop) int {
+	if scr != nil && scr.SupportsGraphics() && AppConfig.ImageBlockRenderer < 2 {
+		cur := scr.Graphics().Protocol()
+		for i := range stops {
+			if stops[i].protocol == cur &&
+				(stops[i].protocol != vtui.GraphicsSixel || stops[i].palette == AppConfig.ImageSixelPalette) {
+				return i
+			}
+		}
+		// The palette is not offered (e.g. an older config): sit on the
+		// protocol regardless of its palette.
+		for i := range stops {
+			if stops[i].protocol == cur {
+				return i
+			}
+		}
+		// The active protocol is not offered (the terminal was probed
+		// differently than when the session started): sit on the last
+		// protocol stop so the next press moves to the cells.
+		for i := len(stops) - 1; i >= 0; i-- {
+			if stops[i].protocol != vtui.GraphicsNone {
+				return i
+			}
+		}
+		return -1
+	}
+	for i := range stops {
+		if stops[i].blockMode == AppConfig.ImageBlockRenderer {
+			return i
+		}
+		// Modes 0 and 1 on a no-graphics terminal already draw half-block
+		// cells (or nothing), so both belong to the half-block stop.
+		if stops[i].blockMode == 2 && AppConfig.ImageBlockRenderer <= 2 {
+			return i
+		}
+	}
+	return len(stops) - 1
+}
+
+// applyRendererStop switches the picture to the given station: the graphics
+// protocol when the stop has one, the sixel palette when the stop names one,
+// and the persisted block mode.
+func applyRendererStop(scr *vtui.ScreenBuf, s rendererStop) {
+	if scr != nil && s.protocol != vtui.GraphicsNone {
+		scr.Graphics().SetProtocol(s.protocol)
+	}
+	if s.palette != "" && AppConfig.ImageSixelPalette != s.palette {
+		AppConfig.ImageSixelPalette = s.palette
+		vtui.SetSixelPaletteMode(s.palette)
+		if scr != nil {
+			scr.Graphics().Invalidate()
+		}
 		RequestSaveConfig()
 	}
-	iv.toast("renderer: " + label)
+	if AppConfig.ImageBlockRenderer != s.blockMode {
+		AppConfig.ImageBlockRenderer = s.blockMode
+		RequestSaveConfig()
+	}
+}
+
+// CycleRenderer round-robins the picture renderer across everything the
+// backend and terminal can display: the graphics protocols the terminal was
+// probed for (kitty, sixel adaptive/fixed, iTerm2, ...), then the half-block
+// cells, then the plain cells. A backend without a graphics protocol leaves
+// only the two cell stops, and the choice is saved.
+func (iv *ImageView) CycleRenderer() {
+	scr := vtui.FrameManager.Screen()
+	stops := rendererCycle(scr)
+	cur := currentRendererIndex(scr, stops)
+	next := stops[(cur+1)%len(stops)]
+	applyRendererStop(scr, next)
+	iv.toast("renderer: " + next.label)
 }
 
 // requestFileSize asks the file system how big the file is. Stat can be a
@@ -1099,14 +1276,25 @@ func (iv *ImageView) baseName() string {
 	return filepath.Base(iv.path)
 }
 
-// displaySize is the picture dimensions, "1442x2160". An empty view with no
-// decoded surface yet reports "?" so the title path never dereferences nil.
+// displaySize is the picture dimensions, "1442x2160", with the reader's own
+// turn applied. The header pass supplies the real size before the full
+// decode, so the title and the OSD never jump when the preview is replaced.
 func (iv *ImageView) displaySize() string {
-	img := iv.display()
-	if img == nil {
-		return "?"
+	if hd, ok := ImagePipe.Identified(iv.vfs, iv.path); ok && hd.Width > 0 && hd.Height > 0 {
+		w, h := hd.Width, hd.Height
+		if hd.Orientation >= 5 && hd.Orientation <= 8 {
+			w, h = h, w
+		}
+		if iv.rotation%180 != 0 {
+			w, h = h, w
+		}
+		return fmt.Sprintf("%dx%d", w, h)
 	}
-	return fmt.Sprintf("%dx%d", img.Width, img.Height)
+	img := iv.display()
+	if img != nil && img.Valid() && img.Width > 0 && img.Height > 0 {
+		return fmt.Sprintf("%dx%d", img.Width, img.Height)
+	}
+	return "?"
 }
 
 // scalePercent is how much of the picture fits the window, rounded.
@@ -1149,7 +1337,20 @@ func (iv *ImageView) overlayLines() []string {
 	if label := imageOrientationLabel(iv.rotation, iv.flipH, iv.flipV); label != "" {
 		lines = append(lines, label)
 	}
+	// The camera's own turn, from the header pass; it survives the decode, so
+	// the panel does not change when the full picture arrives.
+	if orient := iv.exifOrientation(); orient > 1 {
+		lines = append(lines, fmt.Sprintf("EXIF orientation %d", orient))
+	}
 	return lines
+}
+
+// exifOrientation is the camera's orientation tag from the header pass.
+func (iv *ImageView) exifOrientation() int {
+	if hd, ok := ImagePipe.IdentifiedHead(iv.vfs, iv.path); ok {
+		return hd.Orientation
+	}
+	return 0
 }
 
 func formatImageDuration(d time.Duration) string {
@@ -1251,13 +1452,59 @@ func paintPadded(scr *vtui.ScreenBuf, x, y, limit int, text string, attr uint64)
 	scr.Write(x, y, vtui.StringToCharInfo(text, attr))
 }
 
-func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
+// toastText is the message the bottom-left strip shows right now: the
+// transient toast, or the loading report when a decode is at work. One source
+// feeds both the drawing and the guard rectangle used for the re-assertion.
+func (iv *ImageView) toastText() string {
+	if iv.tempMsg != "" {
+		return " " + iv.tempMsg + " "
+	}
+	if iv.loadingToastOn() {
+		dur := time.Since(iv.decodeStart)
+		text := " decoding " + formatImageDuration(dur) + " "
+		if iv.decodePct != nil {
+			if pct := int(iv.decodePct.Load()); pct > 0 {
+				text = fmt.Sprintf(" decoding %d%% ", pct)
+			}
+		}
+		return text
+	}
+	return ""
+}
+
+// toastGuardRect is the bottom-row span the toast occupies at rest, from the
+// left edge; it is also the extent the re-asserted text cells must stay
+// within while the exit slide moves the toast left.
+func (iv *ImageView) toastGuardRect() (vtui.Rect, bool) {
+	text := iv.toastText()
+	if text == "" {
+		return vtui.Rect{}, false
+	}
 	x1, _, x2, y2 := iv.GetPosition()
 	limit := x2 - x1 - 1
 	if limit < 1 {
 		limit = 1
 	}
-	text := " " + iv.tempMsg + " "
+	width := runewidth.StringWidth(text)
+	if width > limit {
+		width = limit
+	}
+	if width <= 0 {
+		return vtui.Rect{}, false
+	}
+	return vtui.Rect{X1: x1, Y1: y2, X2: x1 + width - 1, Y2: y2}, true
+}
+
+func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
+	text := iv.toastText()
+	if text == "" {
+		return
+	}
+	x1, _, x2, y2 := iv.GetPosition()
+	limit := x2 - x1 - 1
+	if limit < 1 {
+		limit = 1
+	}
 	width := runewidth.StringWidth(text)
 	if width > limit {
 		text = runewidth.Truncate(text, limit, "…")
@@ -1266,6 +1513,8 @@ func (iv *ImageView) drawToastText(scr *vtui.ScreenBuf) {
 	attr := imageToastAttr
 	if iv.flashing() {
 		attr = imageWallFlashAttr
+	} else if iv.textOnImage {
+		attr = imageBareTextAttr
 	}
 	scr.Write(x1+iv.tempSlideOffset(width), y2, vtui.StringToCharInfo(text, attr))
 }
@@ -1353,11 +1602,16 @@ func buildLoadingRow(row []vtui.CharInfo, text string, phase float64) []vtui.Cha
 	return row
 }
 
-// drawOverlay writes the info panel over the left edge of the picture.
-func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
+// overlayPane is the cell rectangle the info pane occupies when it is up: the
+// slab under the lines plus the padded text. Drawing and the glyph re-assert
+// rects share it, so the info and the picture agree on the same extent.
+func (iv *ImageView) overlayPane() (vtui.Rect, bool) {
+	if !iv.overlay {
+		return vtui.Rect{}, false
+	}
 	lines := iv.overlayLines()
-	if scr == nil || len(lines) == 0 {
-		return
+	if len(lines) == 0 {
+		return vtui.Rect{}, false
 	}
 	x1, y1, x2, y2 := iv.GetPosition()
 	top := y1
@@ -1377,23 +1631,49 @@ func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
 		rows = y2 - top
 	}
 	if width <= 0 || rows <= 0 {
+		return vtui.Rect{}, false
+	}
+	return vtui.Rect{X1: x1, Y1: top + 1, X2: x1 + width - 1, Y2: top + rows}, true
+}
+
+// drawOverlay writes the info panel over the left edge of the picture.
+func (iv *ImageView) drawOverlay(scr *vtui.ScreenBuf) {
+	pane, ok := iv.overlayPane()
+	if scr == nil || !ok {
 		return
 	}
-
-	// One slab under all the lines reads as a pane; it inverts with the toast
-	// while the wall flash lasts.
 	attr := imageOverlayAttr
 	if iv.flashing() {
 		attr = imageWallFlashAttr
+	} else if iv.textOnImage {
+		attr = imageBareTextAttr
 	}
-	scr.FillRect(x1, top+1, x1+width-1, top+rows, ' ', attr)
-	for i := 0; i < rows; i++ {
-		paintPadded(scr, x1, top+1+i, width, " "+lines[i], attr)
+	if iv.textOnImage && !iv.flashing() {
+		// Bare glyphs on the picture: no slab, so the image shows around the
+		// info. The glyph cells are re-asserted after the image, which the
+		// terminal paints on top in every renderer; the wall flash keeps its
+		// lit slab for the brief signal.
+		lines := iv.overlayLines()
+		for i := 0; i < pane.Y2-pane.Y1+1; i++ {
+			paintPadded(scr, pane.X1, pane.Y1+i, pane.X2-pane.X1+1, " "+lines[i], attr)
+		}
+		return
+	}
+	// One slab under all the lines reads as a pane; it inverts with the toast
+	// while the wall flash lasts.
+	scr.FillRect(pane.X1, pane.Y1, pane.X2, pane.Y2, ' ', attr)
+	lines := iv.overlayLines()
+	for i := 0; i < pane.Y2-pane.Y1+1; i++ {
+		paintPadded(scr, pane.X1, pane.Y1+i, pane.X2-pane.X1+1, " "+lines[i], attr)
 	}
 }
 
 func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	iv.ScreenObject.Show(scr)
+
+	// Advance the toast before anything is laid out, so the picture guards
+	// and the toast drawing agree on the same message state this frame.
+	iv.toastUpdate()
 
 	x1, y1, x2, y2 := iv.GetPosition()
 	top := y1
@@ -1422,13 +1702,12 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 		if !ok {
 			return
 		}
-		scr.Graphics().DrawImage(iv.gfxKey, p)
+		iv.drawImage(scr, p)
 		iv.logGeometry(scr, p)
 	}
 	if iv.overlay {
 		iv.drawOverlay(scr)
 	}
-	iv.toastUpdate()
 	if iv.tempMsg != "" {
 		iv.drawToastText(scr)
 	}
@@ -1440,6 +1719,85 @@ func (iv *ImageView) Show(scr *vtui.ScreenBuf) {
 	} else {
 		iv.stopAnimIfIdle()
 	}
+}
+
+// placementOverlaps reports whether the placement covers any cell of r.
+func placementOverlaps(p vtui.ImagePlacement, r vtui.Rect) bool {
+	return p.Col <= r.X2 && p.Col+p.Cols-1 >= r.X1 &&
+		p.Row <= r.Y2 && p.Row+p.Rows-1 >= r.Y1
+}
+
+// drawImage paints the picture. The kitty protocol and the GUI backends
+// layer the image below the glyphs (negative z-index, or their own
+// compositing), so a single placement is enough. Sixel paints pixels over
+// whatever text was drawn first, so when the overlay pane or the toast sits
+// on the picture it is re-asserted as text after the DCS (SetTextAbove): the
+// terminal replaces the image cells under the glyphs and paints them on top,
+// which holds in every renderer regardless of how the raster maps to cells.
+// The picture is not carved, so it stays visible around the info.
+func (iv *ImageView) drawImage(scr *vtui.ScreenBuf, p vtui.ImagePlacement) {
+	if scr.Graphics().Protocol() != vtui.GraphicsSixel {
+		iv.textOnImage = false
+		scr.Graphics().DrawImage(iv.gfxKey, p)
+		return
+	}
+	scr.Graphics().DrawImage(iv.gfxKey, p)
+	iv.textOnImage = false
+	var slabs []vtui.Rect
+	if pane, ok := iv.overlayPane(); ok && placementOverlaps(p, pane) {
+		iv.textOnImage = true
+		slabs = append(slabs, iv.overlayTextRects(pane)...)
+	}
+	if strip, ok := iv.toastGuardRect(); ok && placementOverlaps(p, strip) {
+		iv.textOnImage = true
+		if rc, ok := iv.toastTextRect(strip); ok {
+			slabs = append(slabs, rc)
+		}
+	}
+	scr.Graphics().SetTextAbove(slabs)
+}
+
+// overlayTextRects is the cell rectangle of each overlay line's glyphs, so
+// the post-image text pass re-asserts exactly the letters and the picture
+// stays visible in the gaps and the padding around them.
+func (iv *ImageView) overlayTextRects(pane vtui.Rect) []vtui.Rect {
+	lines := iv.overlayLines()
+	rects := make([]vtui.Rect, 0, len(lines))
+	for i, s := range lines {
+		if i >= pane.Y2-pane.Y1+1 {
+			break
+		}
+		w := runewidth.StringWidth(" " + s)
+		if w > pane.X2-pane.X1+1 {
+			w = pane.X2 - pane.X1 + 1
+		}
+		if w <= 1 {
+			continue
+		}
+		rects = append(rects, vtui.Rect{X1: pane.X1 + 1, Y1: pane.Y1 + i, X2: pane.X1 + w - 1, Y2: pane.Y1 + i})
+	}
+	return rects
+}
+
+// toastTextRect is the cell span the toast occupies right now. The slide-out
+// moves the toast left of its rest span, so the re-assertion tracks the
+// actual position; the cells it leaves behind are repainted by the image
+// re-emission that the move itself triggers.
+func (iv *ImageView) toastTextRect(strip vtui.Rect) (vtui.Rect, bool) {
+	width := strip.X2 - strip.X1 + 1
+	off := iv.tempSlideOffset(width)
+	x1 := strip.X1 + off
+	x2 := x1 + width - 1
+	if x1 < strip.X1 {
+		x1 = strip.X1
+	}
+	if x2 > strip.X2 {
+		x2 = strip.X2
+	}
+	if x1 > x2 {
+		return vtui.Rect{}, false
+	}
+	return vtui.Rect{X1: x1, Y1: strip.Y1, X2: x2, Y2: strip.Y2}, true
 }
 
 // toastUpdate advances the toast's life once per frame; Show draws what's left.

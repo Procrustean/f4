@@ -604,8 +604,7 @@ func (q *QuickViewPanel) renderImage(innerW int, writeLine func(string), attr ui
 		if attr&vtui.IsBgRGB == 0 {
 			bg = blockImageBack
 		}
-		bw, bh := blockCellSize(scr)
-		if p, ok := fitPlacement(q.imageSurf, bw, bh, x1+1, top, cols, rows); ok {
+		if p, ok := fitPlacement(q.imageSurf, x1+1, top, cols, rows); ok {
 			q.block.draw(scr, p, bg)
 		}
 		return
@@ -615,9 +614,7 @@ func (q *QuickViewPanel) renderImage(innerW int, writeLine func(string), attr ui
 		return
 	}
 
-	cw, ch := cellSize(scr)
-
-	p, ok := fitPlacement(q.imageSurf, cw, ch, x1+1, top, cols, rows)
+	p, ok := fitPlacement(q.imageSurf, x1+1, top, cols, rows)
 	if !ok {
 		return
 	}

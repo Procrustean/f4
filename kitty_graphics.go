@@ -120,6 +120,8 @@ type kittyTransfer struct {
 // appendPayload decodes one base64 chunk. The protocol wants every chunk but
 // the last to be a multiple of four characters long; keeping the remainder in
 // tail costs nothing and makes a client that ignores that rule work anyway.
+// The chunk is decoded straight into the transfer's buffer, so a large upload
+// neither allocates per chunk nor re-copies the decoded bytes.
 func (x *kittyTransfer) appendPayload(s string, last bool) error {
 	s = x.tail + s
 	if last {
@@ -135,14 +137,19 @@ func (x *kittyTransfer) appendPayload(s string, last bool) error {
 	if s == "" {
 		return nil
 	}
-	chunk, err := base64.StdEncoding.DecodeString(s)
+	need := base64.StdEncoding.DecodedLen(len(s))
+	if len(x.data)+need > kittyMaxImageBytes {
+		return fmt.Errorf("the image is too large")
+	}
+	old := len(x.data)
+	// append(make(...)) grows the buffer in place; the decode writes into the
+	// new tail so the chunk bytes are never copied.
+	x.data = append(x.data, make([]byte, need)...)
+	n, err := base64.StdEncoding.Decode(x.data[old:old+need], []byte(s))
+	x.data = x.data[:old+n]
 	if err != nil {
 		return fmt.Errorf("the payload is not valid base64")
 	}
-	if len(x.data)+len(chunk) > kittyMaxImageBytes {
-		return fmt.Errorf("the image is too large")
-	}
-	x.data = append(x.data, chunk...)
 	return nil
 }
 
@@ -260,6 +267,15 @@ func (kg *KittyGraphics) beginTransfer(cmd kittyCommand) {
 	}
 
 	xfer := &kittyTransfer{cmd: cmd}
+	// Direct pixel formats declare their size up front, so the transfer
+	// buffer can be preallocated instead of grown geometrically.
+	if f := cmd.Int('f', 32); f == 24 || f == 32 {
+		if w, h := cmd.Int('s', 0), cmd.Int('v', 0); w > 0 && h > 0 {
+			if n := w * h * (f / 8); n > 0 && n <= kittyMaxImageBytes {
+				xfer.data = make([]byte, 0, n)
+			}
+		}
+	}
 	more := cmd.Int('m', 0) == 1
 	if err := xfer.appendPayload(cmd.Payload, !more); err != nil {
 		kg.reply(cmd, "EINVAL:"+err.Error())

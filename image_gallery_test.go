@@ -259,6 +259,49 @@ func TestGalleryThumbnailBudgetNotExceededOnScreen(t *testing.T) {
 	}
 }
 
+// TestImageViewGalleryShowsIdentifiedDimensions locks in the header-pass
+// consumer: a tile whose identification arrived before its thumbnail shows
+// the dimensions on the row above the caption.
+func TestImageViewGalleryShowsIdentifiedDimensions(t *testing.T) {
+	withStubPipeline(t, 8, 8)
+
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 40, 20)
+	iv.path = "a.png"
+	// c.png is beyond the decode prefetch (index 0 prefetches only b.png), so
+	// it stays identified-only: exactly the case the header pass serves.
+	// d.png is a rotated picture (orientation 6): the label shows the swapped
+	// size, like its decoded surface.
+	iv.SetSiblings([]string{"a.png", "b.png", "c.png", "d.png"}, 0)
+
+	ImagePipe.mu.Lock()
+	ImagePipe.idents.put(imageCacheKey{Path: "c.png"}, imagedec.ImageHead{Width: 1600, Height: 900})
+	ImagePipe.idents.put(imageCacheKey{Path: "d.png"}, imagedec.ImageHead{Width: 1600, Height: 900, Orientation: 6})
+	ImagePipe.mu.Unlock()
+
+	iv.ToggleGallery()
+	// Mark every tile as already asked, so no thumbnail decode races the
+	// draw: the dimensions row must come from the identification alone.
+	for _, p := range []string{"a.png", "b.png", "c.png", "d.png"} {
+		iv.gal.asked[p] = true
+	}
+	scr.Graphics().BeginFrame()
+	iv.Show(scr)
+	scr.Graphics().EndFrame()
+
+	// Slot 2 sits at column 36; its dimensions row is one above the caption.
+	row := ScreenRow(scr, imageTileRows-2, imageTileCols*2, imageTileCols*3-1)
+	if !strings.Contains(row, "1600x900") {
+		t.Errorf("the dimensions row is %q, without 1600x900", row)
+	}
+	// Slot 3 is the rotated picture: 1600x900 with orientation 6 shows as
+	// 900x1600.
+	row = ScreenRow(scr, imageTileRows-2, imageTileCols*3, imageTileCols*4-1)
+	if !strings.Contains(row, "900x1600") {
+		t.Errorf("the rotated dimensions row is %q, without 900x1600", row)
+	}
+}
+
 // TestGalleryVideoTileNeverReadsBytesWhole locks in the video-tile guard:
 // a gallery tile for a video must go straight through the pipeline's guarded
 // load (shell renders the frame from the path) instead of handing the whole

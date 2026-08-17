@@ -3,33 +3,35 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"math"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/unxed/f4/imagedec"
 	"github.com/unxed/f4/vfs"
 	"github.com/unxed/vtinput"
 	"github.com/unxed/vtui"
 )
 
-func newImageTestScreen(t *testing.T) *vtui.ScreenBuf {
+// newImageTestScreenMode builds a silent screen with the given protocol and
+// pins the workspace tab mode, so layout tests see a stable top row.
+func newImageTestScreenMode(t *testing.T, tab vtui.WorkspaceTabMode, proto vtui.GraphicsProtocol) *vtui.ScreenBuf {
 	t.Helper()
-	// The layout tests assume the viewer sits on the first row, so pin the
-	// workspace tab mode to "no tabs"; the tests that care about the tab row
-	// set their own mode.
 	wasMode := vtui.FrameManager.WorkspaceTabMode
-	vtui.FrameManager.WorkspaceTabMode = vtui.WorkspaceTabsNever
+	vtui.FrameManager.WorkspaceTabMode = tab
 	t.Cleanup(func() { vtui.FrameManager.WorkspaceTabMode = wasMode })
 
 	scr := vtui.NewScreenBuf()
 	scr.Writer = io.Discard
 	scr.AllocBuf(80, 25)
-	scr.Graphics().SetProtocol(vtui.GraphicsKitty)
+	scr.Graphics().SetProtocol(proto)
 	scr.Graphics().SetCellSize(8, 16)
 	return scr
+}
+
+func newImageTestScreen(t *testing.T) *vtui.ScreenBuf {
+	return newImageTestScreenMode(t, vtui.WorkspaceTabsNever, vtui.GraphicsKitty)
 }
 
 func newTestImageView(t *testing.T, w, h int) *ImageView {
@@ -50,128 +52,6 @@ func restoreBars(t *testing.T) {
 	t.Helper()
 	was := vtui.FrameManager.HideBars
 	t.Cleanup(func() { vtui.FrameManager.HideBars = was })
-}
-
-// TestImageViewPlacementAspectPreserved proves the kitty and sixel
-// placements keep the picture's aspect across cell geometries: the cell
-// rect covers the canonical fitted pixels within one cell per axis. This
-// is the "how correct is the aspect in wezterm" check — wezterm reports a
-// 9x17 cell, Windows Terminal's sixel rasterises at a fixed 10x20, and
-// 8x16 is the no-report fallback.
-func TestImageViewPlacementAspectPreserved(t *testing.T) {
-	// Make the effective sixel cell follow SetCellSize on every host (a
-	// Windows or WSL host would otherwise force the 10x20 conhost cell).
-	t.Setenv("WT_SESSION", "")
-	t.Setenv("TERM_PROGRAM", "wezterm")
-
-	prots := []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel}
-	cells := [][2]int{{9, 17}, {10, 20}, {8, 16}}
-	shapes := [][2]int{{1000, 1000}, {1600, 900}, {900, 1600}, {2000, 1000}, {1000, 2000}}
-	worst, worstDesc := 0.0, ""
-
-	for _, proto := range prots {
-		for _, cell := range cells {
-			for _, sh := range shapes {
-				scr := newImageTestScreen(t)
-				scr.Graphics().SetProtocol(proto)
-				scr.Graphics().SetCellSize(cell[0], cell[1])
-				iv := newTestImageView(t, sh[0], sh[1])
-
-				p, ok := iv.placementFor(scr)
-				if !ok {
-					t.Fatal("layout failed")
-				}
-				cw, ch := cellSize(scr)
-				if cw != cell[0] || ch != cell[1] {
-					t.Fatalf("%s: effective cell %dx%d, want %dx%d", proto, cw, ch, cell[0], cell[1])
-				}
-
-				// The rect covers the canonical fitted pixels within one
-				// cell per axis — the placement cannot distort more than
-				// one cell of rounding, in kitty and sixel alike.
-				dispW := int(float64(sh[0])*iv.lastScale + 0.5)
-				dispH := int(float64(sh[1])*iv.lastScale + 0.5)
-				if dw, dh := p.Cols*cw-dispW, p.Rows*ch-dispH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
-					t.Errorf("%s %dx%d %dx%d: rect %dx%d cells (%d x %d px) misses the fitted %dx%d px",
-						proto, cell[0], cell[1], sh[0], sh[1], p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, dispW, dispH)
-				}
-				if p.SrcW != 0 || p.SrcH != 0 {
-					t.Errorf("%s %dx%d %dx%d: a fitting image must not be cropped", proto, cell[0], cell[1], sh[0], sh[1])
-				}
-
-				rectAspect := float64(p.Cols*cw) / float64(p.Rows*ch)
-				srcAspect := float64(sh[0]) / float64(sh[1])
-				err := math.Abs(rectAspect/srcAspect - 1)
-				if err > worst {
-					worst, worstDesc = err, fmt.Sprintf("%s %dx%d cell, %dx%d image", proto, cell[0], cell[1], sh[0], sh[1])
-				}
-			}
-		}
-	}
-	t.Logf("worst fitted aspect deviation: %.2f%% (%s)", worst*100, worstDesc)
-}
-
-// TestImageViewZoomedCropAspectPreserved checks the zoomed path: the shown
-// crop must land in the cell rect at its canonical scale (within one cell
-// per axis), in both kitty and sixel on the wezterm 9x17 cell.
-func TestImageViewZoomedCropAspectPreserved(t *testing.T) {
-	t.Setenv("WT_SESSION", "")
-	t.Setenv("TERM_PROGRAM", "wezterm")
-	for _, proto := range []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel} {
-		scr := newImageTestScreen(t)
-		scr.Graphics().SetProtocol(proto)
-		scr.Graphics().SetCellSize(9, 17)
-		iv := newTestImageView(t, 1000, 1000)
-		iv.SetZoom(2)
-
-		p, ok := iv.placementFor(scr)
-		if !ok {
-			t.Fatal("layout failed")
-		}
-		if p.SrcW <= 0 || p.SrcH <= 0 || p.SrcW >= 1000 || p.SrcH >= 1000 {
-			t.Fatalf("%s: a 2x zoom must crop, got src %dx%d", proto, p.SrcW, p.SrcH)
-		}
-		cw, ch := cellSize(scr)
-		shownW := int(float64(p.SrcW)*iv.lastScale + 0.5)
-		shownH := int(float64(p.SrcH)*iv.lastScale + 0.5)
-		if dw, dh := p.Cols*cw-shownW, p.Rows*ch-shownH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
-			t.Errorf("%s: crop %dx%d at scale %.3f shown in %dx%d cells (%d x %d px), want %dx%d px",
-				proto, p.SrcW, p.SrcH, iv.lastScale, p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, shownW, shownH)
-		}
-		// The on-screen rect keeps the crop's aspect: the crop and the box
-		// share one scale, so a distortion here would stretch the picture.
-		rectAspect := float64(p.Cols*cw) / float64(p.Rows*ch)
-		cropAspect := float64(p.SrcW) / float64(p.SrcH)
-		if err := math.Abs(rectAspect/cropAspect - 1); err > 0.06 {
-			t.Errorf("%s: rect aspect %.3f vs crop aspect %.3f (%.1f%%)", proto, rectAspect, cropAspect, err*100)
-		}
-	}
-}
-
-// TestFitPlacementAspectPreserved locks in the gallery tile and quick-view
-// fit: fitPlacement with the real cell metric yields a rect that covers the
-// fitted pixels within one cell per axis, so a 9x17 cell cannot stretch a
-// thumbnail beyond one cell of rounding.
-func TestFitPlacementAspectPreserved(t *testing.T) {
-	cells := [][2]int{{9, 17}, {10, 20}, {8, 16}}
-	shapes := [][2]int{{1000, 1000}, {1600, 900}, {900, 1600}, {2000, 1000}, {1000, 2000}}
-	boxes := [][2]int{{16, 7}, {30, 12}}
-	for _, cell := range cells {
-		for _, sh := range shapes {
-			for _, box := range boxes {
-				surf := solidSurface(sh[0], sh[1], 0x804020)
-				p, ok := fitPlacement(surf, cell[0], cell[1], 0, 0, box[0], box[1])
-				if !ok {
-					t.Fatal("layout failed")
-				}
-				fw, fh := vtui.FitInside(sh[0], sh[1], box[0]*cell[0], box[1]*cell[1])
-				if dw, dh := p.Cols*cell[0]-fw, p.Rows*cell[1]-fh; dw < 0 || dw > cell[0]-1 || dh < 0 || dh > cell[1]-1 {
-					t.Errorf("%dx%d cell, %dx%d in %dx%d box: rect %dx%d (%d x %d px) misses the fitted %dx%d px",
-						cell[0], cell[1], sh[0], sh[1], box[0], box[1], p.Cols, p.Rows, p.Cols*cell[0], p.Rows*cell[1], fw, fh)
-				}
-			}
-		}
-	}
 }
 
 func TestImageViewFitsAndCentres(t *testing.T) {
@@ -1106,6 +986,40 @@ func TestImageViewOverlayLines(t *testing.T) {
 	}
 }
 
+// TestImageViewOverlayShowsIdentifiedBeforeDecode locks in the header-pass
+// consumer in the viewer: the overlay and the title report the real size and
+// the camera's orientation before any decode lands, so nothing jumps when
+// the preview is replaced by the full picture.
+func TestImageViewOverlayShowsIdentifiedBeforeDecode(t *testing.T) {
+	withStubPipeline(t, 8, 8)
+	iv := newTestImageView(t, 8, 8)
+	iv.path = "photo.jpg"
+
+	// The header pass identified the picture; no decode has happened yet.
+	ImagePipe.mu.Lock()
+	ImagePipe.idents.put(imageCacheKey{Path: "photo.jpg"}, imagedec.ImageHead{Width: 1600, Height: 900, Orientation: 6})
+	ImagePipe.mu.Unlock()
+
+	// Orientation 6 swaps the sides: the viewer shows 900x1600, exactly what
+	// the decoded surface will report later.
+	if got := iv.displaySize(); got != "900x1600" {
+		t.Errorf("displaySize before decode is %q, want 900x1600", got)
+	}
+	if got := iv.GetTitle(); !strings.Contains(got, "900x1600") {
+		t.Errorf("title before decode is %q, without 900x1600", got)
+	}
+	lines := iv.overlayLines()
+	if !strings.Contains(lines[1], "900x1600") || !strings.Contains(strings.Join(lines, "|"), "EXIF orientation 6") {
+		t.Errorf("the panel before decode says %v", lines)
+	}
+
+	// The reader's own turn stacks on top of the header size.
+	iv.Rotate(90)
+	if got := iv.displaySize(); got != "1600x900" {
+		t.Errorf("displaySize after a reader turn is %q, want 1600x900", got)
+	}
+}
+
 func TestImageViewOverlayGoesOverPicture(t *testing.T) {
 	scr := newImageTestScreen(t)
 	iv := newTestImageView(t, 100, 100)
@@ -1619,5 +1533,59 @@ func TestImageViewOrientationResetsOnTheNextPicture(t *testing.T) {
 	}
 	if iv.display().Width != 20 || iv.display().Height != 10 {
 		t.Errorf("the picture on screen is %dx%d", iv.display().Width, iv.display().Height)
+	}
+}
+
+// TestImageViewModeSync locks in that the graphics and the cell renderers see
+// the same view at the same zoom: the placement is anchored to the canonical
+// half-block grid, so the fitted scale, the visible crop and the pan range are
+// identical in both modes whatever the terminal's real cell aspect is.
+func TestImageViewModeSync(t *testing.T) {
+	for _, cells := range [][2]int{{8, 16}, {10, 20}, {9, 17}, {8, 15}} {
+		for _, z := range []float64{1, 2.5, 4} {
+			scr := newImageTestScreen(t)
+			iv := newTestImageView(t, 4000, 2000)
+			iv.surface = solidSurface(4000, 2000, 0xCC8855)
+			iv.zoom = z
+			iv.panX, iv.panY = 300, 200
+			gfx, ok1 := iv.placementForSize(scr, cells[0], cells[1])
+			gfxScale := iv.lastScale
+			iv.panX, iv.panY = 300, 200
+			block, ok2 := iv.placementForSize(scr, 1, 2)
+			if !ok1 || !ok2 {
+				t.Fatalf("cells=%dx%d zoom=%v: placement failed (%v, %v)", cells[0], cells[1], z, ok1, ok2)
+			}
+			if gfx.Col != block.Col || gfx.Row != block.Row ||
+				gfx.Cols != block.Cols || gfx.Rows != block.Rows ||
+				gfx.SrcX != block.SrcX || gfx.SrcY != block.SrcY ||
+				gfx.SrcW != block.SrcW || gfx.SrcH != block.SrcH {
+				t.Errorf("cells=%dx%d zoom=%v: renderers disagree\ngfx   = %+v\nblock = %+v",
+					cells[0], cells[1], z, gfx, block)
+			}
+			if iv.lastScale != gfxScale {
+				t.Errorf("cells=%dx%d zoom=%v: the reported scale must not depend on the mode: %v vs %v",
+					cells[0], cells[1], z, gfxScale, iv.lastScale)
+			}
+		}
+	}
+}
+
+// TestImageViewActualSizeZoomKeepsTheZoom: zooming while the literal 1:1
+// size is on must still zoom, with the reported scale following the zoom.
+func TestImageViewActualSizeZoomKeepsTheZoom(t *testing.T) {
+	scr := newImageTestScreen(t)
+	iv := newTestImageView(t, 4000, 2000)
+	iv.surface = solidSurface(4000, 2000, 0xCC8855)
+	iv.actual = true
+	iv.zoom = 2
+	p, ok := iv.placementFor(scr)
+	if !ok {
+		t.Fatal("layout failed")
+	}
+	if p.SrcW <= 0 || p.SrcW >= 4000 {
+		t.Errorf("zoomed 1:1 must show a crop of the source, got %d", p.SrcW)
+	}
+	if iv.lastScale != 2 {
+		t.Errorf("the zoomed literal size must report scale two, got %v", iv.lastScale)
 	}
 }

@@ -493,14 +493,21 @@ func (r *blockRender) buildWork(surf *vtui.ImageSurface, bg uint32, wx, wy, ww, 
 	r.hMemoHit = true
 }
 
-// imageBlockMode reports whether half-block rendering must be used:
-// renderer 0 forces cells off, 2 forces them on, 1 (default) falls back to
-// cells only when the terminal cannot draw images.
+// imageBlockMode reports whether cell rendering must be used: renderer 0
+// forces cells off, 2 forces the half-block cells on, 3 forces the plain
+// cells on, and 1 (default) falls back to cells only when the terminal
+// cannot draw images. Inside WezTerm the two forced cell modes give way to
+// the graphics protocol when it works: the terminal draws the half-block
+// glyph with a seam between cell rows and leaves a stale image on screen
+// when a sixel placement is dropped.
 func imageBlockMode(scr *vtui.ScreenBuf) bool {
 	switch AppConfig.ImageBlockRenderer {
 	case 0:
 		return false
-	case 2:
+	case 2, 3:
+		if weztermEnv() && scr != nil && scr.SupportsGraphics() {
+			return false
+		}
 		return true
 	}
 	return scr != nil && !scr.SupportsGraphics()
@@ -508,7 +515,11 @@ func imageBlockMode(scr *vtui.ScreenBuf) bool {
 
 // blockPlainMode reports whether the block renderer must use plain cells
 // (spaces, one colour) instead of the half-block glyph: a 16-colour console's
-// font cannot be trusted to carry the half-block at all.
+// font cannot be trusted to carry the half-block at all, and renderer 3
+// forces the plain cells everywhere.
 func blockPlainMode(scr *vtui.ScreenBuf) bool {
+	if AppConfig.ImageBlockRenderer == 3 {
+		return true
+	}
 	return scr != nil && scr.ColorProfile == vtui.ColorProfile16
 }

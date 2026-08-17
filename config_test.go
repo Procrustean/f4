@@ -481,7 +481,7 @@ func TestConfig_ImagesSectionRoundTrip(t *testing.T) {
 	if got := imagedec.ImageDecoderPriorityOf("external", -10); got != -5 {
 		t.Errorf("loading must apply the priorities, external is %d", got)
 	}
-	if got := imagedec.ImageDecoderPriorityOf("go-bmp", 10); got != 10 {
+	if got := imagedec.ImageDecoderPriorityOf("go-bmp-ico", 10); got != 10 {
 		t.Errorf("a decoder nobody overrode must keep its own priority, got %d", got)
 	}
 }

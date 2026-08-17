@@ -10,13 +10,8 @@ import (
 
 // newBlockTestScreen is newBenchScreen wrapped for tests.
 func newBlockTestScreen(t *testing.T) *vtui.ScreenBuf {
-	t.Helper()
-	// The placement tests assume the tab bar reserves the top row, so pin
-	// the mode: earlier tests may have switched it globally.
-	wasMode := vtui.FrameManager.WorkspaceTabMode
-	vtui.FrameManager.WorkspaceTabMode = vtui.WorkspaceTabsAlways
-	t.Cleanup(func() { vtui.FrameManager.WorkspaceTabMode = wasMode })
-	return newBenchScreen()
+	// The placement tests assume the tab bar reserves the top row.
+	return newImageTestScreenMode(t, vtui.WorkspaceTabsAlways, vtui.GraphicsNone)
 }
 
 // newBenchScreen is newBlockTestScreen without the testing.T, for benchmarks.
@@ -43,7 +38,7 @@ func solidSurface(w, h int, rgb uint32) *vtui.ImageSurface {
 }
 
 func TestBlockPlacementFits(t *testing.T) {
-	s, _ := fitPlacement(solidSurface(100, 100, 0xFFFFFF), 1, 2, 5, 7, 40, 10)
+	s, _ := fitPlacement(solidSurface(100, 100, 0xFFFFFF), 5, 7, 40, 10)
 	// The pixel box is 40 x 20; a square fits to 20 x 20 pixels, i.e.
 	// 20 cells wide and 10 tall, centred.
 	if s.Cols != 20 || s.Rows != 10 {
@@ -52,17 +47,17 @@ func TestBlockPlacementFits(t *testing.T) {
 	if s.Col != 15 || s.Row != 7 {
 		t.Errorf("origin %d,%d", s.Col, s.Row)
 	}
-	w, _ := fitPlacement(solidSurface(100, 50, 0xFFFFFF), 1, 2, 0, 0, 40, 10)
+	w, _ := fitPlacement(solidSurface(100, 50, 0xFFFFFF), 0, 0, 40, 10)
 	if w.Cols != 40 || w.Rows != 10 {
 		t.Errorf("wide picture size %dx%d", w.Cols, w.Rows)
 	}
 }
 
 func TestBlockPlacementRejectsInvalid(t *testing.T) {
-	if _, ok := fitPlacement(nil, 1, 2, 0, 0, 10, 10); ok {
+	if _, ok := fitPlacement(nil, 0, 0, 10, 10); ok {
 		t.Error("nil surface must be rejected")
 	}
-	if _, ok := fitPlacement(solidSurface(2, 2, 0), 1, 2, 0, 0, 0, 5); ok {
+	if _, ok := fitPlacement(solidSurface(2, 2, 0), 0, 0, 0, 5); ok {
 		t.Error("empty box must be rejected")
 	}
 }
@@ -87,40 +82,6 @@ func TestBlockViewerPlacementFitsAndCentres(t *testing.T) {
 	}
 }
 
-// TestBlockViewerPlacementMatchesGraphics locks in the canonical-crop
-// contract: on a terminal with a real cell size (wezterm's 9x17) the
-// half-block placement uses the same cell as the graphics backend, so
-// Shift+F4 never re-frames or re-scales the picture.
-func TestBlockViewerPlacementMatchesGraphics(t *testing.T) {
-	// Make the effective sixel cell follow SetCellSize on every host.
-	t.Setenv("WT_SESSION", "")
-	t.Setenv("TERM_PROGRAM", "wezterm")
-	for _, proto := range []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel} {
-		scr := newBlockTestScreen(t)
-		scr.Graphics().SetProtocol(proto)
-		scr.Graphics().SetCellSize(9, 17)
-		iv := newTestImageView(t, 100, 100)
-
-		bw, bh := blockCellSize(scr)
-		gw, gh := cellSize(scr)
-		if bw != gw || bh != gh {
-			t.Fatalf("%s: block cell %dx%d must equal the graphics cell %dx%d", proto, bw, bh, gw, gh)
-		}
-		bp, ok1 := iv.placementForSize(scr, bw, bh)
-		gp, ok2 := iv.placementFor(scr)
-		if !ok1 || !ok2 {
-			t.Fatal("layout failed")
-		}
-		if bp.Cols != gp.Cols || bp.Rows != gp.Rows || bp.Col != gp.Col || bp.Row != gp.Row ||
-			bp.SrcW != gp.SrcW || bp.SrcH != gp.SrcH || bp.SrcX != gp.SrcX || bp.SrcY != gp.SrcY {
-			t.Errorf("%s: block placement %+v must match the graphics one %+v", proto, bp, gp)
-		}
-		if gp.Cols == 0 || gp.Rows == 0 {
-			t.Fatalf("%s: empty placement", proto)
-		}
-	}
-}
-
 // TestBlockFillsCanonicalRectOnOddCell is the regression test for the
 // half-block aspect fix: on a 9x17 cell the renderer fills the whole
 // canonical rect instead of re-fitting by the real cell and padding a
@@ -132,17 +93,12 @@ func TestBlockFillsCanonicalRectOnOddCell(t *testing.T) {
 	iv := newTestImageView(t, 100, 100)
 	iv.surface = solidSurface(100, 100, 0x8080C0)
 
-	cw, ch := blockCellSize(scr)
-	p, ok := iv.placementForSize(scr, cw, ch)
+	p, ok := iv.placementForSize(scr, 1, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
-
-	// The rect covers the fitted 408x408 px within one cell per axis.
-	dispW := int(float64(100)*iv.lastScale + 0.5)
-	dispH := int(float64(100)*iv.lastScale + 0.5)
-	if dw, dh := p.Cols*cw-dispW, p.Rows*ch-dispH; dw < 0 || dw > cw-1 || dh < 0 || dh > ch-1 {
-		t.Fatalf("rect %dx%d cells (%d x %d px) misses the fitted %dx%d px", p.Cols, p.Rows, p.Cols*cw, p.Rows*ch, dispW, dispH)
+	if p.Cols <= 0 || p.Rows <= 0 {
+		t.Fatalf("empty canonical rect %dx%d", p.Cols, p.Rows)
 	}
 
 	r := &blockRender{}
@@ -154,6 +110,41 @@ func TestBlockFillsCanonicalRectOnOddCell(t *testing.T) {
 			c := scr.GetCell(p.Col+x, p.Row+y)
 			if vtui.GetRGBFore(c.Attributes) != 0x8080C0 {
 				t.Fatalf("cell %d,%d of the rect is not the picture: fg %06X", x, y, vtui.GetRGBFore(c.Attributes))
+			}
+		}
+	}
+}
+
+// TestBlockActualSizeMatchesGraphics locks the literal-size (1:1) contract:
+// the half-block renderer must lay out the same view as the graphics
+// backends at the actual size, so Shift+F4 at 100% shows the same crop.
+// The block renderer needs the terminal's real cell for the 1:1 scale —
+// the canonical 1x2 grid would show cw times fewer image pixels.
+func TestBlockActualSizeMatchesGraphics(t *testing.T) {
+	// Make the effective sixel cell follow SetCellSize on every host.
+	t.Setenv("WT_SESSION", "")
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	for _, cells := range [][2]int{{8, 16}, {9, 17}, {10, 20}} {
+		for _, proto := range []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel} {
+			scr := newBlockTestScreen(t)
+			scr.Graphics().SetProtocol(proto)
+			scr.Graphics().SetCellSize(cells[0], cells[1])
+			iv := newTestImageView(t, 1000, 1000)
+			iv.actual = true
+
+			bw, bh := blockCellSize(scr)
+			if bw != cells[0] || bh != cells[1] {
+				t.Fatalf("%s %dx%d: block cell %dx%d", proto, cells[0], cells[1], bw, bh)
+			}
+			iv.panX, iv.panY = 0, 0
+			bp, ok1 := iv.placementForSize(scr, bw, bh)
+			iv.panX, iv.panY = 0, 0
+			gp, ok2 := iv.placementFor(scr)
+			if !ok1 || !ok2 {
+				t.Fatal("layout failed")
+			}
+			if bp.Cols != gp.Cols || bp.Rows != gp.Rows || bp.SrcW != gp.SrcW || bp.SrcH != gp.SrcH {
+				t.Errorf("%s %dx%d actual: block %+v must match graphics %+v", proto, cells[0], cells[1], bp, gp)
 			}
 		}
 	}
@@ -196,7 +187,7 @@ func TestBlockDrawWritesCells(t *testing.T) {
 		surface.SetPixel(x, 2, 0, 0, 255, 255)
 		surface.SetPixel(x, 3, 255, 255, 0, 255)
 	}
-	p, ok := fitPlacement(surface, 1, 2, 1, 1, 2, 2)
+	p, ok := fitPlacement(surface, 1, 1, 2, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -238,7 +229,7 @@ func TestBlockDrawSourceRect(t *testing.T) {
 func TestBlockDrawRedrawsAfterMove(t *testing.T) {
 	scr := newBlockTestScreen(t)
 	surface := solidSurface(4, 2, 0x804020)
-	p, ok := fitPlacement(surface, 1, 2, 0, 0, 4, 1)
+	p, ok := fitPlacement(surface, 0, 0, 4, 1)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -260,7 +251,7 @@ func TestBlockRectFitsWideImage(t *testing.T) {
 	// rect centred vertically, and the renderer fills exactly that rect — the
 	// letterbox rows are the caller's background, never painted here.
 	surface := solidSurface(100, 25, 0x804020)
-	p, ok := fitPlacement(surface, 1, 2, 0, 0, 4, 4)
+	p, ok := fitPlacement(surface, 0, 0, 4, 4)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -289,7 +280,7 @@ func TestBlockRectFitsTallImage(t *testing.T) {
 	// A 1:4 picture in an 8x2 cell box: the canonical fit gives it a 1x2-cell
 	// rect centred horizontally; the renderer fills that rect and nothing else.
 	surface := solidSurface(25, 100, 0x804020)
-	p, ok := fitPlacement(surface, 1, 2, 0, 0, 8, 2)
+	p, ok := fitPlacement(surface, 0, 0, 8, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -379,7 +370,7 @@ func blockPlainTestSurface() *vtui.ImageSurface {
 func TestBlockDrawPlainCells(t *testing.T) {
 	scr := newBlockTestScreen(t)
 	scr.ColorProfile = vtui.ColorProfile16
-	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 1, 1, 2, 2)
+	p, ok := fitPlacement(blockPlainTestSurface(), 1, 1, 2, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -421,7 +412,7 @@ func TestBlockBlendIsLinear(t *testing.T) {
 
 func TestBlockDrawPlainTogglesMemo(t *testing.T) {
 	scr := newBlockTestScreen(t)
-	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 0, 0, 2, 2)
+	p, ok := fitPlacement(blockPlainTestSurface(), 0, 0, 2, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -479,6 +470,10 @@ func TestImageBlockMode(t *testing.T) {
 	if !imageBlockMode(scr) {
 		t.Error("always mode must win over kitty")
 	}
+	AppConfig.ImageBlockRenderer = 3
+	if !imageBlockMode(scr) {
+		t.Error("plain mode must use the block renderer too")
+	}
 	AppConfig.ImageBlockRenderer = 0
 	if imageBlockMode(scr) {
 		t.Error("off mode must never use the block renderer")
@@ -510,41 +505,167 @@ func withViewerScreen(scr *vtui.ScreenBuf, fn func()) {
 }
 
 func TestShiftF4CyclesRenderers(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "") // not wezterm: its cycle skips the cells
 	old := AppConfig.ImageBlockRenderer
-	defer func() { AppConfig.ImageBlockRenderer = old }()
+	oldProts := imageGraphicsProtocols
+	oldPal := AppConfig.ImageSixelPalette
+	defer func() {
+		AppConfig.ImageBlockRenderer = old
+		imageGraphicsProtocols = oldProts
+		AppConfig.ImageSixelPalette = oldPal
+		vtui.SetSixelPaletteMode("adaptive")
+	}()
 	iv := &ImageView{BaseFrame: vtui.BaseFrame{}}
 	scr := newBlockTestScreen(t)
 	withViewerScreen(scr, func() {
-		// Without a graphics protocol the half-block cells are the only
-		// renderer: the cycle leaves the setting put.
+		// Without a graphics protocol the cycle is half-block <-> plain.
 		AppConfig.ImageBlockRenderer = 1
-		for i := 0; i < 2; i++ {
-			if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
-				t.Fatal("Shift+F4 must be consumed")
-			}
+		if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
+			t.Fatal("Shift+F4 must be consumed")
 		}
-		if AppConfig.ImageBlockRenderer != 1 {
-			t.Fatalf("no-graphics cycle moved the setting to %d, want 1",
+		if AppConfig.ImageBlockRenderer != 3 {
+			t.Fatalf("no-graphics half-block -> plain set %d, want 3",
 				AppConfig.ImageBlockRenderer)
 		}
-		// With kitty available Shift+F4 flips graphics <-> half-block.
+		if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
+			t.Fatal("Shift+F4 must be consumed")
+		}
+		if AppConfig.ImageBlockRenderer != 2 {
+			t.Fatalf("no-graphics plain -> half-block set %d, want 2",
+				AppConfig.ImageBlockRenderer)
+		}
+		// With kitty and sixel available Shift+F4 runs through both
+		// protocols (sixel twice, for its two palettes), then the cells,
+		// and wraps back to kitty.
+		imageGraphicsProtocols = []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel}
 		scr.Graphics().SetProtocol(vtui.GraphicsKitty)
 		AppConfig.ImageBlockRenderer = 1
+		AppConfig.ImageSixelPalette = "adaptive"
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if scr.Graphics().Protocol() != vtui.GraphicsSixel || AppConfig.ImageBlockRenderer != 1 ||
+			AppConfig.ImageSixelPalette != "adaptive" {
+			t.Fatalf("kitty -> sixel adaptive: protocol %v mode %d palette %q",
+				scr.Graphics().Protocol(), AppConfig.ImageBlockRenderer, AppConfig.ImageSixelPalette)
+		}
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if AppConfig.ImageSixelPalette != "fixed" || AppConfig.ImageBlockRenderer != 1 {
+			t.Fatalf("sixel adaptive -> fixed: mode %d palette %q",
+				AppConfig.ImageBlockRenderer, AppConfig.ImageSixelPalette)
+		}
 		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
 		if AppConfig.ImageBlockRenderer != 2 {
-			t.Fatalf("graphics -> half-block set %d, want 2",
+			t.Fatalf("sixel fixed -> half-block set %d, want 2",
 				AppConfig.ImageBlockRenderer)
 		}
 		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
-		if AppConfig.ImageBlockRenderer != 1 {
-			t.Fatalf("half-block -> graphics set %d, want 1",
+		if AppConfig.ImageBlockRenderer != 3 {
+			t.Fatalf("half-block -> plain set %d, want 3",
 				AppConfig.ImageBlockRenderer)
+		}
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if scr.Graphics().Protocol() != vtui.GraphicsKitty || AppConfig.ImageBlockRenderer != 1 {
+			t.Fatalf("plain -> kitty: protocol %v mode %d",
+				scr.Graphics().Protocol(), AppConfig.ImageBlockRenderer)
+		}
+	})
+}
+
+// Inside WezTerm the forced cell renderers give way to the graphics
+// protocol: the terminal draws the half-block glyph with a seam between
+// cell rows and keeps a stale image on screen when a sixel placement is
+// dropped, so wherever its native protocols work the cells stay off.
+func TestWezTermForcesGraphicsOverCells(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	old := AppConfig.ImageBlockRenderer
+	defer func() { AppConfig.ImageBlockRenderer = old }()
+
+	scr := newBlockTestScreen(t)
+	scr.Renderer = kittyFakeRenderer{}
+	scr.Graphics().SetProtocol(vtui.GraphicsKitty)
+
+	AppConfig.ImageBlockRenderer = 2
+	if imageBlockMode(scr) {
+		t.Error("wezterm must not use half-block cells when graphics work")
+	}
+	AppConfig.ImageBlockRenderer = 3
+	if imageBlockMode(scr) {
+		t.Error("wezterm must not use plain cells when graphics work")
+	}
+	AppConfig.ImageBlockRenderer = 1
+	if imageBlockMode(scr) {
+		t.Error("wezterm mode 1 must stay on the graphics protocol")
+	}
+}
+
+// Without any graphics protocol the cells remain the only renderer even in
+// WezTerm: there is nothing better to fall back to.
+func TestWezTermWithoutGraphicsKeepsCells(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	old := AppConfig.ImageBlockRenderer
+	defer func() { AppConfig.ImageBlockRenderer = old }()
+
+	scr := newBlockTestScreen(t) // GraphicsNone
+	AppConfig.ImageBlockRenderer = 1
+	if !imageBlockMode(scr) {
+		t.Error("wezterm without graphics must fall back to the cells")
+	}
+	AppConfig.ImageBlockRenderer = 2
+	if !imageBlockMode(scr) {
+		t.Error("wezterm without graphics must still honour the forced cells")
+	}
+}
+
+// Inside WezTerm Shift+F4 cycles only the native protocols and never moves
+// the persisted block mode.
+func TestWezTermCycleStaysOnProtocols(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "wezterm")
+	old := AppConfig.ImageBlockRenderer
+	oldProts := imageGraphicsProtocols
+	oldPal := AppConfig.ImageSixelPalette
+	defer func() {
+		AppConfig.ImageBlockRenderer = old
+		imageGraphicsProtocols = oldProts
+		AppConfig.ImageSixelPalette = oldPal
+		vtui.SetSixelPaletteMode("adaptive")
+	}()
+	iv := &ImageView{BaseFrame: vtui.BaseFrame{}}
+	scr := newBlockTestScreen(t)
+	scr.Renderer = kittyFakeRenderer{}
+	scr.Graphics().SetProtocol(vtui.GraphicsKitty)
+	imageGraphicsProtocols = []vtui.GraphicsProtocol{vtui.GraphicsKitty, vtui.GraphicsSixel}
+	withViewerScreen(scr, func() {
+		AppConfig.ImageBlockRenderer = 1
+		AppConfig.ImageSixelPalette = "adaptive"
+		if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
+			t.Fatal("Shift+F4 must be consumed")
+		}
+		if scr.Graphics().Protocol() != vtui.GraphicsSixel || AppConfig.ImageBlockRenderer != 1 ||
+			AppConfig.ImageSixelPalette != "adaptive" {
+			t.Fatalf("kitty -> sixel adaptive: protocol %v mode %d palette %q",
+				scr.Graphics().Protocol(), AppConfig.ImageBlockRenderer, AppConfig.ImageSixelPalette)
+		}
+		if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
+			t.Fatal("Shift+F4 must be consumed")
+		}
+		if AppConfig.ImageSixelPalette != "fixed" || AppConfig.ImageBlockRenderer != 1 {
+			t.Fatalf("sixel adaptive -> fixed: mode %d palette %q",
+				AppConfig.ImageBlockRenderer, AppConfig.ImageSixelPalette)
+		}
+		if !sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed) {
+			t.Fatal("Shift+F4 must be consumed")
+		}
+		if scr.Graphics().Protocol() != vtui.GraphicsKitty || AppConfig.ImageBlockRenderer != 1 {
+			t.Fatalf("sixel fixed -> kitty: protocol %v mode %d",
+				scr.Graphics().Protocol(), AppConfig.ImageBlockRenderer)
 		}
 	})
 }
 
 func TestBlockPlainMode(t *testing.T) {
 	scr := newBlockTestScreen(t)
+	old := AppConfig.ImageBlockRenderer
+	defer func() { AppConfig.ImageBlockRenderer = old }()
+	AppConfig.ImageBlockRenderer = 1
 	scr.ColorProfile = vtui.ColorProfileTrueColor
 	if blockPlainMode(scr) {
 		t.Error("a truecolor terminal must not be plain")
@@ -556,11 +677,21 @@ func TestBlockPlainMode(t *testing.T) {
 	if blockPlainMode(nil) {
 		t.Error("nil screen must not be plain")
 	}
+	// Renderer 3 forces the plain cells even on a truecolor terminal.
+	scr.ColorProfile = vtui.ColorProfileTrueColor
+	AppConfig.ImageBlockRenderer = 3
+	if !blockPlainMode(scr) {
+		t.Error("plain mode must force plain cells on a truecolor terminal")
+	}
+	AppConfig.ImageBlockRenderer = 2
+	if blockPlainMode(scr) {
+		t.Error("half-block mode must not be plain on a truecolor terminal")
+	}
 }
 
 func TestBlockAutoPlainOn16Color(t *testing.T) {
 	scr := newBlockTestScreen(t)
-	p, ok := fitPlacement(blockPlainTestSurface(), 1, 2, 0, 0, 2, 2)
+	p, ok := fitPlacement(blockPlainTestSurface(), 0, 0, 2, 2)
 	if !ok {
 		t.Fatal("layout failed")
 	}
@@ -577,6 +708,37 @@ func TestBlockAutoPlainOn16Color(t *testing.T) {
 	if c := scr.GetCell(0, 0); c.Char != blockHalfChar {
 		t.Fatalf("truecolor screen: char %d, want half-block", c.Char)
 	}
+}
+
+func TestShiftF4CyclesNativeBackend(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "") // not wezterm: its cycle skips the cells
+	old := AppConfig.ImageBlockRenderer
+	defer func() { AppConfig.ImageBlockRenderer = old }()
+	iv := &ImageView{BaseFrame: vtui.BaseFrame{}}
+	scr := vtui.NewSilentScreenBuf()
+	scr.AllocBuf(80, 25)
+	scr.Renderer = kittyFakeRenderer{}
+	scr.Graphics().SetProtocol(vtui.GraphicsNative)
+	withViewerScreen(scr, func() {
+		// A GUI backend's only graphics stop is native; the cycle then
+		// runs half-block -> plain -> native.
+		AppConfig.ImageBlockRenderer = 1
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if AppConfig.ImageBlockRenderer != 2 {
+			t.Fatalf("native -> half-block set %d, want 2",
+				AppConfig.ImageBlockRenderer)
+		}
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if AppConfig.ImageBlockRenderer != 3 {
+			t.Fatalf("half-block -> plain set %d, want 3",
+				AppConfig.ImageBlockRenderer)
+		}
+		sendKey(iv, vtinput.VK_F4, vtinput.ShiftPressed)
+		if scr.Graphics().Protocol() != vtui.GraphicsNative || AppConfig.ImageBlockRenderer != 1 {
+			t.Fatalf("plain -> native: protocol %v mode %d",
+				scr.Graphics().Protocol(), AppConfig.ImageBlockRenderer)
+		}
+	})
 }
 
 func TestShiftF4IgnoredInGallery(t *testing.T) {

@@ -132,6 +132,7 @@ func (iv *ImageView) ToggleGallery() {
 	if iv.blockTiles == nil {
 		iv.blockTiles = make(map[int]*blockRender)
 	}
+	iv.identifyAll()
 }
 
 // galleryPath is the picture under the grid cursor.
@@ -289,13 +290,12 @@ func (iv *ImageView) showGallery(scr *vtui.ScreenBuf) {
 		}
 		iv.showTile(scr, slot, idx,
 			x1+(slot%g.cols)*imageTileCols,
-			top+(slot/g.cols)*imageTileRows,
-			cw, ch)
+			top+(slot/g.cols)*imageTileRows)
 	}
 }
 
 // showTile paints one thumbnail and the caption under it.
-func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch int) {
+func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row int) {
 	path := iv.siblings[idx]
 	name := filepath.Base(path)
 	if iv.vfs != nil {
@@ -316,6 +316,17 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 	}
 	scr.Write(col, row+imageTileRows-1, vtui.StringToCharInfo(caption, attr))
 
+	// The header pass knows the size before the thumbnail decodes; a rotated
+	// picture (5-8) shows swapped sides, like its decoded surface.
+	if h, ok := ImagePipe.Identified(iv.vfs, path); ok {
+		w, ht := h.Width, h.Height
+		if h.Orientation >= 5 && h.Orientation <= 8 {
+			w, ht = ht, w
+		}
+		dims := runewidth.Truncate(" "+fmt.Sprintf("%dx%d", w, ht), imageTileCols, "…")
+		scr.Write(col, row+imageTileRows-2, vtui.StringToCharInfo(dims, imageTileNameAttr))
+	}
+
 	surface := iv.gal.thumbs[path]
 	if surface == nil || !surface.Valid() {
 		// Not requested yet: the per-frame budget decides what is asked.
@@ -325,8 +336,7 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 	boxCols, boxRows := imageTileCols-2, imageTileRows-2
 
 	if imageBlockMode(scr) {
-		bw, bh := blockCellSize(scr)
-		if p, ok := fitPlacement(surface, bw, bh, col+1, row, boxCols, boxRows); ok {
+		if p, ok := fitPlacement(surface, col+1, row, boxCols, boxRows); ok {
 			c := iv.blockTiles[slot]
 			if c == nil {
 				c = &blockRender{}
@@ -340,7 +350,7 @@ func (iv *ImageView) showTile(scr *vtui.ScreenBuf, slot, idx, col, row, cw, ch i
 		return
 	}
 
-	if p, ok := fitPlacement(surface, cw, ch, col+1, row, boxCols, boxRows); ok {
+	if p, ok := fitPlacement(surface, col+1, row, boxCols, boxRows); ok {
 		scr.Graphics().DrawImage(fmt.Sprintf("%s#%d", iv.gfxKey, idx), p)
 	}
 }

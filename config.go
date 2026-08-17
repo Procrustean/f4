@@ -214,8 +214,8 @@ type F4Config struct {
 	ImageDecoderPriority   string
 	ImageFullScreen        bool
 	ImageShowOverlay       bool
-	ImageBlockRenderer     int // 0 = off, 1 = half-block fallback, 2 = always
-	ImageSixelPalette      string // tiled (default), adaptive, or fixed cube
+	ImageBlockRenderer     int    // 0 = off, 1 = half-block fallback, 2 = always half-block, 3 = always plain
+	ImageSixelPalette      string // adaptive (default) or fixed cube
 	RegisteredPlugins      []string
 	ConfirmCopy            bool
 	ConfirmMove            bool
@@ -336,7 +336,7 @@ var AppConfig = F4Config{
 	ImageDecoderPriority:     "",
 	ImageFullScreen:          true,
 	ImageShowOverlay:         false,
-	ImageSixelPalette:        "tiled",
+	ImageSixelPalette:        "adaptive",
 	ConfirmCopy:              true,
 	ConfirmMove:              true,
 	ConfirmDelete:            true,
@@ -580,15 +580,15 @@ func LoadConfig() {
 	AppConfig.ImageShowOverlay = ini.GetString("Images", "ShowOverlay", "0") == "1"
 	AppConfig.ImageBlockRenderer = 1
 	fmt.Sscanf(ini.GetString("Images", "BlockRenderer", "1"), "%d", &AppConfig.ImageBlockRenderer)
-	if AppConfig.ImageBlockRenderer < 0 || AppConfig.ImageBlockRenderer > 2 {
+	if AppConfig.ImageBlockRenderer < 0 || AppConfig.ImageBlockRenderer > 3 {
 		AppConfig.ImageBlockRenderer = 1
 	}
-	AppConfig.ImageSixelPalette = ini.GetString("Images", "SixelPalette", "tiled")
+	AppConfig.ImageSixelPalette = ini.GetString("Images", "SixelPalette", "adaptive")
 	switch strings.ToLower(AppConfig.ImageSixelPalette) {
-	case "fixed", "adaptive", "tiled":
+	case "fixed", "adaptive":
 		AppConfig.ImageSixelPalette = strings.ToLower(AppConfig.ImageSixelPalette)
 	default:
-		AppConfig.ImageSixelPalette = "tiled"
+		AppConfig.ImageSixelPalette = "adaptive"
 	}
 	AppConfig.UseExternalEditor = ini.GetString("Editor", "UseExternalEditor", "0") == "1"
 	AppConfig.ExternalEditorCommand = ini.GetString("Editor", "ExternalEditorCommand", "")
