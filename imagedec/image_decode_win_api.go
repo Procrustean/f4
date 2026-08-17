@@ -146,6 +146,12 @@ const (
 	shellVtblGetImage = 3
 	shellFlagsGen     = 0x09
 	shellPriority     = 1000
+
+	// wicThumbMaxBox: only a box this small may borrow the embedded thumbnail.
+	// Gallery tiles (about 128px) use it so a large picture never decodes
+	// whole; the on-screen sized decode asks for a screen-sized box, where the
+	// tiny thumbnail would make the picture blurry, so it goes to the scaler.
+	wicThumbMaxBox = 1024
 )
 
 type shellSize struct{ CX, CY int32 }
@@ -633,11 +639,13 @@ func decodeSingleFrame(ctx context.Context, factory, decoder uintptr, tw, th int
 
 	src := frame
 	if tw > 0 && th > 0 && (int(w) > tw || int(h) > th) {
-		if thumb, ok := wicFrameThumbnail(frame, int(w), int(h), tw, th); ok {
-			src = thumb
-			defer wicRelease(thumb)
-			_ = wicCall(src, wicSourceGetPixelFormat, uintptr(unsafe.Pointer(&srcFmt)))
-			_ = wicCall(src, wicSourceGetSize, uintptr(unsafe.Pointer(&w)), uintptr(unsafe.Pointer(&h)))
+		if tw <= wicThumbMaxBox && th <= wicThumbMaxBox {
+			if thumb, ok := wicFrameThumbnail(frame, int(w), int(h), tw, th); ok {
+				src = thumb
+				defer wicRelease(thumb)
+				_ = wicCall(src, wicSourceGetPixelFormat, uintptr(unsafe.Pointer(&srcFmt)))
+				_ = wicCall(src, wicSourceGetSize, uintptr(unsafe.Pointer(&w)), uintptr(unsafe.Pointer(&h)))
+			}
 		}
 		if int(w) > tw || int(h) > th {
 			fw, fh := wicAspectFit(int(w), int(h), tw, th)
