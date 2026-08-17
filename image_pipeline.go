@@ -16,8 +16,10 @@ import (
 
 const (
 	// imageCacheLimit bounds the decoded pixels kept; the cache makes going
-	// back and forth instant, not a whole directory.
-	imageCacheLimit = 192 << 20
+	// back and forth instant, not a whole directory. The headroom over the
+	// older budget holds the picture the reader stepped away from (kept
+	// pinned), so a quick comparison does not re-decode it.
+	imageCacheLimit = 256 << 20
 
 	// imageWorkers: one lane stays free for the on-screen picture while
 	// prefetch fills the rest.
@@ -141,6 +143,10 @@ type ImagePipeline struct {
 	bytesJobs  map[imageCacheKey]*imageBytesJob
 	bytesGen   uint64
 	clearGen   uint64
+
+	// prevPin is the picture the reader stepped away from, kept in the
+	// surface cache so flipping back for a comparison does not re-decode it.
+	prevPin *imageCacheKey
 
 	load     imageLoader
 	preview  imageLoader
@@ -484,6 +490,19 @@ func (p *ImagePipeline) Prefetch(v vfs.VFS, paths []string) {
 		}
 		p.request(v, path, false, imageWaiter{}, context.Background())
 	}
+}
+
+// PinPrevious keeps the picture the reader stepped away from in the surface
+// cache: only the last one is pinned, the next navigation replaces it.
+func (p *ImagePipeline) PinPrevious(v vfs.VFS, path string) {
+	key := imageCacheKey{Source: imageSource(v), Path: path}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.prevPin != nil && *p.prevPin != key {
+		p.surfaceCache.unpin(*p.prevPin)
+	}
+	p.prevPin = &key
+	p.surfaceCache.pin(key)
 }
 
 // Invalidate forgets one picture, so that the next request decodes it again.

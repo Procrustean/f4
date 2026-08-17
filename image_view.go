@@ -406,6 +406,9 @@ func (iv *ImageView) open(path string) {
 	if path != iv.path {
 		// The toast answers the picture it was said over; drop it at once.
 		iv.toastClear()
+		// Keep the picture we are leaving in the cache, so flipping back for
+		// a comparison or a revert does not re-decode it.
+		ImagePipe.PinPrevious(iv.vfs, iv.path)
 		// Remember where the reader stands, as a share of the pan range, so
 		// the next picture opens on the same relative spot.
 		iv.carryFracX = panFrac(iv.panX, iv.panMaxX)

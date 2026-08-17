@@ -118,6 +118,39 @@ func TestImagePipelineKeepsTheNewestPictureHoweverLarge(t *testing.T) {
 	}
 }
 
+func TestImagePipelinePinKeepsThePreviousPicture(t *testing.T) {
+	p := newTestPipeline(func(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
+		return imageTestSurface(100, 100), "stub", nil
+	})
+	// Room for two pictures of forty thousand bytes each.
+	p.surfaceCache.limit = 90000
+
+	for _, name := range []string{"a", "b", "c"} {
+		if res := p.LoadSync(context.Background(), nil, name); res.Err != nil {
+			t.Fatalf("%s: %v", name, res.Err)
+		}
+	}
+	// The reader steps away from b; pinning it must survive the next eviction.
+	p.PinPrevious(nil, "b")
+	if res := p.LoadSync(context.Background(), nil, "d"); res.Err != nil {
+		t.Fatalf("d: %v", res.Err)
+	}
+	if _, ok := p.Cached(nil, "b"); !ok {
+		t.Error("the pinned previous picture must survive the eviction")
+	}
+	if _, ok := p.Cached(nil, "c"); ok {
+		t.Error("an unpinned picture must still be thrown out")
+	}
+	// The next navigation replaces the pin, releasing the older one.
+	p.PinPrevious(nil, "d")
+	if res := p.LoadSync(context.Background(), nil, "e"); res.Err != nil {
+		t.Fatalf("e: %v", res.Err)
+	}
+	if _, ok := p.Cached(nil, "b"); ok {
+		t.Error("a replaced pin must no longer be protected")
+	}
+}
+
 func TestImagePipelinePrefetchFollowsTheView(t *testing.T) {
 	started := make(chan string, 8)
 	finished := make(chan string, 8)
