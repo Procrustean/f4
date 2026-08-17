@@ -278,7 +278,7 @@ func (p *ImagePipeline) PreviewPrefetch(v vfs.VFS, paths []string) {
 	p.mu.Unlock()
 
 	for _, path := range paths {
-		if imagedec.IsVideoFile(path) {
+		if imagedec.IsVideoFile(path) || !canEmbeddedPreview(path) {
 			continue
 		}
 		key := imageCacheKey{Source: source, Path: path}

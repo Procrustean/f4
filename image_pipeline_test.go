@@ -207,7 +207,8 @@ func TestImagePipelinePreviewPrefetch(t *testing.T) {
 	}
 
 	// The ring beyond the decoded neighbours: only thumbnails, no decodes.
-	p.PreviewPrefetch(nil, []string{"far1", "far2"})
+	// JPEG names, so the embedded-preview filter lets them through.
+	p.PreviewPrefetch(nil, []string{"far1.jpg", "far2.jpg"})
 
 	deadline := time.After(2 * time.Second)
 	for {
@@ -236,7 +237,7 @@ func TestImagePipelinePreviewPrefetch(t *testing.T) {
 	if running != 0 {
 		t.Errorf("%d preview jobs are still running", running)
 	}
-	if _, ok := p.previews.peek(imageCacheKey{Path: "far1"}); !ok {
+	if _, ok := p.previews.peek(imageCacheKey{Path: "far1.jpg"}); !ok {
 		t.Error("the extracted thumbnail must be remembered")
 	}
 }

@@ -27,13 +27,21 @@ const (
 	imagePreviewDecoder = "exif-thumbnail" // what the interface calls this stage
 )
 
+// canEmbeddedPreview reports whether the format carries a small copy the
+// preview pass can extract; only JPEG does today.
+func canEmbeddedPreview(path string) bool {
+	switch imagedec.ImageExtension(path) {
+	case "jpg", "jpeg", "jfif":
+		return true
+	}
+	return false
+}
+
 // imageQuickPreview returns the small copy the file carries inside itself.
 func imageQuickPreview(ctx context.Context, v vfs.VFS, path string) (*vtui.ImageSurface, string, error) {
 	// Only JPEG carries an Exif thumbnail; skip the pointless open and
 	// 256 KiB head read for other formats.
-	switch imagedec.ImageExtension(path) {
-	case "jpg", "jpeg", "jfif":
-	default:
+	if !canEmbeddedPreview(path) {
 		return nil, "", fmt.Errorf("embedded preview is only supported for JPEG files")
 	}
 	head, err := imageReadHead(ctx, v, path, imagePreviewHeadSize)

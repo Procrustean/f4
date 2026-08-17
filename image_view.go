@@ -34,8 +34,9 @@ const (
 	imageViewFallbackCellW = 8
 	imageViewFallbackCellH = 16
 
-	// How many pictures on each side are decoded before they are asked for.
-	imageViewPrefetchRadius = 2
+	// imageViewPrefetchRadius: the nearest neighbours beyond the full decode
+	// (radius 1) get their embedded previews extracted, a cheap header read.
+	imageViewPrefetchRadius = 6
 
 	// imageIdentWindow: the identification pass (cheap header reads) covers
 	// this many pictures on each side, far more than the decode prefetch.

@@ -777,11 +777,12 @@ func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
 	}
 
 	iv := newTestImageView(t, 100, 100)
-	iv.path = "2.png"
-	iv.SetSiblings([]string{"0.png", "1.png", "2.png", "3.png", "4.png"}, 2)
+	iv.path = "2.jpg"
+	iv.SetSiblings([]string{"0.jpg", "1.jpg", "2.jpg", "3.jpg", "4.jpg"}, 2)
 
 	// The nearest neighbours are decoded whole; the ones beyond them are
-	// only worth a thumbnail.
+	// only worth a thumbnail (JPEG names, so the preview filter lets them
+	// through).
 	seen := map[string]bool{}
 	for i := 0; i < 2; i++ {
 		deadline := time.NewTimer(time.Second)
@@ -795,12 +796,12 @@ func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
 			t.Fatalf("only %d neighbours were decoded: %v", len(seen), seen)
 		}
 	}
-	for _, want := range []string{"1.png", "3.png"} {
+	for _, want := range []string{"1.jpg", "3.jpg"} {
 		if !seen[want] {
 			t.Errorf("%s was not decoded whole", want)
 		}
 	}
-	if seen["2.png"] {
+	if seen["2.jpg"] {
 		t.Error("the picture on screen is not its own neighbour")
 	}
 
@@ -817,7 +818,7 @@ func TestImageViewPrefetchesItsNeighbours(t *testing.T) {
 			t.Fatalf("only %d thumbnails were prepared: %v", len(previewSeen), previewSeen)
 		}
 	}
-	for _, want := range []string{"0.png", "4.png"} {
+	for _, want := range []string{"0.jpg", "4.jpg"} {
 		if !previewSeen[want] {
 			t.Errorf("%s was not thumbnailed", want)
 		}
