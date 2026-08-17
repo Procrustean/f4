@@ -157,6 +157,12 @@ type ImageView struct {
 	sizeKnown bool
 	fileTime  time.Time
 	timeKnown bool
+
+	// osdPrev: the overlay lines of the picture still on screen while its
+	// successor decodes, so the OSD shows no intermediate state between
+	// pictures.
+	osdPrev []string
+
 	gal       *imageGallery
 	selected  map[string]bool
 	slideStop chan struct{}
@@ -416,6 +422,12 @@ func (iv *ImageView) open(path string) {
 		iv.carryPending = true
 		iv.carrySurface = iv.display()
 	}
+	// The picture on screen stays until its successor decodes; keep its
+	// overlay lines up so the OSD does not flash an unknown size or a
+	// missing timestamp during the switch.
+	if !iv.loading {
+		iv.osdPrev = iv.overlayLines()
+	}
 	iv.cancelDecode()
 	iv.path = path
 	// The zoom and the pan belong to the viewing session, not to the file:
@@ -563,6 +575,11 @@ func (iv *ImageView) accept(gen uint64, res ImageResult) {
 	}
 	iv.SetImage(res)
 	iv.loading = res.Preview
+	// The final picture is in place: the OSD can speak for it now, not for
+	// the picture the reader left.
+	if !res.Preview {
+		iv.osdPrev = nil
+	}
 	// A zoom or the 1:1 mode carried over from the previous picture can ask
 	// for more than the screen-sized decode that just arrived; fetch the
 	// full picture now, exactly as SetZoom and ToggleActualSize would.
@@ -1314,21 +1331,26 @@ func decoderWithTime(decoder string, dur time.Duration) string {
 }
 
 // overlayLines is what the info panel has to say about the picture.
+// While the next picture decodes, the one on screen has not changed yet, so
+// the panel keeps its previous lines: no "unknown size" or missing timestamp
+// flashes between pictures. Only the final output appears, with the decode
+// timing as the last line.
 func (iv *ImageView) overlayLines() []string {
-	size := "unknown size"
-	if iv.sizeKnown {
-		size = formatSize(iv.fileSize)
+	if iv.loading && iv.osdPrev != nil {
+		return iv.osdPrev
 	}
-
 	lines := []string{
 		iv.baseName(),
 		iv.displaySize(),
-		size,
+	}
+	// Size and time appear only once the stat lands; a placeholder would be
+	// an intermediate message between pictures.
+	if iv.sizeKnown {
+		lines = append(lines, formatSize(iv.fileSize))
 	}
 	if iv.timeKnown {
 		lines = append(lines, iv.fileTime.Format("2006-01-02 15:04"))
 	}
-	lines = append(lines, iv.decoderLabel())
 	if label := imageOrientationLabel(iv.rotation, iv.flipH, iv.flipV); label != "" {
 		lines = append(lines, label)
 	}
@@ -1337,6 +1359,9 @@ func (iv *ImageView) overlayLines() []string {
 	if orient := iv.exifOrientation(); orient > 1 {
 		lines = append(lines, fmt.Sprintf("EXIF orientation %d", orient))
 	}
+	// The decode/render timing is the last line: it can be updated after the
+	// picture shows, without holding the rest of the panel back.
+	lines = append(lines, iv.decoderLabel())
 	return lines
 }
 

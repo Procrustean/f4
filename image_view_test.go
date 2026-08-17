@@ -982,11 +982,45 @@ func TestImageViewOverlayLines(t *testing.T) {
 	}
 	iv.Rotate(90)
 	lines = iv.overlayLines()
-	if lines[1] != "200x320" || len(lines) != 6 || !strings.Contains(lines[5], "90") {
+	// The turn label joins before the decode timing, which stays the last line.
+	if lines[1] != "200x320" || len(lines) != 6 || !strings.Contains(lines[4], "90") || lines[5] != "png" {
 		t.Errorf("turned picture panel: %v", lines)
 	}
-	if got := newTestImageView(t, 8, 8).overlayLines()[2]; got != "unknown size" {
-		t.Errorf("unknown size line is %q", got)
+	// No size and no time yet: the lines stay out, and no placeholder text
+	// like "unknown size" may flash between pictures.
+	bare := newTestImageView(t, 8, 8).overlayLines()
+	if len(bare) != 3 || bare[2] != "test" {
+		t.Errorf("size-less panel is %v", bare)
+	}
+}
+
+// TestImageViewOverlayFreezesDuringSwitch locks in that the OSD keeps the
+// previous picture's lines while its successor decodes: the picture on screen
+// has not changed yet, so no "unknown size" or missing timestamp may flash.
+func TestImageViewOverlayFreezesDuringSwitch(t *testing.T) {
+	iv := newTestImageView(t, 320, 200)
+	iv.path, iv.decoder = "photo.png", "png"
+	iv.fileSize, iv.sizeKnown = 4096, true
+	iv.fileTime, iv.timeKnown = time.Date(2024, 5, 17, 9, 30, 0, 0, time.Local), true
+	before := strings.Join(iv.overlayLines(), "|")
+
+	// A switch starts: open() snapshots the lines while the old picture is
+	// still on screen, so the panel must not change even though size, time
+	// and decoder are about to be reset for the next file.
+	iv.osdPrev = iv.overlayLines()
+	iv.loading = true
+	iv.fileSize, iv.sizeKnown = 0, false
+	iv.fileTime, iv.timeKnown = time.Time{}, false
+	iv.decodeDur = 0
+	if got := strings.Join(iv.overlayLines(), "|"); got != before {
+		t.Errorf("OSD changed during the switch: %q vs %q", got, before)
+	}
+	// The final picture lands: the OSD speaks for it now, with its own data.
+	iv.loading = false
+	iv.osdPrev = nil
+	iv.path, iv.decoder = "next.png", "jpeg"
+	if got := iv.overlayLines(); len(got) == 0 || got[0] != "next.png" || got[len(got)-1] != "jpeg" {
+		t.Errorf("the OSD must show the new picture after the switch: %v", got)
 	}
 }
 
