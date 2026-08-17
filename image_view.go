@@ -1339,9 +1339,11 @@ func (iv *ImageView) overlayLines() []string {
 	if iv.loading && iv.osdPrev != nil {
 		return iv.osdPrev
 	}
-	lines := []string{
-		iv.baseName(),
-		iv.displaySize(),
+	lines := []string{iv.baseName()}
+	// The dimensions line appears only once the decoded surface exists; a
+	// "?" would be an intermediate message between pictures.
+	if img := iv.display(); img != nil && img.Valid() && img.Width > 0 && img.Height > 0 {
+		lines = append(lines, fmt.Sprintf("%dx%d", img.Width, img.Height))
 	}
 	// Size and time appear only once the stat lands; a placeholder would be
 	// an intermediate message between pictures.
