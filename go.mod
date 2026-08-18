@@ -174,4 +174,4 @@ replace github.com/ebitengine/hideconsole => ./internal/hideconsole
 
 // replace github.com/unxed/colorer4go => ../../../dev/colorer4go
 
-// replace github.com/unxed/vtui => ../../../dev/vtui
+replace github.com/unxed/vtui => ../vtui
